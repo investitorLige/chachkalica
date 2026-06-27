@@ -1,0 +1,47 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Generate a friendy_mercury config for experiment <strong>{{ experiment.name }}</strong>.</p>
+
+<h3>Datasets</h3>
+{% if datasets %}
+<ul>
+  {% for d in datasets %}
+    <li>{{ d.dataset.name }} — <strong>{{ d.role }}</strong>
+      (labels: {{ d.get_label_source_display }}{% if d.annotator %} / {{ d.annotator.username }}{% endif %})</li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="errornote">No datasets assigned — add at least one train dataset.</p>
+{% endif %}
+
+<h3>Models</h3>
+{% if models %}
+<ul>
+  {% for m in models %}
+    <li>{{ m.arch }} — num_classes: {% if m.num_classes %}{{ m.num_classes }}{% else %}auto{% endif %}</li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="errornote">No model architectures assigned.</p>
+{% endif %}
+
+<h3>Generated config</h3>
+<p class="help">The final <code>output_dir</code> and file name use the new run's id once created.
+The YAML is written under <code>{{ configs_root }}</code>.</p>
+<pre style="background:#1f2937;color:#e5e7eb;padding:1em;overflow:auto;border-radius:6px;">{{ yaml_text }}</pre>
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="apply" value="1">
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Create run &amp; write config">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+{% endblock %}

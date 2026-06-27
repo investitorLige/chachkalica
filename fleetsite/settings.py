@@ -57,6 +57,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "django_rq",
     "fleet",
+    "training",
 ]
 
 MIDDLEWARE = [
