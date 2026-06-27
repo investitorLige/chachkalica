@@ -78,3 +78,16 @@ def ingest_run(run) -> dict:
     run.results = summary
     run.save(update_fields=["results"])
     return {"run_results": created, "summary": summary}
+
+
+def eval_is_complete(output_dir: str | Path) -> bool:
+    """A standalone eval is done once eval_result.yaml is written."""
+    return (Path(output_dir) / "eval_result.yaml").exists()
+
+
+def ingest_eval(eval_run) -> dict:
+    """Pull metrics from an eval run's eval_result.yaml onto the EvalRun row."""
+    data = _load_yaml(Path(eval_run.output_dir) / "eval_result.yaml") or {}
+    eval_run.metrics = data.get("metrics")
+    eval_run.save(update_fields=["metrics"])
+    return {"metrics": eval_run.metrics}

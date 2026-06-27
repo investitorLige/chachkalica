@@ -43,3 +43,19 @@ def fetch_status(run, ts: TrainingSettings | None = None) -> dict:
         return {"status": "unknown"}
     resp.raise_for_status()
     return resp.json()
+
+
+def launch_eval(eval_run, ts: TrainingSettings | None = None) -> dict:
+    """Ask the service to evaluate a trained model from its generated request."""
+    payload = {"eval_id": eval_run.pk, "request_path": eval_run.request_yaml_path}
+    resp = requests.post(f"{base_url(ts)}/eval", json=payload, timeout=TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_eval_status(eval_run, ts: TrainingSettings | None = None) -> dict:
+    resp = requests.get(f"{base_url(ts)}/evals/{eval_run.pk}", timeout=TIMEOUT)
+    if resp.status_code == 404:
+        return {"status": "unknown"}
+    resp.raise_for_status()
+    return resp.json()

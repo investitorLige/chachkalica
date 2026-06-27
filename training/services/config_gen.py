@@ -16,7 +16,13 @@ from django.conf import settings
 from fleet.services import datasets as datasets_svc
 from fleet.services import lsapi
 from fleet.services.paths import source_root, target_root
-from training.models import Experiment, ExperimentDataset, ExperimentModel, TrainingSettings
+from training.models import (
+    Experiment,
+    ExperimentDataset,
+    ExperimentModel,
+    TrainingSettings,
+    default_iou_thresholds,
+)
 
 
 def _resolve(path: str) -> Path:
@@ -25,36 +31,52 @@ def _resolve(path: str) -> Path:
     return p if p.is_absolute() else Path(settings.BASE_DIR) / p
 
 
+def resolve_label_dir(dataset, label_source: str, annotator=None, explicit_path: str = "") -> Path:
+    """Resolve a dataset's labels directory for a given label-source choice.
+
+    Shared by training (:class:`ExperimentDataset`) and standalone eval
+    (:class:`EvalRun`) so both pick labels the same way:
+    ``source`` -> data/source/<name>/labels, ``annotator`` ->
+    data/target/<name>/<username>, ``explicit`` -> a given path.
+    """
+    if label_source == ExperimentDataset.SOURCE:
+        return datasets_svc.labels_source_dir(dataset)
+    if label_source == ExperimentDataset.ANNOTATOR:
+        if annotator is None:
+            raise ValueError(f"{dataset.name}: annotator output selected but no annotator set.")
+        return target_root() / dataset.name / annotator.username
+    if label_source == ExperimentDataset.EXPLICIT:
+        if not (explicit_path or "").strip():
+            raise ValueError(f"{dataset.name}: explicit label path selected but empty.")
+        return _resolve(explicit_path.strip())
+    raise ValueError(f"Unknown label source {label_source!r}")
+
+
 def label_dir(exp_dataset: ExperimentDataset) -> Path:
     """Resolve the labels directory feeding this dataset, per its label source."""
-    if exp_dataset.label_source == ExperimentDataset.SOURCE:
-        return datasets_svc.labels_source_dir(exp_dataset.dataset)
-    if exp_dataset.label_source == ExperimentDataset.ANNOTATOR:
-        if exp_dataset.annotator is None:
-            raise ValueError(
-                f"{exp_dataset.dataset.name}: annotator output selected but no annotator set."
-            )
-        return target_root() / exp_dataset.dataset.name / exp_dataset.annotator.username
-    if exp_dataset.label_source == ExperimentDataset.EXPLICIT:
-        if not exp_dataset.explicit_labels_path.strip():
-            raise ValueError(
-                f"{exp_dataset.dataset.name}: explicit label path selected but empty."
-            )
-        return _resolve(exp_dataset.explicit_labels_path.strip())
-    raise ValueError(f"Unknown label source {exp_dataset.label_source!r}")
+    return resolve_label_dir(
+        exp_dataset.dataset, exp_dataset.label_source,
+        exp_dataset.annotator, exp_dataset.explicit_labels_path,
+    )
+
+
+def dataset_classes(dataset) -> list[str]:
+    """Class names for a dataset, from its on-disk classes.txt."""
+    classes, _tools = lsapi.parse_classes_file(source_root() / dataset.name / "classes.txt")
+    return classes
+
+
+def images_dir(dataset) -> Path:
+    return lsapi.image_source_dir(source_root() / dataset.name)
 
 
 def dataset_entry(exp_dataset: ExperimentDataset) -> dict:
     """Build one YAML dataset entry: {name, images, labels, classes}."""
-    name = exp_dataset.dataset.name
-    dataset_dir = source_root() / name
-    images_dir = lsapi.image_source_dir(dataset_dir)
-    classes, _tools = lsapi.parse_classes_file(dataset_dir / "classes.txt")
     return {
-        "name": name,
-        "images": str(images_dir),
+        "name": exp_dataset.dataset.name,
+        "images": str(images_dir(exp_dataset.dataset)),
         "labels": str(label_dir(exp_dataset)),
-        "classes": classes,
+        "classes": dataset_classes(exp_dataset.dataset),
     }
 
 
@@ -144,6 +166,57 @@ def run_paths(experiment: Experiment, run_id: int, ts: TrainingSettings | None =
     yaml_path = _resolve(ts.configs_root) / f"{stem}.yaml"
     output_dir = _resolve(ts.runs_root) / stem
     return yaml_path, output_dir
+
+
+def classes_for_name(dataset_name: str) -> list[str]:
+    """Class names for a dataset directory, by name (no DB row required)."""
+    classes, _tools = lsapi.parse_classes_file(source_root() / dataset_name / "classes.txt")
+    return classes
+
+
+def eval_request_paths(eval_run, ts: TrainingSettings | None = None):
+    ts = ts or TrainingSettings.load()
+    stem = f"eval-{eval_run.pk}"
+    return _resolve(ts.configs_root) / f"{stem}.yaml", _resolve(ts.runs_root) / stem
+
+
+def build_eval_request(eval_run, output_dir: Path | str, ts: TrainingSettings | None = None) -> dict:
+    """Assemble the eval request consumed by friendy_mercury's eval_checkpoint.py.
+
+    ``classes`` is the *eval dataset's* class space (the target labels); the
+    model's own train-class space is read from the checkpoint by the trainer.
+    """
+    ts = ts or TrainingSettings.load()
+    tm = eval_run.trained_model
+    ds = eval_run.dataset
+    if not tm.checkpoint_path:
+        raise ValueError(f"{tm.name}: no checkpoint path to evaluate.")
+    return {
+        "name": f"eval-{eval_run.pk}",
+        "checkpoint_path": tm.checkpoint_path,
+        "images": str(images_dir(ds)),
+        "labels": str(resolve_label_dir(
+            ds, eval_run.label_source, eval_run.annotator, eval_run.explicit_labels_path)),
+        "classes": dataset_classes(ds),
+        "output_dir": str(output_dir),
+        "score_threshold": 0.001,
+        "iou_thresholds": default_iou_thresholds(),
+        "device": ts.default_device,
+    }
+
+
+def write_eval_request(eval_run, ts: TrainingSettings | None = None) -> tuple[Path, str]:
+    """Generate the eval request YAML for ``eval_run`` and persist its paths."""
+    ts = ts or TrainingSettings.load()
+    request_path, output_dir = eval_request_paths(eval_run, ts)
+    data = build_eval_request(eval_run, output_dir, ts)
+    text = yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
+    request_path.parent.mkdir(parents=True, exist_ok=True)
+    request_path.write_text(text, encoding="utf-8")
+    eval_run.request_yaml_path = str(request_path)
+    eval_run.output_dir = str(output_dir)
+    eval_run.save(update_fields=["request_yaml_path", "output_dir"])
+    return request_path, text
 
 
 def write_config(experiment: Experiment, run) -> tuple[Path, str]:

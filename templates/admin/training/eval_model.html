@@ -1,0 +1,49 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Evaluate model <strong>{{ model.name }}</strong> ({{ model.arch }}) against a dataset.</p>
+<p class="help">The model's checkpoint and training class space come from
+<code>{{ model.checkpoint_path }}</code>. Pick the dataset whose labels to score against.</p>
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="apply" value="1">
+
+  <p>
+    <label for="dataset">Dataset:</label>
+    <select name="dataset" id="dataset" required>
+      <option value="">— select a dataset —</option>
+      {% for d in datasets %}<option value="{{ d.pk }}">{{ d.name }}</option>{% endfor %}
+    </select>
+  </p>
+
+  <p>
+    <label for="label_source">Label source:</label>
+    <select name="label_source" id="label_source">
+      {% for value, label in label_source_choices %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+    </select>
+  </p>
+
+  <p>
+    <label for="annotator">Annotator (for annotator output):</label>
+    <select name="annotator" id="annotator">
+      <option value="">—</option>
+      {% for a in annotators %}<option value="{{ a.pk }}">{{ a.username }}</option>{% endfor %}
+    </select>
+  </p>
+
+  <p>
+    <label for="explicit_labels_path">Explicit labels path (for explicit):</label>
+    <input type="text" name="explicit_labels_path" id="explicit_labels_path" size="60">
+  </p>
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Queue evaluation">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+{% endblock %}

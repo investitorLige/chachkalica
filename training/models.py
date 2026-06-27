@@ -299,3 +299,110 @@ class RunResult(models.Model):
     def metric(self, key: str):
         m = self.primary_metrics
         return m.get(key) if isinstance(m, dict) else None
+
+
+class TrainedModel(models.Model):
+    """A catalogued trained model — the 'Models' tab.
+
+    Usually promoted from a :class:`RunResult` (its ``best.pt``), capturing the
+    architecture, checkpoint path, class space, and a metrics snapshot so it can
+    later be evaluated against new datasets independently of the training run.
+    """
+
+    DEV = "dev"
+    STAGING = "staging"
+    PRODUCTION = "production"
+    ARCHIVED = "archived"
+    STAGE_CHOICES = [
+        (DEV, "dev"),
+        (STAGING, "staging"),
+        (PRODUCTION, "production"),
+        (ARCHIVED, "archived"),
+    ]
+
+    name = models.CharField(max_length=128, unique=True)
+    description = models.TextField(blank=True)
+    stage = models.CharField(max_length=16, choices=STAGE_CHOICES, default=DEV)
+
+    arch = models.CharField(max_length=32)
+    checkpoint_path = models.CharField(max_length=1024)
+    num_classes = models.PositiveIntegerField(null=True, blank=True)
+    classes = models.JSONField(
+        default=list, blank=True,
+        help_text="Class names (ordered) the model predicts; needed to build eval configs.",
+    )
+    metrics = models.JSONField(
+        null=True, blank=True, help_text="Metrics snapshot at promotion time.",
+    )
+
+    source_run_result = models.ForeignKey(
+        RunResult, on_delete=models.SET_NULL, null=True, blank=True, related_name="trained_models",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class EvalRun(models.Model):
+    """One standalone evaluation of a :class:`TrainedModel` against a dataset.
+
+    Mirrors :class:`TrainingRun`: the admin action writes an eval request YAML
+    and enqueues a job that drives the trainer service's /eval endpoint, then
+    ingests the resulting metrics back here.
+    """
+
+    CREATED = "created"
+    QUEUED = "queued"
+    RUNNING = "running"
+    OK = "ok"
+    ERROR = "error"
+    STATUS_CHOICES = [
+        (CREATED, "created"),
+        (QUEUED, "queued"),
+        (RUNNING, "running"),
+        (OK, "ok"),
+        (ERROR, "error"),
+    ]
+
+    # Reuse the label-source vocabulary from ExperimentDataset.
+    SOURCE = ExperimentDataset.SOURCE
+    ANNOTATOR = ExperimentDataset.ANNOTATOR
+    EXPLICIT = ExperimentDataset.EXPLICIT
+
+    trained_model = models.ForeignKey(
+        TrainedModel, on_delete=models.CASCADE, related_name="eval_runs"
+    )
+    dataset = models.ForeignKey(Dataset, on_delete=models.PROTECT, related_name="+")
+    label_source = models.CharField(
+        max_length=16,
+        choices=ExperimentDataset.LABEL_SOURCE_CHOICES,
+        default=ExperimentDataset.SOURCE,
+    )
+    annotator = models.ForeignKey(
+        Annotator, on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    explicit_labels_path = models.CharField(max_length=1024, blank=True)
+
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=CREATED)
+    request_yaml_path = models.CharField(max_length=1024, blank=True)
+    output_dir = models.CharField(max_length=1024, blank=True)
+    metrics = models.JSONField(null=True, blank=True)
+    last_error = models.TextField(blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"Eval #{self.pk} — {self.trained_model.name} on {self.dataset.name}"
+
+    def metric(self, key: str):
+        return self.metrics.get(key) if isinstance(self.metrics, dict) else None

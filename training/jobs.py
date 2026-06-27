@@ -10,7 +10,7 @@ import time
 
 from django.utils import timezone
 
-from training.models import TrainingRun
+from training.models import EvalRun, TrainingRun
 from training.services import ingest, runner
 
 POLL_INTERVAL = 10       # seconds between status checks
@@ -62,4 +62,52 @@ def run_training(run_id: int, resume: bool = False) -> dict:
 
     summary = ingest.ingest_run(run)
     _mark(run, TrainingRun.OK, finished=True)
+    return {"status": "ok", **summary}
+
+
+def _mark_eval(eval_run: EvalRun, status: str, *, error: str = "", finished: bool = False):
+    eval_run.status = status
+    eval_run.last_error = error
+    if finished:
+        eval_run.finished_at = timezone.now()
+    eval_run.save(update_fields=["status", "last_error", "finished_at"])
+
+
+def run_eval(eval_run_id: int) -> dict:
+    eval_run = EvalRun.objects.get(pk=eval_run_id)
+    eval_run.status = EvalRun.RUNNING
+    eval_run.started_at = timezone.now()
+    eval_run.last_error = ""
+    eval_run.save(update_fields=["status", "started_at", "last_error"])
+
+    try:
+        runner.launch_eval(eval_run)
+    except Exception as exc:  # noqa: BLE001
+        _mark_eval(eval_run, EvalRun.ERROR, error=f"launch failed: {exc}", finished=True)
+        raise
+
+    waited = 0
+    while waited < MAX_WAIT:
+        status = runner.fetch_eval_status(eval_run)
+        state = status.get("status")
+        if state == "ok":
+            break
+        if state == "error":
+            _mark_eval(eval_run, EvalRun.ERROR, error=status.get("log_tail", "")[-4000:],
+                       finished=True)
+            return {"status": "error"}
+        if state == "unknown":
+            if ingest.eval_is_complete(eval_run.output_dir):
+                break
+            _mark_eval(eval_run, EvalRun.ERROR, error="trainer lost the eval and wrote no result",
+                       finished=True)
+            return {"status": "error"}
+        time.sleep(POLL_INTERVAL)
+        waited += POLL_INTERVAL
+    else:
+        _mark_eval(eval_run, EvalRun.ERROR, error="timed out waiting for eval", finished=True)
+        return {"status": "error"}
+
+    summary = ingest.ingest_eval(eval_run)
+    _mark_eval(eval_run, EvalRun.OK, finished=True)
     return {"status": "ok", **summary}
