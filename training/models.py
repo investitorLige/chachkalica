@@ -255,3 +255,47 @@ class TrainingRun(models.Model):
     def __str__(self) -> str:
         name = self.experiment.name if self.experiment else "(deleted experiment)"
         return f"Run #{self.pk} — {name}"
+
+
+class RunResult(models.Model):
+    """One friendy_mercury internal run (a train-dataset × model pairing).
+
+    A single :class:`TrainingRun` fans out into several of these — friendy_mercury
+    pairs every train dataset with every model. Rows are populated by
+    ``training.services.ingest`` after a run finishes, by joining the trainer's
+    ``results.yaml`` (training) with ``val_results.yaml``/``test_results.yaml``
+    (metrics), keyed by the internal ``run_name``.
+    """
+
+    run = models.ForeignKey(TrainingRun, on_delete=models.CASCADE, related_name="run_results")
+    run_name = models.CharField(max_length=255)
+    run_index = models.IntegerField(null=True, blank=True)
+    model_arch = models.CharField(max_length=32, blank=True)
+    train_dataset_name = models.CharField(max_length=255, blank=True)
+
+    best_epoch = models.IntegerField(null=True, blank=True)
+    best_loss = models.FloatField(null=True, blank=True)
+    run_dir = models.CharField(max_length=1024, blank=True)
+    best_checkpoint = models.CharField(max_length=1024, blank=True)
+    last_checkpoint = models.CharField(max_length=1024, blank=True)
+
+    val_metrics = models.JSONField(null=True, blank=True)
+    test_metrics = models.JSONField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["run_index", "id"]
+        unique_together = [("run", "run_name")]
+
+    def __str__(self) -> str:
+        return self.run_name
+
+    @property
+    def primary_metrics(self) -> dict | None:
+        """Best metrics to surface: test if present, else val."""
+        return self.test_metrics or self.val_metrics
+
+    def metric(self, key: str):
+        m = self.primary_metrics
+        return m.get(key) if isinstance(m, dict) else None

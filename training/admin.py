@@ -7,19 +7,27 @@ trainer service is a later phase — for now the action ends at a generated,
 ready-to-run config.
 """
 
+import django_rq
 from django.contrib import admin, messages
 from django.contrib.admin.helpers import ACTION_CHECKBOX_NAME
 from django.template.response import TemplateResponse
+from django.utils import timezone
 
 from fleet.admin import _status_badge
+from training import jobs
 from training.models import (
     Experiment,
     ExperimentDataset,
     ExperimentModel,
+    RunResult,
     TrainingRun,
     TrainingSettings,
 )
 from training.services import config_gen
+
+
+def _queue():
+    return django_rq.get_queue("default")
 
 
 @admin.register(TrainingSettings)
@@ -93,10 +101,13 @@ class ExperimentAdmin(admin.ModelAdmin):
             if request.POST.get("apply"):
                 run = TrainingRun.objects.create(experiment=experiment)
                 yaml_path, _text = config_gen.write_config(experiment, run)
+                _queue().enqueue(jobs.run_training, run.pk)
+                run.status = TrainingRun.QUEUED
+                run.save(update_fields=["status"])
                 self.message_user(
                     request,
-                    f"Run #{run.pk} created — config written to {yaml_path}. "
-                    "Execution against the trainer service lands in the next phase.",
+                    f"Run #{run.pk} queued — config written to {yaml_path}. "
+                    "Watch the Training runs page for progress.",
                 )
                 return None
             provisional_output = config_gen._resolve(ts.runs_root) / f"{experiment.name}-<run id>"
@@ -120,10 +131,32 @@ class ExperimentAdmin(admin.ModelAdmin):
         return TemplateResponse(request, "admin/training/launch_run.html", context)
 
 
+class RunResultInline(admin.TabularInline):
+    model = RunResult
+    extra = 0
+    can_delete = False
+    fields = ["run_name", "model_arch", "train_dataset_name", "map50", "map50_95",
+              "best_epoch", "best_checkpoint"]
+    readonly_fields = fields
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    @admin.display(description="mAP50")
+    def map50(self, obj):
+        return obj.metric("map50")
+
+    @admin.display(description="mAP50-95")
+    def map50_95(self, obj):
+        return obj.metric("map50_95")
+
+
 @admin.register(TrainingRun)
 class TrainingRunAdmin(admin.ModelAdmin):
     list_display = ["__str__", "experiment", "status_badge", "config_yaml_path", "created_at"]
     list_filter = ["status", "experiment"]
+    inlines = [RunResultInline]
+    actions = ["launch_selected", "ingest_selected"]
     readonly_fields = [
         "experiment", "status", "config_yaml_path", "output_dir",
         "last_error", "started_at", "finished_at", "results", "created_at",
@@ -136,3 +169,30 @@ class TrainingRunAdmin(admin.ModelAdmin):
     @admin.display(description="status", ordering="status")
     def status_badge(self, obj):
         return _status_badge(obj.status)
+
+    @admin.action(description="Launch / relaunch on trainer service")
+    def launch_selected(self, request, queryset):
+        queue = _queue()
+        for run in queryset:
+            if not run.config_yaml_path:
+                self.message_user(request, f"Run #{run.pk} has no config; skipped.",
+                                  level=messages.WARNING)
+                continue
+            queue.enqueue(jobs.run_training, run.pk)
+            run.status = TrainingRun.QUEUED
+            run.save(update_fields=["status"])
+        self.message_user(request, "Launch job(s) queued — refresh to see progress.")
+
+    @admin.action(description="Ingest results from output dir (no rerun)")
+    def ingest_selected(self, request, queryset):
+        from training.services import ingest
+
+        for run in queryset:
+            if not run.output_dir or not ingest.is_complete(run.output_dir):
+                self.message_user(request, f"Run #{run.pk}: no finished output to ingest.",
+                                  level=messages.WARNING)
+                continue
+            summary = ingest.ingest_run(run)
+            run.status = TrainingRun.OK
+            run.save(update_fields=["status"])
+            self.message_user(request, f"Run #{run.pk}: ingested {summary['run_results']} result(s).")
