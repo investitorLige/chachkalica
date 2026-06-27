@@ -1,0 +1,62 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Merge the following dataset(s) into a new dataset:</p>
+<ul>
+  {% for dataset in datasets %}
+    <li>{{ dataset.name }} —
+      {% if dataset.will_carry_labels %}<strong>labeled</strong> (annotations carried over &amp; remapped){% else %}unlabeled (images only){% endif %}
+    </li>
+  {% endfor %}
+</ul>
+
+{% if any_labeled %}
+  <p class="help">
+    Labeled datasets keep their annotations: each label's class index is renumbered
+    into the merged 0…N order, and annotations whose class is dropped below are removed.
+    The merged dataset uses the YOLO layout (<code>images/</code> + <code>labels/</code>).
+  </p>
+{% endif %}
+
+{% if cloud %}
+  <p class="errornote">
+    These selected datasets use cloud storage and cannot be merged:
+    {{ cloud|join:", " }}. Merge supports local-storage datasets only.
+  </p>
+{% endif %}
+
+<p><strong>Labels kept</strong> (present in every dataset, renumbered 0…N):
+  {% if kept %}{{ kept|join:", " }}{% else %}<em>none — these datasets share no common class names</em>{% endif %}
+</p>
+{% if dropped %}
+  <p><strong>Labels dropped</strong> (not in every dataset): {{ dropped|join:", " }}</p>
+{% endif %}
+<p><strong>Labeling tools</strong> (present in every dataset):
+  {% if tools %}{{ tools|join:", " }}{% else %}<em>none — these datasets share no common labeling tools</em>{% endif %}
+</p>
+
+{% if not cloud and kept and tools %}
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="apply" value="1">
+
+  <p>
+    <label for="new_name">New dataset name:</label>
+    <input type="text" name="new_name" id="new_name"
+           pattern="[A-Za-z0-9][A-Za-z0-9._-]*"
+           title="Letters, digits, '.', '_', '-'; no spaces or path separators." required>
+  </p>
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Merge datasets">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+{% else %}
+  <p><a href="../" class="button cancel-link">Back</a></p>
+{% endif %}
+{% endblock %}

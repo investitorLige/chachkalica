@@ -1,0 +1,33 @@
+name: mercury_label_lab
+
+services:
+  sam-backend:
+    build:
+      context: ../..
+      dockerfile: ml_backends/sam/Dockerfile
+    container_name: mercury-sam-backend
+    ports:
+      - "9090:9090"
+    environment:
+      SAM_CHECKPOINT: ${SAM_CHECKPOINT:-/models/sam_vit_b_01ec64.pth}
+      SAM_MODEL_TYPE: ${SAM_MODEL_TYPE:-vit_b}
+      SAM_DEVICE: ${SAM_DEVICE:-cpu}
+      SAM_MIN_AVAILABLE_RAM_GB: ${SAM_MIN_AVAILABLE_RAM_GB:-6}
+      SAM_DATA_ROOT: /data
+      SAM_FROM_NAME: ${SAM_FROM_NAME:-segmentation}
+      SAM_TO_NAME: ${SAM_TO_NAME:-image}
+      SAM_LABEL: ${SAM_LABEL:-Object}
+      SAM_OUTPUT: ${SAM_OUTPUT:-polygon}
+      LABEL_STUDIO_URL: ${LABEL_STUDIO_URL:-http://host.docker.internal:8080}
+      LABEL_STUDIO_API_TOKEN: ${LABEL_STUDIO_API_TOKEN:-}
+      MODEL_DIR: /tmp/label-studio-ml
+      AUTO_UPDATE: ""
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${SAM_HOST_DATA_ROOT:-/home/luka/workspace/PPCV}:/data:ro
+      - sam-models:/models
+
+volumes:
+  sam-models:
+

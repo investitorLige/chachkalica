@@ -1,0 +1,26 @@
+services:
+  webhook:
+    build: .
+    container_name: coco-sync-webhook
+    # Write target/ files as the host user (not root) so they stay readable and
+    # so `fleet.py sync`, running as that user, can overwrite them. Override via
+    # COCO_SYNC_UID/GID if your checkout is owned by a different uid/gid.
+    user: "${COCO_SYNC_UID:-1000}:${COCO_SYNC_GID:-1000}"
+    ports:
+      - "${COCO_SYNC_PORT:-9000}:9000"
+    # Lets the container reach each Label Studio container, which fleet.py
+    # publishes on a host port, via http://host.docker.internal:<port>.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      SOURCE_ROOT: /data/source
+      TARGET_ROOT: /data/target
+      FLEET_CONFIG: /configs/fleet.local.yaml
+      LS_HOST: ${LS_HOST:-host.docker.internal}
+    volumes:
+      # Source is read-only (classes.txt); target is where labels are written.
+      - ../data/source:/data/source:ro
+      - ../data/target:/data/target
+      # Fleet state holds per-annotator tokens/ports used for task lookups.
+      - ../configs:/configs:ro
+    restart: unless-stopped

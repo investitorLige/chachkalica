@@ -1,0 +1,14 @@
+# Secrets — fleet credentials and the durable annotator roster
+configs/fleet.local.yaml
+configs/register.yaml
+data/*
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Django
+*.sqlite3
+staticfiles/
+.env
+node_modules/

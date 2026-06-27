@@ -1,0 +1,14 @@
+instance_config: configs/instance/local.yaml
+
+project:
+  title: PPE
+
+paths:
+  dataset_dir: mock_dataset/images
+  classes_file: mock_dataset/classes.txt
+
+storage:
+  type: local
+
+auth:
+  token: 0f026176749ca6077829efd8ce50972b2eb8d755

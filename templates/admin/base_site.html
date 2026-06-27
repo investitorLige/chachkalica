@@ -1,0 +1,14 @@
+{% extends "admin/base.html" %}
+{% load static %}
+
+{% block title %}{{ title }} | Mercury Fleet{% endblock %}
+
+{% block extrastyle %}{{ block.super }}
+<link rel="stylesheet" href="{% static 'admin/css/fleet-theme.css' %}">
+{% endblock %}
+
+{% block branding %}
+<div id="site-name"><a href="{% url 'admin:index' %}">Mercury Fleet</a></div>
+{% endblock %}
+
+{% block nav-global %}{% endblock %}

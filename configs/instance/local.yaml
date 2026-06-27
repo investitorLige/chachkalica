@@ -1,0 +1,8 @@
+label_studio:
+  mode: local
+  container_name: label-studio
+  image_name: heartexlabs/label-studio:latest
+  url: http://localhost:8080
+  port: 8080
+  volume_name: label-studio-data
+  data_root: ./data

@@ -1,0 +1,18 @@
+instance_config: configs/instance/local.yaml
+
+project:
+  title: PPE Detection Dataset
+
+paths:
+  dataset_dir: source
+  classes_file: source/classes.txt
+  target_dir: target
+
+storage:
+  type: local
+  # For cloud storage, set:
+  # type: cloud
+  # root: https://example-bucket.example.com
+
+auth:
+  token: YOUR_LABEL_STUDIO_TOKEN

@@ -1,0 +1,11 @@
+# Django fleet manager (web + rq worker + webhook receiver).
+# The SAM ML backend keeps its own deps in ml_backends/sam/requirements.txt.
+Django>=5.2,<6.0
+psycopg[binary]>=3.1
+rq>=1.16
+django-rq>=2.10
+requests>=2.31
+pyyaml>=6.0
+gunicorn>=22.0
+python-dotenv>=1.0
+whitenoise>=6.6

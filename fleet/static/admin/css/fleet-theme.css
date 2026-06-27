@@ -1,0 +1,97 @@
+/* Mercury Fleet — green & black admin theme.
+ *
+ * Django's admin (5.x) is themed entirely through CSS custom properties. We
+ * redefine the palette on :root and on both explicit data-theme values, and
+ * this stylesheet loads after base.css, so it wins for auto / light / dark.
+ * Near-black surfaces, green accents.
+ */
+
+:root,
+html[data-theme="light"],
+html[data-theme="dark"] {
+  --primary: #0f1a12;            /* header / sidebar surfaces */
+  --primary-fg: #e6f4ea;
+  --secondary: #0f1a12;
+
+  --accent: #22c55e;             /* green accent */
+  --body-fg: #e6f4ea;
+  --body-bg: #0b0f0b;            /* near-black page */
+  --body-quiet-color: #9bb7a6;
+  --body-loud-color: #ffffff;
+
+  --header-color: #e6f4ea;
+  --header-branding-color: #22c55e;
+  --header-bg: #0a0f0a;
+  --header-link-color: #22c55e;
+
+  --breadcrumbs-fg: #9bb7a6;
+  --breadcrumbs-link-fg: #22c55e;
+  --breadcrumbs-bg: #0f1a12;
+
+  --link-fg: #34d399;
+  --link-hover-color: #22c55e;
+  --link-selected-fg: #16a34a;
+
+  --hairline-color: #1d2a20;
+  --border-color: #1d2a20;
+
+  --button-fg: #04130a;
+  --button-bg: #22c55e;
+  --button-hover-bg: #16a34a;
+  --default-button-bg: #16a34a;
+  --default-button-hover-bg: #15803d;
+  --close-button-bg: #334b3b;
+  --close-button-hover-bg: #243528;
+  --delete-button-bg: #ef4444;
+  --delete-button-hover-bg: #dc2626;
+
+  --object-tools-fg: #04130a;
+  --object-tools-bg: #22c55e;
+  --object-tools-hover-bg: #16a34a;
+
+  --message-success-bg: #14331f;
+  --message-warning-bg: #3a2f12;
+  --message-error-bg: #3a1414;
+
+  --darkened-bg: #0f1a12;        /* table stripes / odd rows */
+  --selected-bg: #102a1a;
+  --selected-row: #14331f;       /* dim green selection */
+
+  --close-button-bg: #243528;
+
+  color-scheme: dark;
+}
+
+/* Inputs read better with explicit dark fields. */
+body,
+input, textarea, select,
+.module, .form-row, fieldset.module {
+  background-color: var(--body-bg);
+  color: var(--body-fg);
+}
+
+input:not([type="checkbox"]):not([type="radio"]),
+textarea {
+  background-color: #0f1a12;
+  color: var(--body-fg);
+  border: 1px solid var(--border-color);
+}
+
+/* Do NOT recolor <select>: its dropdown popup is drawn by the OS and ignores
+   page CSS, so forcing colors makes options invisible on some platforms.
+   `color-scheme: dark` (set on :root) renders it dark natively and keeps the
+   options readable. Only give it a matching border. */
+select {
+  border: 1px solid var(--border-color);
+}
+
+/* Login box + module headers in green-on-black. */
+.module h2, .module caption, .inline-group h2 {
+  background: #102a1a;
+  color: var(--accent);
+}
+
+#header { border-bottom: 2px solid var(--accent); }
+
+a:link, a:visited { color: var(--link-fg); }
+a:hover { color: var(--link-hover-color); }

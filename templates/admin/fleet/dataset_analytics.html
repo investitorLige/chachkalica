@@ -1,0 +1,241 @@
+{% extends "admin/base_site.html" %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  /* Neon green on near-black, to match the fleet admin theme. */
+  .ds-analytics { max-width: 1000px; }
+  .ds-analytics h2 { margin-top: 2em; border-bottom: 1px solid #1d2a20; padding-bottom: .3em; }
+  .ds-cards { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0 8px; }
+  .ds-card { background: #0f1a12; border: 1px solid #1d2a20; border-radius: 8px;
+             padding: 10px 16px; min-width: 110px; }
+  .ds-card .num { font-size: 22px; font-weight: 700; line-height: 1.1; color: #34d399; }
+  .ds-card .lbl { color: #9bb7a6; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .ds-charts { display: flex; flex-wrap: wrap; gap: 40px; align-items: flex-start; margin: 16px 0; }
+  .ds-chart { text-align: center; }
+  .ds-chart .cap { font-weight: 600; margin-bottom: 10px; }
+  .ds-chart .sub { color: #9bb7a6; font-size: 12px; font-weight: 400; }
+  .ds-donut { width: 200px; height: 200px; border-radius: 50%; position: relative; margin: 0 auto; }
+  .ds-donut::after { content: ""; position: absolute; inset: 30%; background: #0b0f0b; border-radius: 50%; }
+  .ds-donut .center { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column;
+                      align-items: center; justify-content: center; }
+  .ds-donut .center .big { font-size: 24px; font-weight: 700; color: #34d399; }
+  .ds-donut .center .small { font-size: 11px; color: #9bb7a6; }
+  .ds-legend { margin: 8px 0 4px; }
+  .ds-legend table { border-collapse: collapse; min-width: 360px; }
+  .ds-legend th, .ds-legend td { padding: 4px 10px; text-align: right; border-bottom: 1px solid #1d2a20; }
+  .ds-legend th:first-child, .ds-legend td:first-child { text-align: left; }
+  .ds-swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px;
+               vertical-align: middle; margin-right: 6px; }
+  .ds-note { color: #9bb7a6; font-size: 12px; }
+  .ds-section { margin: 20px 0; max-width: 560px; }
+  .ds-section .cap { font-weight: 600; margin-bottom: 8px; }
+  .ds-bar { display: flex; height: 22px; border-radius: 4px; overflow: hidden;
+            border: 1px solid #1d2a20; background: #0f1a12; }
+  .ds-bar span { display: block; height: 100%; }
+  .ds-barlegend { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 16px;
+                  font-size: 12px; color: #9bb7a6; }
+  .ds-issues { margin: 4px 0; padding-left: 18px; color: #e6c07a; font-size: 13px; }
+  .ds-issues li { margin: 2px 0; }
+  .ds-ok { color: #34d399; }
+
+  /* Click-for-info affordance: any element carrying a metric explanation. */
+  .ds-info { cursor: help; position: relative; }
+  .ds-card.ds-info:hover { border-color: #34d399; }
+  .ds-info-mark { color: #34d399; font-size: 11px; font-weight: 700;
+                  opacity: .55; margin-left: 5px; vertical-align: middle; }
+  .ds-info:hover .ds-info-mark { opacity: 1; }
+  th.ds-info, .ds-chart .cap.ds-info, .ds-section .cap.ds-info { text-decoration: underline dotted #34d399 2px;
+                  text-underline-offset: 3px; }
+
+  /* Floating explanation popover (one shared element, positioned by JS). */
+  .ds-popover { position: absolute; z-index: 1000; max-width: 280px;
+                background: #0f1a12; border: 1px solid #34d399; border-radius: 8px;
+                padding: 12px 14px; box-shadow: 0 6px 24px rgba(0,0,0,.6);
+                color: #d7e7dd; font-size: 13px; line-height: 1.45; display: none; }
+  .ds-popover.show { display: block; }
+  .ds-popover .ds-pop-title { color: #34d399; font-weight: 700; font-size: 13px;
+                margin: 0 0 5px; text-transform: none; letter-spacing: 0; }
+  .ds-popover .ds-pop-close { position: absolute; top: 6px; right: 9px; cursor: pointer;
+                color: #9bb7a6; font-size: 15px; line-height: 1; border: none; background: none; }
+  .ds-popover .ds-pop-close:hover { color: #34d399; }
+  .ds-popover p { margin: 0; padding-right: 10px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="ds-analytics">
+{% for report in reports %}
+  <h2>{{ report.dataset.name }}</h2>
+
+  <div class="ds-cards">
+    <div class="ds-card ds-info" data-info-title="Images"
+         data-info="Total number of image files found in this dataset, whether or not they have been labeled yet.">
+      <div class="num">{{ report.summary.image_count }}</div><div class="lbl">Images<span class="ds-info-mark">ⓘ</span></div></div>
+    <div class="ds-card ds-info" data-info-title="Labeled images"
+         data-info="Share of images that have at least one valid annotation. The fraction shows labeled images out of the total.">
+      <div class="num">{{ report.summary.labeled_pct }}%</div><div class="lbl">Labeled ({{ report.summary.labeled_images }}/{{ report.summary.image_count }})<span class="ds-info-mark">ⓘ</span></div></div>
+    <div class="ds-card ds-info" data-info-title="Labels"
+         data-info="Total number of annotation regions (boxes and polygons) across every labeled image in the dataset.">
+      <div class="num">{{ report.summary.total_regions }}</div><div class="lbl">Labels<span class="ds-info-mark">ⓘ</span></div></div>
+    <div class="ds-card ds-info" data-info-title="Classes"
+         data-info="Number of distinct object classes declared in this dataset's classes.txt file.">
+      <div class="num">{{ report.summary.class_count }}</div><div class="lbl">Classes<span class="ds-info-mark">ⓘ</span></div></div>
+    <div class="ds-card ds-info" data-info-title="Labels per labeled image"
+         data-info="Average number of annotation regions on a labeled image (total labels ÷ labeled images). Empty/background images are excluded.">
+      <div class="num">{{ report.summary.avg_regions_per_labeled_image }}</div><div class="lbl">Labels / labeled img<span class="ds-info-mark">ⓘ</span></div></div>
+    <div class="ds-card ds-info" data-info-title="Median labels per labeled image"
+         data-info="The middle value of labels-per-image across labeled images. Less skewed by a few very crowded images than the average.">
+      <div class="num">{{ report.summary.median_regions_per_labeled_image }}</div><div class="lbl">Median / labeled img<span class="ds-info-mark">ⓘ</span></div></div>
+    <div class="ds-card ds-info" data-info-title="Max labels on one image"
+         data-info="The highest number of annotation regions found on any single image.">
+      <div class="num">{{ report.summary.max_regions_per_image }}</div><div class="lbl">Max / image<span class="ds-info-mark">ⓘ</span></div></div>
+    <div class="ds-card ds-info" data-info-title="Crowded images"
+         data-info="Images with {{ report.summary.crowded_min }} or more labels. A high count points to dense, busy scenes.">
+      <div class="num">{{ report.summary.crowded_images }}</div><div class="lbl">Crowded (≥{{ report.summary.crowded_min }})<span class="ds-info-mark">ⓘ</span></div></div>
+    <div class="ds-card ds-info" data-info-title="Empty / background images"
+         data-info="Images with no valid annotations — either no label file or an empty one. In YOLO an empty label file usually marks an intentional background/negative sample.">
+      <div class="num">{{ report.summary.empty_images }}</div><div class="lbl">Empty / background<span class="ds-info-mark">ⓘ</span></div></div>
+    <div class="ds-card ds-info" data-info-title="Boxes / polygons"
+         data-info="Annotation regions split by shape: axis-aligned bounding boxes versus polygons.">
+      <div class="num">{{ report.summary.bbox_regions }} / {{ report.summary.polygon_regions }}</div><div class="lbl">Boxes / polygons<span class="ds-info-mark">ⓘ</span></div></div>
+  </div>
+
+  {% if report.summary.total_regions %}
+  <div class="ds-charts">
+    <div class="ds-chart">
+      <div class="cap ds-info" data-info-title="Label distribution"
+           data-info="Each class's share of all annotation regions. A class with many regions takes a larger slice of the ring.">Label distribution<br><span class="sub">share of all {{ report.summary.total_regions }} labels</span></div>
+      <div class="ds-donut" style="background: conic-gradient({{ report.label_gradient }});">
+        <div class="center"><span class="big">{{ report.summary.total_regions }}</span><span class="small">labels</span></div>
+      </div>
+    </div>
+    <div class="ds-chart">
+      <div class="cap ds-info" data-info-title="Per-image distribution"
+           data-info="Each class's share of the images that contain it. An image with several same-class regions is counted once, so this reflects how widespread a class is rather than how frequent.">Per-image distribution<br><span class="sub">each class counted once per image</span></div>
+      <div class="ds-donut" style="background: conic-gradient({{ report.image_gradient }});">
+        <div class="center"><span class="big">{{ report.summary.labeled_images }}</span><span class="small">labeled images</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="ds-legend">
+    <table>
+      <thead>
+        <tr>
+          <th class="ds-info" data-info-title="Class" data-info="The object class name as declared in classes.txt.">Class</th>
+          <th class="ds-info" data-info-title="Labels" data-info="Number of annotation regions belonging to this class.">Labels</th>
+          <th class="ds-info" data-info-title="Label %" data-info="This class's share of all annotation regions in the dataset.">Label %</th>
+          <th class="ds-info" data-info-title="Images" data-info="Number of images that contain this class at least once.">Images</th>
+          <th class="ds-info" data-info-title="Image %" data-info="This class's share among images that carry any label.">Image %</th>
+          <th class="ds-info" data-info-title="Avg size" data-info="Mean bounding-box area of this class as a percentage of the image area.">Avg size</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in report.rows %}
+        <tr>
+          <td><span class="ds-swatch" style="background: {{ row.color }};"></span>{{ row.name }}</td>
+          <td>{{ row.region_count }}</td>
+          <td>{{ row.region_pct }}%</td>
+          <td>{{ row.image_count }}</td>
+          <td>{{ row.image_pct }}%</td>
+          <td>{{ row.avg_size_pct }}%</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="ds-note">Avg size = mean box area as a share of the image.</p>
+  </div>
+
+  <div class="ds-section">
+    <div class="cap ds-info" data-info-title="Object sizes"
+         data-info="Annotation regions bucketed by bounding-box area relative to the whole image: Small (&lt;1%), Medium (1–10%) and Large (≥10%). Helps spot datasets dominated by tiny or oversized objects.">Object sizes<span class="sub"> — box area relative to the image</span></div>
+    <div class="ds-bar">
+      {% for seg in report.size_dist %}{% if seg.pct %}<span style="width: {{ seg.pct }}%; background: {{ seg.color }};" title="{{ seg.label }}: {{ seg.count }}"></span>{% endif %}{% endfor %}
+    </div>
+    <div class="ds-barlegend">
+      {% for seg in report.size_dist %}
+        <span><span class="ds-swatch" style="background: {{ seg.color }};"></span>{{ seg.label }}: {{ seg.count }} ({{ seg.pct }}%)</span>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="ds-section">
+    <div class="cap ds-info" data-info-title="Data quality"
+         data-info="Automatic checks for common annotation problems: orphan label files with no matching image, class indices outside classes.txt, boxes extending past the image edge, and zero/negative-area boxes.">Data quality</div>
+    {% if report.quality.issue_total %}
+    <ul class="ds-issues">
+      {% if report.quality.orphan_label_files %}<li>⚠ {{ report.quality.orphan_label_files }} orphan label file(s) — no matching image{% if report.quality.orphan_examples %} (e.g. {{ report.quality.orphan_examples|join:", " }}){% endif %}.</li>{% endif %}
+      {% if report.quality.invalid_class_regions %}<li>⚠ {{ report.quality.invalid_class_regions }} region(s) with a class index outside classes.txt (ignored in the stats above).</li>{% endif %}
+      {% if report.quality.out_of_bounds_boxes %}<li>⚠ {{ report.quality.out_of_bounds_boxes }} box(es) extending outside the image bounds.</li>{% endif %}
+      {% if report.quality.zero_area_boxes %}<li>⚠ {{ report.quality.zero_area_boxes }} box(es) with zero/negative area.</li>{% endif %}
+    </ul>
+    {% else %}
+      <p class="ds-note ds-ok">✓ No data-quality issues detected.</p>
+    {% endif %}
+  </div>
+
+  {% if report.summary.unused_classes %}
+    <p class="ds-note">Declared but never annotated: {{ report.summary.unused_classes|join:", " }}.</p>
+  {% endif %}
+  {% else %}
+    <p class="ds-note">No annotation regions found in this dataset's <code>labels/</code> folder.</p>
+  {% endif %}
+{% endfor %}
+
+  <p style="margin-top:2em;"><a href="../" class="button cancel-link">Back</a></p>
+</div>
+
+<div class="ds-popover" id="ds-popover" role="dialog" aria-live="polite">
+  <button type="button" class="ds-pop-close" aria-label="Close">×</button>
+  <p class="ds-pop-title"></p>
+  <p class="ds-pop-body"></p>
+</div>
+
+<script>
+(function () {
+  var pop = document.getElementById('ds-popover');
+  var titleEl = pop.querySelector('.ds-pop-title');
+  var bodyEl = pop.querySelector('.ds-pop-body');
+  var current = null;
+
+  function hide() {
+    pop.classList.remove('show');
+    current = null;
+  }
+
+  function show(target) {
+    titleEl.textContent = target.getAttribute('data-info-title') || '';
+    bodyEl.textContent = target.getAttribute('data-info') || '';
+    current = target;
+    // Make it measurable, then position near the clicked element.
+    pop.classList.add('show');
+    var r = target.getBoundingClientRect();
+    var sx = window.pageXOffset, sy = window.pageYOffset;
+    var top = sy + r.bottom + 8;
+    var left = sx + r.left;
+    var maxLeft = sx + document.documentElement.clientWidth - pop.offsetWidth - 12;
+    if (left > maxLeft) left = Math.max(sx + 8, maxLeft);
+    pop.style.top = top + 'px';
+    pop.style.left = left + 'px';
+  }
+
+  document.addEventListener('click', function (e) {
+    var close = e.target.closest('.ds-pop-close');
+    if (close) { hide(); return; }
+    var target = e.target.closest('[data-info]');
+    if (target) {
+      e.preventDefault();
+      if (current === target) { hide(); return; }
+      show(target);
+      return;
+    }
+    if (!e.target.closest('#ds-popover')) hide();
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') hide();
+  });
+  window.addEventListener('resize', hide);
+})();
+</script>
+{% endblock %}
