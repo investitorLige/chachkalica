@@ -54,7 +54,10 @@ class ExperimentDatasetInline(admin.TabularInline):
 class ExperimentModelInline(admin.TabularInline):
     model = ExperimentModel
     extra = 1
-    fields = ["order", "arch", "num_classes", "params"]
+    # num_classes is intentionally omitted: it defaults to "auto" (resolved per
+    # train dataset from classes.txt). The model field stays for a programmatic
+    # override, but operators don't need to see it.
+    fields = ["order", "arch", "params"]
 
 
 @admin.register(Experiment)

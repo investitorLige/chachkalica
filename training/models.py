@@ -200,7 +200,8 @@ class ExperimentModel(models.Model):
     arch = models.CharField(max_length=32, choices=ARCH_CHOICES, default=RETINANET)
     num_classes = models.PositiveIntegerField(
         null=True, blank=True,
-        help_text="Leave blank for 'auto' (resolved per train dataset).",
+        help_text="Leave empty for auto — resolved per train dataset from its "
+                  "classes.txt. Only set this to override the class count.",
     )
     params = models.JSONField(
         default=dict, blank=True,
