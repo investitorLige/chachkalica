@@ -2,13 +2,22 @@
 
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import yaml
 from django.test import TestCase
 
 from fleet.models import Dataset, FleetSettings
-from training.models import EvalRun, Experiment, RunResult, TrainedModel, TrainingRun
-from training.services import config_gen, ingest, promote
+from training.models import (
+    EvalRun,
+    Experiment,
+    ExperimentDataset,
+    RunResult,
+    TrainedModel,
+    TrainingRun,
+    TrainingSettings,
+)
+from training.services import autoeval, config_gen, ingest, promote
 
 
 def _make_dataset_on_disk(source_root: Path, name: str, classes: list[str]) -> None:
@@ -93,3 +102,89 @@ class RegistryTests(TestCase):
         ingest.ingest_eval(eval_run)
         eval_run.refresh_from_db()
         self.assertEqual(eval_run.metric("map50_95"), 0.44)
+
+
+class AutoEvalTests(TestCase):
+    """After-training auto-eval: promote every trained model, eval on the test set."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.source = root / "source"
+        self.source.mkdir()
+        fs = FleetSettings.load()
+        fs.source_dir = str(self.source)
+        fs.target_dir = str(root / "target")
+        fs.save()
+
+        ts = TrainingSettings.load()
+        ts.configs_root = str(root / "configs")
+        ts.runs_root = str(root / "runs")
+        ts.save()
+
+        _make_dataset_on_disk(self.source, "train_ds", ["object"])
+        _make_dataset_on_disk(self.source, "test_ds", ["object"])
+        self.train_ds = Dataset.objects.create(name="train_ds")
+        self.test_ds = Dataset.objects.create(name="test_ds")
+
+        self.exp = Experiment.objects.create(name="exp-auto")
+        ExperimentDataset.objects.create(
+            experiment=self.exp, dataset=self.train_ds, role=ExperimentDataset.TRAIN,
+        )
+        self.run = TrainingRun.objects.create(experiment=self.exp, output_dir=str(root / "out"))
+        # Two trained models (checkpoints) + one that failed (no checkpoint).
+        RunResult.objects.create(
+            run=self.run, run_name="00-train_ds-00-yolox", model_arch="yolox",
+            train_dataset_name="train_ds", best_checkpoint=str(root / "out/0/best.pt"),
+        )
+        RunResult.objects.create(
+            run=self.run, run_name="01-train_ds-01-rtdetr", model_arch="rtdetr",
+            train_dataset_name="train_ds", last_checkpoint=str(root / "out/1/last.pt"),
+        )
+        RunResult.objects.create(
+            run=self.run, run_name="02-train_ds-02-rfdetr", model_arch="rfdetr",
+            train_dataset_name="train_ds",  # no checkpoint — training failed
+        )
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _add_test_dataset(self):
+        ExperimentDataset.objects.create(
+            experiment=self.exp, dataset=self.test_ds, role=ExperimentDataset.TEST,
+        )
+
+    def test_noop_without_test_dataset(self):
+        with mock.patch.object(autoeval, "_queue") as q:
+            self.assertEqual(autoeval.schedule_test_evals(self.run), [])
+            q.return_value.enqueue.assert_not_called()
+        self.assertEqual(EvalRun.objects.count(), 0)
+        self.assertEqual(TrainedModel.objects.count(), 0)
+
+    def test_promotes_and_evals_every_checkpointed_model(self):
+        self._add_test_dataset()
+        with mock.patch.object(autoeval, "_queue") as q:
+            queued = autoeval.schedule_test_evals(self.run)
+
+        # Two models had checkpoints; the checkpoint-less one is skipped.
+        self.assertEqual(len(queued), 2)
+        self.assertEqual(TrainedModel.objects.count(), 2)
+        self.assertEqual(EvalRun.objects.count(), 2)
+        # Every eval targets the test dataset and got queued.
+        for ev in EvalRun.objects.all():
+            self.assertEqual(ev.dataset, self.test_ds)
+            self.assertEqual(ev.status, EvalRun.QUEUED)
+            self.assertTrue(ev.request_yaml_path)
+        self.assertEqual(q.return_value.enqueue.call_count, 2)
+
+    def test_carries_test_dataset_label_source(self):
+        ExperimentDataset.objects.create(
+            experiment=self.exp, dataset=self.test_ds, role=ExperimentDataset.TEST,
+            label_source=ExperimentDataset.EXPLICIT,
+            explicit_labels_path=str(self.source / "test_ds" / "labels"),
+        )
+        with mock.patch.object(autoeval, "_queue"):
+            autoeval.schedule_test_evals(self.run)
+        ev = EvalRun.objects.first()
+        self.assertEqual(ev.label_source, ExperimentDataset.EXPLICIT)
+        self.assertTrue(ev.explicit_labels_path.endswith("test_ds/labels"))

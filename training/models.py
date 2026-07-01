@@ -167,10 +167,9 @@ class ExperimentDataset(models.Model):
         max_length=1024, blank=True,
         help_text="Required when label source is 'explicit path'.",
     )
-    order = models.PositiveIntegerField(default=0)
 
     class Meta:
-        ordering = ["order", "id"]
+        ordering = ["id"]  # the order rows were added
 
     def __str__(self) -> str:
         return f"{self.dataset.name} [{self.role}]"
@@ -194,7 +193,13 @@ class ExperimentModel(models.Model):
     RETINANET = "retinanet"
     YOLOX = "yolox"
     RTDETR = "rtdetr"
-    ARCH_CHOICES = [(RETINANET, "retinanet"), (YOLOX, "yolox"), (RTDETR, "rtdetr")]
+    RFDETR = "rfdetr"
+    ARCH_CHOICES = [
+        (RETINANET, "retinanet"),
+        (YOLOX, "yolox"),
+        (RTDETR, "rtdetr"),
+        (RFDETR, "rfdetr"),
+    ]
 
     experiment = models.ForeignKey(Experiment, on_delete=models.CASCADE, related_name="models")
     arch = models.CharField(max_length=32, choices=ARCH_CHOICES, default=RETINANET)
@@ -208,10 +213,9 @@ class ExperimentModel(models.Model):
         help_text="Architecture kwargs, e.g. {\"variant\": \"resnet50_fpn_v2\", "
                   "\"weights_backbone\": \"DEFAULT\"}.",
     )
-    order = models.PositiveIntegerField(default=0)
 
     class Meta:
-        ordering = ["order", "id"]
+        ordering = ["id"]  # the order rows were added
 
     def __str__(self) -> str:
         return self.arch

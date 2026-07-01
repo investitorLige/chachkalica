@@ -1,0 +1,38 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Statistics for the checkpointed best epoch of <strong>{{ rr.run_name }}</strong>
+   ({{ rr.model_arch }} on {{ rr.train_dataset_name }}) — the model saved as
+   <code>{{ rr.best_checkpoint|default:rr.last_checkpoint }}</code>.</p>
+
+<table>
+  <tr><th>Best epoch</th><td>{{ rr.best_epoch|default:"—" }}</td></tr>
+  <tr><th>Best loss</th><td>{{ rr.best_loss|default:"—" }}</td></tr>
+  <tr><th>mAP50</th><td>{{ rr.map50|default:"—" }}</td></tr>
+  <tr><th>mAP50-95</th><td>{{ rr.map50_95|default:"—" }}</td></tr>
+</table>
+
+{% if entry_yaml %}
+  <h2>Best epoch (from history.yaml)</h2>
+  <pre style="max-height:24em;overflow:auto;margin:.3em 0;padding:.6em;background:#1e1e1e;color:#d4d4d4;border-radius:4px;font-size:12px;line-height:1.6">{{ entry_yaml }}</pre>
+{% else %}
+  <p class="help">No per-epoch history on disk for this run
+  {% if rr.best_epoch is None %}(it never checkpointed a best epoch — e.g. no val set, or it errored early).{% else %}(<code>{{ rr.run_dir }}/history.yaml</code> is missing or empty).{% endif %}</p>
+{% endif %}
+
+{% if test_yaml %}
+  <h2>Test metrics</h2>
+  <pre style="max-height:24em;overflow:auto;margin:.3em 0;padding:.6em;background:#1e1e1e;color:#d4d4d4;border-radius:4px;font-size:12px;line-height:1.6">{{ test_yaml }}</pre>
+{% endif %}
+
+{% if val_yaml %}
+  <h2>Validation metrics</h2>
+  <pre style="max-height:24em;overflow:auto;margin:.3em 0;padding:.6em;background:#1e1e1e;color:#d4d4d4;border-radius:4px;font-size:12px;line-height:1.6">{{ val_yaml }}</pre>
+{% endif %}
+
+{% if not test_yaml and not val_yaml %}
+  <p class="help">No evaluation metrics ingested for this run yet.</p>
+{% endif %}
+
+<p style="margin-top:1.5em"><a href="../" class="button cancel-link">Back</a></p>
+{% endblock %}

@@ -11,7 +11,7 @@ import time
 from django.utils import timezone
 
 from training.models import EvalRun, TrainingRun
-from training.services import ingest, runner
+from training.services import autoeval, ingest, runner
 
 POLL_INTERVAL = 10       # seconds between status checks
 MAX_WAIT = 60 * 60 * 48  # give up after 48h
@@ -62,7 +62,16 @@ def run_training(run_id: int, resume: bool = False) -> dict:
 
     summary = ingest.ingest_run(run)
     _mark(run, TrainingRun.OK, finished=True)
-    return {"status": "ok", **summary}
+
+    # Best-effort: training succeeded, so an auto-eval hiccup must not fail the
+    # run. Per-eval build errors are already captured on their EvalRun rows.
+    try:
+        queued = autoeval.schedule_test_evals(run)
+    except Exception as exc:  # noqa: BLE001 - never let auto-eval flip an OK run
+        run.last_error = f"training ok, but scheduling test evals failed: {exc}"
+        run.save(update_fields=["last_error"])
+        return {"status": "ok", "auto_eval_error": str(exc), **summary}
+    return {"status": "ok", "auto_evals": queued, **summary}
 
 
 def _mark_eval(eval_run: EvalRun, status: str, *, error: str = "", finished: bool = False):

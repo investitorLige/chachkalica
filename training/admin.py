@@ -12,6 +12,7 @@ from django.contrib import admin, messages
 from django.contrib.admin.helpers import ACTION_CHECKBOX_NAME
 from django.template.response import TemplateResponse
 from django.utils import timezone
+from django.utils.html import format_html_join
 
 from fleet.admin import _status_badge
 from fleet.models import Annotator, Dataset
@@ -48,7 +49,7 @@ class ExperimentDatasetInline(admin.TabularInline):
     model = ExperimentDataset
     extra = 1
     autocomplete_fields = ["dataset", "annotator"]
-    fields = ["order", "dataset", "role", "label_source", "annotator", "explicit_labels_path"]
+    fields = ["dataset", "role", "label_source", "annotator", "explicit_labels_path"]
 
 
 class ExperimentModelInline(admin.TabularInline):
@@ -57,7 +58,7 @@ class ExperimentModelInline(admin.TabularInline):
     # num_classes is intentionally omitted: it defaults to "auto" (resolved per
     # train dataset from classes.txt). The model field stays for a programmatic
     # override, but operators don't need to see it.
-    fields = ["order", "arch", "params"]
+    fields = ["arch", "params"]
 
 
 @admin.register(Experiment)
@@ -164,7 +165,7 @@ class TrainingRunAdmin(admin.ModelAdmin):
     inlines = [RunResultInline]
     actions = ["launch_selected", "ingest_selected"]
     readonly_fields = [
-        "experiment", "status", "config_yaml_path", "output_dir",
+        "experiment", "status", "epoch_progress", "config_yaml_path", "output_dir",
         "last_error", "started_at", "finished_at", "results", "created_at",
     ]
 
@@ -175,6 +176,31 @@ class TrainingRunAdmin(admin.ModelAdmin):
     @admin.display(description="status", ordering="status")
     def status_badge(self, obj):
         return _status_badge(obj.status)
+
+    @admin.display(description="Epoch progress")
+    def epoch_progress(self, obj):
+        """Per-epoch lines read live from each run's history.yaml on disk.
+
+        Reflects training as it happens (history.yaml is rewritten each epoch);
+        reload the page to refresh. One block per internal run, since a run fans
+        out into several train-dataset × model pairings.
+        """
+        from training.services import progress
+
+        histories = progress.run_histories(obj.output_dir)
+        if not histories:
+            return "No epoch history yet — reload while the run is training."
+        return format_html_join(
+            "",
+            "<div style='margin-bottom:1em'><strong>{}</strong>"
+            "<pre style='max-height:24em;overflow:auto;margin:.3em 0;padding:.6em;"
+            "background:#1e1e1e;color:#d4d4d4;border-radius:4px;font-size:12px;"
+            "line-height:1.6'>{}</pre></div>",
+            (
+                (h["run_name"], "\n".join(progress.epoch_line(e) for e in h["epochs"]))
+                for h in histories
+            ),
+        )
 
     @admin.action(description="Launch / relaunch on trainer service")
     def launch_selected(self, request, queryset):
@@ -210,7 +236,7 @@ class RunResultAdmin(admin.ModelAdmin):
                     "map50", "map50_95", "best_epoch"]
     list_filter = ["model_arch", "train_dataset_name"]
     search_fields = ["run_name", "train_dataset_name"]
-    actions = ["promote_selected"]
+    actions = ["show_best_epoch_stats", "promote_selected"]
 
     def has_add_permission(self, request):
         return False
@@ -222,6 +248,32 @@ class RunResultAdmin(admin.ModelAdmin):
     @admin.display(description="mAP50-95")
     def map50_95(self, obj):
         return obj.metric("map50_95")
+
+    @admin.action(description="Show best-epoch statistics")
+    def show_best_epoch_stats(self, request, queryset):
+        import yaml
+
+        from training.services import progress
+
+        if queryset.count() != 1:
+            self.message_user(request, "Select exactly one result.", level=messages.WARNING)
+            return None
+        rr = queryset.first()
+        entry = progress.best_epoch_entry(rr.run_dir, rr.best_epoch)
+
+        def _dump(value):
+            return yaml.safe_dump(value, sort_keys=False, default_flow_style=False) if value else ""
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Best-epoch statistics — {rr.run_name}",
+            "rr": rr,
+            "entry": entry,
+            "entry_yaml": _dump(entry),
+            "val_yaml": _dump(rr.val_metrics),
+            "test_yaml": _dump(rr.test_metrics),
+        }
+        return TemplateResponse(request, "admin/training/best_epoch_stats.html", context)
 
     @admin.action(description="Promote to model registry")
     def promote_selected(self, request, queryset):
