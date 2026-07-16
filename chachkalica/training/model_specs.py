@@ -257,12 +257,29 @@ WEIGHTS_FIELD_PREFIX = "xm_weights_"  # form field name: xm_weights_<arch>
 WEIGHTS_NONE = ""                # train from scratch (random init)
 WEIGHTS_DEFAULT = "__default__"  # the arch/variant's published default (weights=True)
 WEIGHTS_CUSTOM = "__custom__"    # use the free-text custom path/URL field
+WEIGHTS_FRIENDY_PREFIX = "__friendy__:"
+INIT_CHECKPOINT_KEY = "init_checkpoint"
+
+
+def friendy_weights_value(checkpoint_path: str) -> str:
+    """Encode a promoted Friendy checkpoint as a dropdown value."""
+    return f"{WEIGHTS_FRIENDY_PREFIX}{checkpoint_path}"
+
+
+def friendy_checkpoint_from_value(value: str) -> str | None:
+    if isinstance(value, str) and value.startswith(WEIGHTS_FRIENDY_PREFIX):
+        return value[len(WEIGHTS_FRIENDY_PREFIX):]
+    return None
 
 # Archs whose published default is variant-resolved by the adapter when it gets
 # ``weights=True`` (torchvision COCO enum / YOLOX per-variant URL / RF-DETR
 # per-variant default). RT-DETR is excluded: its size *is* its checkpoint, so it
 # lists explicit repo ids instead of a single "default".
 WEIGHTS_DEFAULT_ARCHS = {"retinanet", "fasterrcnn", "yolox", "rfdetr"}
+
+# torchvision accepts weight-enum names, not arbitrary checkpoint paths/URLs.
+# Its published defaults already have dedicated options.
+WEIGHTS_CUSTOM_ARCHS = {"yolox", "rtdetr", "rfdetr"}
 
 # Published, appropriately-licensed checkpoints offered per arch *beyond* the
 # variant default. Each entry: {value, label, variant?}. ``value`` is written
@@ -320,7 +337,8 @@ def weights_base_choices(arch: str) -> list[tuple[str, str]]:
         out.append((WEIGHTS_DEFAULT, "COCO pretrained (default)"))
     for entry in WEIGHTS_CATALOG.get(arch, []):
         out.append((entry["value"], entry["label"]))
-    out.append((WEIGHTS_CUSTOM, "Custom path or URL…"))
+    if arch in WEIGHTS_CUSTOM_ARCHS:
+        out.append((WEIGHTS_CUSTOM, "Custom native pretrained reference…"))
     return out
 
 

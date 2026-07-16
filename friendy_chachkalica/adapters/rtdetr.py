@@ -242,8 +242,6 @@ def build_rtdetr(
     if weights is None:
         model = _from_scratch()
     else:
-        # Fall back to random init (not a crash) if the pretrained weights can't
-        # be fetched — e.g. HuggingFace is unreachable or the repo id is wrong.
         try:
             config = RTDetrConfig.from_pretrained(weights, **config_kwargs)
             config.id2label = id2label
@@ -255,11 +253,10 @@ def build_rtdetr(
                 ignore_mismatched_sizes=ignore_mismatched_sizes,
             )
         except Exception as exc:  # noqa: BLE001
-            print(
-                f"[rtdetr] Pretrained weights {weights!r} unavailable ({exc}); "
-                f"training from scratch (random init)."
-            )
-            model = _from_scratch()
+            raise RuntimeError(
+                f"RT-DETR pretrained weights {weights!r} were requested but could "
+                "not be loaded; refusing to silently train from random initialization."
+            ) from exc
 
     return RTDETRAdapter(
         model=model,

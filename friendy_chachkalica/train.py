@@ -2,6 +2,8 @@ import argparse
 import json
 import random
 import time
+import traceback
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,7 +14,7 @@ import yaml
 from torch.utils.data import DataLoader
 
 try:
-    from .config import DatasetConfig, ExperimentConfig, ExperimentRun, build_experiment_runs, load_config
+    from .config import DatasetConfig, ExperimentConfig, ExperimentRun, ModelConfig, build_experiment_runs, load_config
     from .data import build_eval_dataloader, build_train_dataloader
     from .device import resolve_device
     from .metrics import (
@@ -24,7 +26,7 @@ try:
     from .postprocess import apply_class_aware_nms
     from .registry import build_model
 except ImportError:
-    from config import DatasetConfig, ExperimentConfig, ExperimentRun, build_experiment_runs, load_config
+    from config import DatasetConfig, ExperimentConfig, ExperimentRun, ModelConfig, build_experiment_runs, load_config
     from data import build_eval_dataloader, build_train_dataloader
     from device import resolve_device
     from metrics import (
@@ -45,6 +47,24 @@ except ImportError:
 # well-defined training-time analogue (train on tiles). Other pipelines route
 # val/test inference through chachak but train on full frames.
 _TRAINABLE_PIPELINES = {"batch_detect"}
+
+
+class ExperimentTrainingError(RuntimeError):
+    """Raised after all requested runs finish when one or more failed."""
+
+    def __init__(
+        self,
+        failures: List[Dict[str, Any]],
+        results: List[Dict[str, Any]],
+        results_path: Path,
+    ) -> None:
+        self.failures = failures
+        self.results = results
+        self.results_path = results_path
+        names = ", ".join(str(item.get("run_name", item.get("run_index"))) for item in failures)
+        super().__init__(
+            f"{len(failures)} training run(s) failed ({names}); details: {results_path}"
+        )
 
 
 def _ensure_chachak_importable() -> None:
@@ -213,13 +233,14 @@ def train_experiment(
     eval_loaders: Dict[tuple, DataLoader] = {}
     results = []
     runs = build_experiment_runs(config)
+    results_path = config.output_dir / "results.yaml"
     print(f"[train] Training {len(runs)} run(s) (resume={resume})")
     for run in runs:
         result_path = config.output_dir / run.name / "result.yaml"
         if resume and result_path.exists():
             print(f"[train] Run {run.name} already complete, skipping (found {result_path})")
             results.append(_read_yaml(result_path))
-            _write_yaml(config.output_dir / "results.yaml", _to_builtin(results))
+            _write_yaml(results_path, _to_builtin(results))
             continue
 
         train_loader = _get_train_loader(config, run.train_dataset, train_loaders)
@@ -239,14 +260,35 @@ def train_experiment(
             )
         except Exception as exc:
             print(f"[train] Run {run.name} FAILED: {exc}")
-            result = {"run_index": run.index, "run_name": run.name, "error": str(exc)}
+            traceback.print_exc()
+            result = {
+                "run_index": run.index,
+                "run_name": run.name,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
         results.append(result)
-        _write_yaml(config.output_dir / "results.yaml", _to_builtin(results))
+        _write_yaml(results_path, _to_builtin(results))
+
+    _raise_if_training_failed(results, results_path)
 
     if evaluate_after_train:
         _evaluate_all_runs_after_train(config)
 
     return results
+
+
+def _raise_if_training_failed(
+    results: List[Dict[str, Any]],
+    results_path: Path,
+) -> None:
+    failures = [result for result in results if result.get("error") is not None]
+    if failures:
+        print(
+            f"[train] Experiment FAILED: {len(failures)}/{len(results)} run(s) failed; "
+            f"details written to {results_path}"
+        )
+        raise ExperimentTrainingError(failures, results, results_path)
 
 
 def _evaluate_all_runs_after_train(config: ExperimentConfig) -> None:
@@ -314,6 +356,105 @@ def _get_eval_loader(
     return loader
 
 
+_WARM_START_STRUCTURAL_PARAMS = {
+    "retinanet": ("variant",),
+    "fasterrcnn": ("variant",),
+    "yolox": ("variant",),
+    "rfdetr": ("variant", "resolution"),
+    # RT-DETR's repository id selects the model topology (r18/r50/v1/v2).
+    "rtdetr": ("weights",),
+}
+
+
+def _read_initial_checkpoint(
+    checkpoint_path: Path,
+    expected_model_name: str,
+) -> Dict[str, Any]:
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Warm-start checkpoint not found: {checkpoint_path}")
+
+    state = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(state, Mapping) or not isinstance(
+        state.get("model_state_dict"), Mapping
+    ):
+        raise ValueError(
+            f"{checkpoint_path} is not a Friendy training checkpoint "
+            "(missing model_state_dict)."
+        )
+
+    checkpoint_model_name = state.get("model_name")
+    if checkpoint_model_name != expected_model_name:
+        raise ValueError(
+            f"Warm-start architecture mismatch: checkpoint is "
+            f"{checkpoint_model_name!r}, requested model is {expected_model_name!r}."
+        )
+    return dict(state)
+
+
+def _warm_start_build_params(
+    model_config: ModelConfig,
+    checkpoint_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    source_config = checkpoint_state.get("model_config") or {}
+    source_params = dict(source_config.get("params") or {})
+    current_params = dict(model_config.params)
+
+    for key in _WARM_START_STRUCTURAL_PARAMS.get(model_config.name, ()):
+        source_value = source_params.get(key)
+        current_value = current_params.get(key)
+        if (
+            source_value is not None
+            and current_value is not None
+            and source_value != current_value
+        ):
+            raise ValueError(
+                f"Warm-start {model_config.name} parameter mismatch for {key!r}: "
+                f"checkpoint uses {source_value!r}, current model requests "
+                f"{current_value!r}."
+            )
+
+    build_params = {**source_params, **current_params}
+    if model_config.name != "rtdetr":
+        # These architectures select topology independently of weights. Build
+        # without another download, then restore the Friendy checkpoint below.
+        build_params["weights"] = False
+    return build_params
+
+
+def _load_warm_start_state(
+    model: torch.nn.Module,
+    checkpoint_state: Dict[str, Any],
+    checkpoint_path: Path,
+) -> None:
+    source_state = checkpoint_state["model_state_dict"]
+    model_state = model.state_dict()
+    compatible = {
+        key: value
+        for key, value in source_state.items()
+        if key in model_state
+        and torch.is_tensor(value)
+        and value.shape == model_state[key].shape
+    }
+    loaded_parameters = sum(model_state[key].numel() for key in compatible)
+    total_parameters = sum(value.numel() for value in model_state.values())
+    coverage = loaded_parameters / max(1, total_parameters)
+    if not compatible or coverage < 0.5:
+        raise ValueError(
+            f"Warm-start checkpoint {checkpoint_path} is not sufficiently compatible: "
+            f"{len(compatible)}/{len(model_state)} tensors, "
+            f"{coverage:.1%} of parameters."
+        )
+
+    model.load_state_dict(compatible, strict=False)
+    reinitialized = len(model_state) - len(compatible)
+    print(
+        f"[train] Warm-start loaded {len(compatible)}/{len(model_state)} tensors "
+        f"({coverage:.1%} of parameters) from {checkpoint_path}; "
+        f"reinitialized {reinitialized} task-specific/incompatible tensor(s)."
+    )
+
+
 def train_model(
     config: ExperimentConfig,
     run: ExperimentRun,
@@ -335,12 +476,33 @@ def train_model(
     )
     print(f"[train] Run directory: {run_dir}")
 
+    initial_state = None
+    build_params = dict(model_config.params)
+    if model_config.init_checkpoint is not None:
+        print(f"[train] Reading warm-start checkpoint: {model_config.init_checkpoint}")
+        initial_state = _read_initial_checkpoint(
+            model_config.init_checkpoint,
+            expected_model_name=model_config.name,
+        )
+        build_params = _warm_start_build_params(model_config, initial_state)
+
+    effective_model_config = ModelConfig(
+        name=model_config.name,
+        num_classes=model_config.num_classes,
+        params=build_params,
+    )
     print(f"[train] Building model adapter: {model_config.name}")
     adapter = build_model(
         model_config.name,
         num_classes=model_config.num_classes,
-        **model_config.params,
+        **build_params,
     )
+    if initial_state is not None:
+        _load_warm_start_state(
+            adapter.model,
+            initial_state,
+            model_config.init_checkpoint,
+        )
     adapter.to(device)
     print(f"[train] Model moved to device: {device}")
 
@@ -491,7 +653,8 @@ def train_model(
         checkpoint = {
             "epoch": epoch,
             "model_name": model_config.name,
-            "model_config": _to_builtin(model_config),
+            "model_config": _to_builtin(effective_model_config),
+            "init_checkpoint": str(model_config.init_checkpoint) if model_config.init_checkpoint else None,
             "train_dataset": _to_builtin(train_dataset_config),
             "model_state_dict": adapter.model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -566,6 +729,7 @@ def train_model(
         "train_dataset_role": train_dataset_config.role,
         "run_name": run_name,
         "run_dir": str(run_dir),
+        "init_checkpoint": str(model_config.init_checkpoint) if model_config.init_checkpoint else None,
         "best_epoch": best_epoch,
         "best_metric": best_metric_name,
         "best_score": best_score,
@@ -619,6 +783,12 @@ def train_one_epoch(
             with _autocast_context(config, device, adapter):
                 loss, loss_items = adapter.training_step(chunk_images, chunk_targets)
 
+            _require_finite_loss(
+                loss,
+                loss_items,
+                phase="training",
+            )
+
             if scaler is not None:
                 scaler.scale(loss).backward()
                 if config.training.gradient_clip_norm is not None:
@@ -665,6 +835,11 @@ def evaluate_loss(
         loss_step = getattr(adapter, "validation_step", adapter.training_step)
         with _autocast_context(config, device, adapter):
             loss, loss_items = loss_step(images, targets)
+        _require_finite_loss(
+            loss,
+            loss_items,
+            phase="validation",
+        )
         batch_size = len(images)
         total_loss += float(loss.detach().cpu()) * batch_size
         total_images += batch_size
@@ -959,13 +1134,10 @@ def _predict_with_config(
     if config is None:
         return adapter.predict(images)
 
-    try:
-        threshold = config.evaluation.map_score_threshold
-        if threshold is None:
-            threshold = config.evaluation.score_threshold
-        return adapter.predict(images, score_threshold=threshold)
-    except TypeError:
-        return adapter.predict(images)
+    threshold = config.evaluation.map_score_threshold
+    if threshold is None:
+        threshold = config.evaluation.score_threshold
+    return adapter.predict(images, score_threshold=threshold)
 
 
 def build_optimizer(
@@ -1138,6 +1310,28 @@ def _amp_enabled(config: ExperimentConfig, device: torch.device, adapter: Any) -
         and device.type == "cuda"
         and getattr(adapter, "supports_amp", True)
     )
+
+
+def _require_finite_loss(
+    loss: torch.Tensor,
+    loss_items: Dict[str, torch.Tensor],
+    phase: str,
+) -> None:
+    if not torch.is_tensor(loss) or loss.numel() != 1:
+        raise TypeError(
+            f"{phase} loss must be a scalar tensor, got {type(loss).__name__} "
+            f"with shape {getattr(loss, 'shape', None)}"
+        )
+    if bool(torch.isfinite(loss.detach()).all()):
+        return
+
+    nonfinite_items = [
+        name
+        for name, value in loss_items.items()
+        if torch.is_tensor(value) and not bool(torch.isfinite(value.detach()).all())
+    ]
+    detail = f"; non-finite components: {', '.join(nonfinite_items)}" if nonfinite_items else ""
+    raise FloatingPointError(f"Non-finite {phase} loss: {loss.detach().cpu().item()}{detail}")
 
 
 def _accumulate_losses(

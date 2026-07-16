@@ -235,7 +235,7 @@ class TrainingRunAdmin(admin.ModelAdmin):
     list_filter = ["status", "experiment"]
     inlines = [RunResultInline]
     actions = [
-        "launch_selected", "resume_selected", "pause_selected", "view_hard_val_images",
+        "launch_selected", "resume_selected", "pause_selected", "live_training_report",
         "ingest_selected", "reconcile_selected", "kill_run_gracefully",
     ]
     readonly_fields = [
@@ -278,8 +278,10 @@ class TrainingRunAdmin(admin.ModelAdmin):
 
     def get_urls(self):
         custom = [
-            path("hard-images/", self.admin_site.admin_view(self.hard_images_view),
-                 name="training_trainingrun_hard_images"),
+            path("report/", self.admin_site.admin_view(self.live_report_view),
+                 name="training_trainingrun_live_report"),
+            path("report/metrics/", self.admin_site.admin_view(self.live_report_metrics),
+                 name="training_trainingrun_live_report_metrics"),
             path("hard-images/image/", self.admin_site.admin_view(self.hard_images_image),
                  name="training_trainingrun_hard_images_image"),
             path("hard-images/data/", self.admin_site.admin_view(self.hard_images_data),
@@ -287,23 +289,14 @@ class TrainingRunAdmin(admin.ModelAdmin):
         ]
         return custom + super().get_urls()
 
-    @admin.action(description="View live hardest val images...")
-    def view_hard_val_images(self, request, queryset):
-        """Open live hardest-val-image artifacts written by validation epochs."""
+    @admin.action(description="Live training report")
+    def live_training_report(self, request, queryset):
+        """Open the combined live report: epoch status, metric charts, hard images."""
         if queryset.count() != 1:
             self.message_user(request, "Select exactly one training run.", level=messages.WARNING)
             return None
         run = queryset.first()
-        artifacts = self._hard_image_artifacts(run)
-        if not artifacts:
-            self.message_user(
-                request,
-                f"Run #{run.pk}: no hardest-val-images artifact yet. Reload after the "
-                "first validation mAP pass has completed.",
-                level=messages.WARNING,
-            )
-            return None
-        return redirect(reverse("admin:training_trainingrun_hard_images") + "?run=" + str(run.pk))
+        return redirect(reverse("admin:training_trainingrun_live_report") + "?run=" + str(run.pk))
 
     def _hard_image_artifacts(self, run):
         """Return available ``val_hard_images.json`` files for a TrainingRun."""
@@ -336,42 +329,66 @@ class TrainingRunAdmin(admin.ModelAdmin):
             return None
         return artifacts[0]
 
-    def hard_images_view(self, request):
-        """Render live hard-image viewer for one TrainingRun internal run."""
+    def _report_data(self, run):
+        """Reshape a run's live state for the report page + poll endpoint.
+
+        Unions the internal runs that have per-epoch ``history.yaml`` with those
+        that have a ``val_hard_images.json`` artifact (a run may have one before
+        the other), so the picker lists every internal run either surfaces.
+        """
+        from training.services import progress
+
+        histories = {h["run_name"]: h["epochs"] for h in progress.run_histories(run.output_dir)}
+        artifacts = {a["run_name"]: a for a in self._hard_image_artifacts(run)}
+        runs = []
+        for name in sorted(set(histories) | set(artifacts)):
+            artifact = artifacts.get(name)
+            runs.append({
+                "run_name": name,
+                "epochs": [progress.flatten_epoch(e) for e in histories.get(name, [])],
+                "has_hard_images": artifact is not None,
+                "hard_image_count": artifact["count"] if artifact else 0,
+                "query": urlencode({"run": run.pk, "run_name": name}),
+            })
+        return {
+            "status": run.status,
+            "total_epochs": run.experiment.epochs if run.experiment else None,
+            "runs": runs,
+        }
+
+    def live_report_view(self, request):
+        """Render the combined live training report for one TrainingRun."""
         run = TrainingRun.objects.filter(pk=request.GET.get("run")).first()
         if run is None:
-            raise Http404("hard-images requires ?run=")
+            raise Http404("live report requires ?run=")
+        # Ranking metric / thresholds are shared across a run's hard-image
+        # artifacts, so pull them from whichever one exists (if any) for the
+        # viewer's caption.
         artifacts = self._hard_image_artifacts(run)
-        current = self._selected_hard_image_artifact(run, request.GET.get("run_name"))
-        if current is None:
-            raise Http404("no hard-images artifact for this training run")
-        payload = current["payload"]
-        choices = [
-            {
-                "run_name": artifact["run_name"],
-                "label": f"{artifact['run_name']} ({artifact['count']} images)",
-                "count": artifact["count"],
-                "query": urlencode({"run": run.pk, "run_name": artifact["run_name"]}),
-                "selected": artifact["run_name"] == current["run_name"],
-            }
-            for artifact in artifacts
-        ]
+        payload = artifacts[0]["payload"] if artifacts else {}
         context = {
             **self.admin_site.each_context(request),
-            "title": f"Live hardest val images - run #{run.pk}",
-            "subject_name": f"Run #{run.pk} - {current['run_name']}",
-            "image_count": len(payload.get("images", [])),
+            "title": f"Live training report - run #{run.pk}",
+            "run": run,
+            "run_id": run.pk,
+            "status_badge_html": _status_badge(run.status),
+            "report_json": self._report_data(run),
             "metric": payload.get("metric", ""),
             "metric_description": payload.get("metric_description", ""),
             "iou_threshold": payload.get("iou_threshold"),
             "score_threshold": payload.get("score_threshold"),
             "max_display_predictions": payload.get("max_display_predictions"),
-            "query": urlencode({"run": run.pk, "run_name": current["run_name"]}),
-            "run_choices": choices,
-            "run_choices_json": json.dumps(choices),
+            "metrics_url": reverse("admin:training_trainingrun_live_report_metrics"),
             "back_label": "Back to training runs",
         }
-        return TemplateResponse(request, "admin/training/hard_images_viewer.html", context)
+        return TemplateResponse(request, "admin/training/live_report.html", context)
+
+    def live_report_metrics(self, request):
+        """JSON poll target feeding the live report's charts, table and status."""
+        run = TrainingRun.objects.filter(pk=request.GET.get("run")).first()
+        if run is None:
+            return JsonResponse({"error": "unknown training run"}, status=400)
+        return JsonResponse(self._report_data(run))
 
     def hard_images_image(self, request):
         """Stream one live hard image for a TrainingRun."""

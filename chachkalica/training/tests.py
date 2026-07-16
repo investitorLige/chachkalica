@@ -364,9 +364,9 @@ class WeightsDropdownTests(TestCase):
         self.assertIs(obj.params["weights"], True)
         self.assertTrue(obj.pretrained)
 
-    def test_none_option_omits_weights_and_clears_pretrained(self):
+    def test_none_option_sets_explicit_scratch_and_clears_pretrained(self):
         obj = self._save(ExperimentModel.YOLOX, model_specs.WEIGHTS_NONE)
-        self.assertNotIn("weights", obj.params)
+        self.assertIs(obj.params["weights"], False)
         self.assertFalse(obj.pretrained)
 
     def test_catalog_option_passes_through(self):
@@ -391,6 +391,11 @@ class WeightsDropdownTests(TestCase):
         self.assertFalse(form.is_valid())
         self.assertIn("weights_custom", form.errors)
 
+    def test_torchvision_arches_do_not_offer_unsupported_custom_paths(self):
+        for arch in (ExperimentModel.RETINANET, ExperimentModel.FASTERRCNN):
+            choices = dict(model_specs.weights_base_choices(arch))
+            self.assertNotIn(model_specs.WEIGHTS_CUSTOM, choices)
+
     def test_rtdetr_has_no_default_option_but_lists_v1_and_v2(self):
         choices = dict(model_specs.weights_base_choices(ExperimentModel.RTDETR))
         self.assertNotIn(model_specs.WEIGHTS_DEFAULT, choices)
@@ -402,7 +407,7 @@ class WeightsDropdownTests(TestCase):
         self.assertEqual(vmap.get("rf-detr-base-o365.pth"), "base")
 
     def test_trained_model_appears_as_option(self):
-        TrainedModel.objects.create(
+        trained = TrainedModel.objects.create(
             name="my-yolox", arch=ExperimentModel.YOLOX,
             checkpoint_path="/runs/best.pt",
         )
@@ -410,12 +415,44 @@ class WeightsDropdownTests(TestCase):
         choices = dict(form.fields[
             model_specs.weights_field_name(ExperimentModel.YOLOX)
         ].choices)
-        self.assertIn("/runs/best.pt", choices)
+        encoded = model_specs.friendy_weights_value(trained.checkpoint_path)
+        self.assertIn(encoded, choices)
         # A model of a different arch must not leak into another arch's dropdown.
         rtdetr_choices = dict(form.fields[
             model_specs.weights_field_name(ExperimentModel.RTDETR)
         ].choices)
-        self.assertNotIn("/runs/best.pt", rtdetr_choices)
+        self.assertNotIn(encoded, rtdetr_choices)
+
+    def test_trained_model_selection_saves_init_checkpoint_not_weights(self):
+        trained = TrainedModel.objects.create(
+            name="my-yolox", arch=ExperimentModel.YOLOX,
+            checkpoint_path="/runs/best.pt",
+        )
+
+        obj = self._save(
+            ExperimentModel.YOLOX,
+            model_specs.friendy_weights_value(trained.checkpoint_path),
+        )
+
+        self.assertEqual(obj.params["init_checkpoint"], "/runs/best.pt")
+        self.assertNotIn("weights", obj.params)
+        self.assertFalse(obj.pretrained)
+
+    def test_existing_init_checkpoint_preselects_friendy_option(self):
+        checkpoint = "/runs/deleted-registry-model/best.pt"
+        model = ExperimentModel(
+            arch=ExperimentModel.YOLOX,
+            params={"init_checkpoint": checkpoint},
+        )
+
+        form = ExperimentModelForm(instance=model)
+        field = form.fields[model_specs.weights_field_name(ExperimentModel.YOLOX)]
+
+        self.assertEqual(
+            field.initial,
+            model_specs.friendy_weights_value(checkpoint),
+        )
+        self.assertIn(field.initial, dict(field.choices))
 
     def test_existing_string_weights_preselects_dropdown(self):
         m = ExperimentModel(arch=ExperimentModel.RTDETR,

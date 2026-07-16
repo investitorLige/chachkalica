@@ -104,10 +104,11 @@ def _weights_field(arch: str) -> forms.Field:
             attrs={"class": "xm-spec-field xm-weights-field", "data-arch": arch},
             variant_map=model_specs.weights_variant_map(arch),
         ),
-        help_text="Where each model's weights start from. 'COCO pretrained' loads "
-                  "the architecture's published weights for the selected size; the "
-                  "listed checkpoints and your own trained models are alternatives; "
-                  "'Custom path or URL' uses the field below.",
+        help_text="Published/native options use the architecture's own weight "
+                  "format. 'Your model' performs a checked Friendy warm-start and "
+                  "reinitializes incompatible task-head tensors. A custom native "
+                  "reference is available only for adapters that support paths, "
+                  "URLs, or repository ids.",
     )
 
 
@@ -133,10 +134,11 @@ class ExperimentModelForm(forms.ModelForm):
     # URL…". Shared across archs — only the selected arch's dropdown is read.
     weights_custom = forms.CharField(
         required=False,
-        label="Custom weights (path or URL)",
+        label="Custom native pretrained reference",
         widget=forms.TextInput(attrs={"class": "xm-weights-custom", "size": "60"}),
-        help_text="Local checkpoint path or download URL. Used only when the "
-                  "Pretrained weights dropdown is set to 'Custom path or URL…'.",
+        help_text="Architecture-native path, URL, or repository id—not a Friendy "
+                  "best.pt/last.pt file. For those, choose the corresponding "
+                  "'Your model' option.",
     )
 
     class Meta:
@@ -202,7 +204,10 @@ class ExperimentModelForm(forms.ModelForm):
         by_arch: dict[str, list[dict]] = {}
         for tm in TrainedModel.objects.exclude(checkpoint_path="").order_by("name"):
             by_arch.setdefault(tm.arch, []).append(
-                {"value": tm.checkpoint_path, "label": f"Your model: {tm.name}"}
+                {
+                    "value": model_specs.friendy_weights_value(tm.checkpoint_path),
+                    "label": f"Your model: {tm.name}",
+                }
             )
         for arch, options in by_arch.items():
             self._add_weight_options(arch, options)
@@ -213,7 +218,11 @@ class ExperimentModelForm(forms.ModelForm):
         if field is None:
             return
         choices = list(field.choices)
-        choices[-1:-1] = [(e["value"], e["label"]) for e in entries]
+        insert_at = len(choices)
+        if choices and choices[-1][0] == model_specs.WEIGHTS_CUSTOM:
+            insert_at -= 1
+        choices[insert_at:insert_at] = [
+            (entry["value"], entry["label"]) for entry in entries]
         field.choices = choices
         variant_map = dict(getattr(field.widget, "variant_map", {}) or {})
         for entry in entries:
@@ -226,6 +235,22 @@ class ExperimentModelForm(forms.ModelForm):
         fname = model_specs.weights_field_name(arch)
         field = self.fields[fname]
         known = {c[0] for c in field.choices}
+
+        init_checkpoint = params.get(model_specs.INIT_CHECKPOINT_KEY)
+        if init_checkpoint:
+            encoded = model_specs.friendy_weights_value(str(init_checkpoint))
+            if encoded not in known:
+                choices = list(field.choices)
+                insert_at = len(choices)
+                if choices and choices[-1][0] == model_specs.WEIGHTS_CUSTOM:
+                    insert_at -= 1
+                choices.insert(
+                    insert_at,
+                    (encoded, f"Friendy checkpoint: {init_checkpoint}"),
+                )
+                field.choices = choices
+            field.initial = encoded
+            return
 
         if "weights" in params:
             stored = params["weights"]
@@ -297,6 +322,7 @@ class ExperimentModelForm(forms.ModelForm):
         for key in model_specs.ALL_SPEC_KEYS:
             params.pop(key, None)
         params.pop(model_specs.WEIGHTS_KEY, None)
+        params.pop(model_specs.INIT_CHECKPOINT_KEY, None)
         for spec in model_specs.ARCH_FIELD_SPECS.get(arch, []):
             fname = model_specs.field_name(arch, spec["key"])
             value = self.cleaned_data.get(fname)
@@ -307,17 +333,21 @@ class ExperimentModelForm(forms.ModelForm):
         # Resolve the weights dropdown into params["weights"] (or leave it unset
         # for random init), and keep the legacy `pretrained` column consistent.
         weights_sel = self.cleaned_data.get(model_specs.weights_field_name(arch))
+        friendy_checkpoint = model_specs.friendy_checkpoint_from_value(weights_sel)
         obj.pretrained = weights_sel == model_specs.WEIGHTS_DEFAULT
-        if weights_sel == model_specs.WEIGHTS_DEFAULT:
+        if friendy_checkpoint:
+            params[model_specs.INIT_CHECKPOINT_KEY] = friendy_checkpoint
+        elif weights_sel == model_specs.WEIGHTS_DEFAULT:
             params[model_specs.WEIGHTS_KEY] = True
         elif weights_sel == model_specs.WEIGHTS_CUSTOM:
             custom = (self.cleaned_data.get("weights_custom") or "").strip()
             if custom:
                 params[model_specs.WEIGHTS_KEY] = custom
+        elif weights_sel == model_specs.WEIGHTS_NONE:
+            # Explicit False matters for RF-DETR, whose adapter default is pretrained.
+            params[model_specs.WEIGHTS_KEY] = False
         elif weights_sel not in (None, model_specs.WEIGHTS_NONE):
             params[model_specs.WEIGHTS_KEY] = weights_sel
-        # WEIGHTS_NONE (or an unfilled custom, already flagged in clean) → no
-        # weights key → the adapter trains from scratch.
 
         obj.params = params
 

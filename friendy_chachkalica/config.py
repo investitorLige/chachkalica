@@ -23,6 +23,7 @@ class ModelConfig:
     name: str
     num_classes: int | str
     params: Dict[str, Any] = field(default_factory=dict)
+    init_checkpoint: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -158,7 +159,7 @@ def load_config(config_path: str | Path) -> ExperimentConfig:
     val_dataset = _parse_optional_dataset(datasets_raw.get("val"), base_dir, "datasets.val", role="val")
     test_dataset = _parse_optional_dataset(datasets_raw.get("test"), base_dir, "datasets.test", role="test")
 
-    models = _parse_models(_require_list(raw, "models"))
+    models = _parse_models(_require_list(raw, "models"), base_dir)
     training = _parse_training(raw.get("training", {}))
     evaluation = _parse_evaluation(raw.get("evaluation", {}))
     pipeline = _parse_pipeline(raw.get("pipeline"), base_dir)
@@ -217,6 +218,7 @@ def _resolve_model_for_dataset(model_config: ModelConfig, dataset_config: Datase
         name=model_config.name,
         num_classes=len(dataset_config.classes),
         params=dict(model_config.params),
+        init_checkpoint=model_config.init_checkpoint,
     )
 
 
@@ -337,7 +339,7 @@ def _parse_num_classes(value: Any, field_name: str) -> int | str:
     return num_classes
 
 
-def _parse_models(value: List[Any]) -> List[ModelConfig]:
+def _parse_models(value: List[Any], base_dir: Path) -> List[ModelConfig]:
     if not value:
         raise ValueError("models must contain at least one model")
 
@@ -365,7 +367,18 @@ def _parse_models(value: List[Any]) -> List[ModelConfig]:
             raise ValueError(f"{field_name}.params must be a mapping")
         model_params = {**params, **model_params}
 
-        models.append(ModelConfig(name=name, num_classes=num_classes, params=model_params))
+        init_checkpoint = model_params.pop("init_checkpoint", None)
+        if init_checkpoint is not None:
+            init_checkpoint = _resolve_path(init_checkpoint, base_dir)
+
+        models.append(
+            ModelConfig(
+                name=name,
+                num_classes=num_classes,
+                params=model_params,
+                init_checkpoint=init_checkpoint,
+            )
+        )
 
     return models
 

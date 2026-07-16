@@ -59,6 +59,32 @@ def best_epoch_entry(run_dir: str | Path | None, best_epoch: int | None = None) 
     return flagged[-1] if flagged else None
 
 
+def flatten_epoch(epoch: dict) -> dict:
+    """Flat, JSON-serialisable metrics for one epoch (charts + metrics table).
+
+    Reshapes a raw ``history.yaml`` entry (nested ``train``/``val``/``val_map``
+    dicts) into a single flat row. Shared by the live-report page's initial
+    context and its polling endpoint so the metric keys are defined in one place.
+    """
+    train = epoch.get("train") or {}
+    val = epoch.get("val") or {}
+    val_map = epoch.get("val_map") or {}
+    return {
+        "epoch": epoch.get("epoch"),
+        "train_loss": train.get("loss"),
+        "val_loss": val.get("loss"),
+        "map50": val_map.get("map50"),
+        "map50_95": val_map.get("map50_95"),
+        "precision": val_map.get("precision"),
+        "recall": val_map.get("recall"),
+        "f1": val_map.get("f1"),
+        "lr": epoch.get("lr"),
+        "best_metric": epoch.get("best_metric"),
+        "best_metric_score": epoch.get("best_metric_score"),
+        "is_best": bool(epoch.get("is_best")),
+    }
+
+
 def _fmt(value) -> str:
     return f"{value:.4f}" if isinstance(value, (int, float)) else "—"
 

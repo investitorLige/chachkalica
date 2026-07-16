@@ -1,0 +1,427 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  .lr-wrap { max-width: 1200px; }
+  .lr-status { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; margin: 8px 0 16px; }
+  .lr-status .lr-epoch { font-weight: 700; font-size: 15px; }
+  .lr-status .lr-best { color: #14692b; font-weight: 600; }
+  .lr-status #lr-poll-note { color: #888; font-size: 12px; }
+  .lr-picker { margin: 10px 0 18px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .lr-section-title { margin: 1.6em 0 .4em; border-bottom: 1px solid #ccc; padding-bottom: .3em; }
+
+  table.lr-metrics { border-collapse: collapse; margin: 6px 0 12px; }
+  table.lr-metrics th, table.lr-metrics td { padding: 5px 16px; border-bottom: 1px solid #e0e0e0; text-align: right; font-variant-numeric: tabular-nums; }
+  table.lr-metrics th.rowlabel, table.lr-metrics td.rowlabel { text-align: left; font-weight: 600; }
+  table.lr-metrics td.na { color: #bbb; }
+
+  .lr-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 20px; }
+  .lr-chart-box { border: 1px solid #e0e0e0; border-radius: 4px; padding: 10px 12px; }
+  .lr-chart-box h3 { margin: 0 0 8px; font-size: 13px; color: #555; }
+  .lr-chart-canvas { position: relative; height: 240px; }
+
+  /* Hardest-val viewer (lifted from hard_images_viewer.html) */
+  #pv-stage { position: relative; display: inline-block; max-width: 100%; }
+  #pv-stage img { display: block; max-width: 100%; height: auto; }
+  #pv-stage canvas { position: absolute; top: 0; left: 0; pointer-events: none; }
+  #pv-controls { margin: 10px 0; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  #pv-controls .pv-group { display: flex; gap: 6px; align-items: center; }
+  #pv-status { margin: 6px 0; font-weight: 600; }
+  #pv-error { color: #ba2121; margin: 6px 0; }
+  #pv-metric { margin: 6px 0 12px; padding: .6em .8em; background: #f5f5f5; color: #222; border-radius: 4px; font-size: 12px; }
+  #pv-metric code { background: #e8e8e8; color: #222; padding: 0 3px; border-radius: 3px; }
+  #pv-breakdown { font-weight: 600; }
+  #pv-empty { color: #888; }
+  .pv-legend span { display: inline-block; margin-right: 14px; }
+  .pv-swatch { display: inline-block; width: 12px; height: 12px; margin-right: 4px; vertical-align: middle; }
+</style>
+{% endblock %}
+
+{% block extrahead %}{{ block.super }}
+<script src="{% static 'training/chart.umd.min.js' %}"></script>
+{% endblock %}
+
+{% block content %}
+<div class="lr-wrap">
+
+<div class="lr-status">
+  <span>Run #{{ run_id }}</span>
+  <span>{{ status_badge_html }}</span>
+  <span class="lr-epoch" id="lr-epoch">—</span>
+  <span class="lr-best" id="lr-best"></span>
+  <span id="lr-poll-note"></span>
+</div>
+
+<div class="lr-picker">
+  <label for="lr-run-select"><strong>Internal run</strong></label>
+  <select id="lr-run-select"></select>
+</div>
+
+<h2 class="lr-section-title">Latest epoch metrics</h2>
+<table class="lr-metrics">
+  <tbody id="lr-metrics-body"></tbody>
+</table>
+
+<h2 class="lr-section-title">Metrics over epochs</h2>
+<div class="lr-charts">
+  <div class="lr-chart-box"><h3>Loss</h3><div class="lr-chart-canvas"><canvas id="chart-loss"></canvas></div></div>
+  <div class="lr-chart-box"><h3>mAP</h3><div class="lr-chart-canvas"><canvas id="chart-map"></canvas></div></div>
+  <div class="lr-chart-box"><h3>Precision / Recall / F1</h3><div class="lr-chart-canvas"><canvas id="chart-pr"></canvas></div></div>
+  <div class="lr-chart-box"><h3>Learning rate</h3><div class="lr-chart-canvas"><canvas id="chart-lr"></canvas></div></div>
+</div>
+
+<h2 class="lr-section-title">Hardest validation images</h2>
+<div id="pv-metric">
+  Ranking metric: <code>{{ metric|default:"—" }}</code>{% if metric_description %} — {{ metric_description }}{% endif %}
+  (ranked at IoU ≥ {{ iou_threshold|default:"—" }}, score ≥ {{ score_threshold|default:"—" }}; up to {{ max_display_predictions|default:"20" }} highest-confidence predictions saved per image; use the confidence slider to filter visible predictions).
+  <div id="pv-breakdown"></div>
+</div>
+
+<div id="pv-empty" style="display:none">No hardest-val-images artifact for this internal run yet — reload after its first validation mAP pass has completed.</div>
+
+<div id="pv-viewer">
+  <div id="pv-controls">
+    <div class="pv-group">
+      <button type="button" id="pv-prev" class="button">← Prev</button>
+      <input type="number" id="pv-index" value="1" min="1" style="width:5em">
+      <span>/ <span id="pv-count">0</span></span>
+      <button type="button" id="pv-next" class="button">Next →</button>
+    </div>
+    <div class="pv-group">
+      <label for="pv-conf">Confidence ≥ <span id="pv-conf-val">{{ score_threshold|default:"0.25" }}</span></label>
+      <input type="range" id="pv-conf" min="0" max="1" step="0.001" value="{{ score_threshold|default:"0.25" }}">
+    </div>
+    <div class="pv-group">
+      <label><input type="checkbox" id="pv-gt" checked> Show ground truth</label>
+    </div>
+    <div class="pv-legend">
+      <span><span class="pv-swatch" style="background:#00c853"></span>prediction</span>
+      <span><span class="pv-swatch" style="background:#ff3d00"></span>ground truth</span>
+    </div>
+  </div>
+
+  <div id="pv-status"></div>
+  <div id="pv-error"></div>
+
+  <div id="pv-stage">
+    <img id="pv-img" alt="">
+    <canvas id="pv-canvas"></canvas>
+  </div>
+</div>
+
+<p style="margin-top:16px"><a href="../" class="button cancel-link">{{ back_label|default:"Back to training runs" }}</a></p>
+
+</div>
+
+{{ report_json|json_script:"report-data" }}
+
+<script>
+(function () {
+  "use strict";
+  var RUN_ID = {{ run_id }};
+  var METRICS_URL = "{{ metrics_url }}";
+  var IMAGE_URL = "{% url 'admin:training_trainingrun_hard_images_image' %}";
+  var DATA_URL = "{% url 'admin:training_trainingrun_hard_images_data' %}";
+  var POLL_MS = 5000;
+  var TERMINAL = { ok: 1, error: 1 };
+
+  var data = JSON.parse(document.getElementById("report-data").textContent);
+  var selectedRun = null;   // run_name string
+
+  // ---- charts ----------------------------------------------------------
+  var COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"];
+  var CHART_SPECS = [
+    { id: "chart-loss", series: [["train_loss", "train"], ["val_loss", "val"]] },
+    { id: "chart-map", series: [["map50", "mAP@50"], ["map50_95", "mAP@50-95"]] },
+    { id: "chart-pr", series: [["precision", "precision"], ["recall", "recall"], ["f1", "f1"]] },
+    { id: "chart-lr", series: [["lr", "lr"]] },
+  ];
+  var charts = {};
+
+  function datasetsFor(spec, epochs) {
+    return spec.series.map(function (s, i) {
+      return {
+        label: s[1],
+        data: epochs.map(function (e) { return e[s[0]]; }),
+        borderColor: COLORS[i % COLORS.length],
+        backgroundColor: COLORS[i % COLORS.length],
+        borderWidth: 2, pointRadius: 2, spanGaps: true, tension: 0.15,
+      };
+    });
+  }
+
+  function buildCharts(epochs) {
+    var labels = epochs.map(function (e) { return e.epoch; });
+    CHART_SPECS.forEach(function (spec) {
+      var isLr = spec.id === "chart-lr";
+      var cfg = {
+        type: "line",
+        data: { labels: labels, datasets: datasetsFor(spec, epochs) },
+        options: {
+          responsive: true, maintainAspectRatio: false, animation: false,
+          interaction: { mode: "index", intersect: false },
+          scales: {
+            x: { title: { display: true, text: "epoch" } },
+            y: isLr ? { type: "logarithmic" } : { beginAtZero: false },
+          },
+          plugins: { legend: { display: spec.series.length > 1 } },
+        },
+      };
+      charts[spec.id] = new Chart(document.getElementById(spec.id).getContext("2d"), cfg);
+    });
+  }
+
+  function updateCharts(epochs) {
+    var labels = epochs.map(function (e) { return e.epoch; });
+    CHART_SPECS.forEach(function (spec) {
+      var ch = charts[spec.id];
+      if (!ch) return;
+      ch.data.labels = labels;
+      ch.data.datasets = datasetsFor(spec, epochs);
+      ch.update();
+    });
+  }
+
+  // ---- metrics table ---------------------------------------------------
+  var ROWS = [
+    ["train_loss", "Train loss", "f4"], ["val_loss", "Val loss", "f4"],
+    ["map50", "mAP@50", "f4"], ["map50_95", "mAP@50-95", "f4"],
+    ["precision", "Precision", "f4"], ["recall", "Recall", "f4"], ["f1", "F1", "f4"],
+    ["lr", "Learning rate", "exp"],
+  ];
+
+  function fmt(v, kind) {
+    if (v === null || v === undefined || (typeof v === "number" && isNaN(v))) return null;
+    if (typeof v !== "number") return String(v);
+    return kind === "exp" ? v.toExponential(2) : v.toFixed(4);
+  }
+
+  function renderTable(latest) {
+    var body = document.getElementById("lr-metrics-body");
+    body.innerHTML = "";
+    var rows = ROWS.slice();
+    if (latest && latest.best_metric && latest.best_metric !== "val_map50") {
+      rows.push(["best_metric_score", latest.best_metric, "f4"]);
+    }
+    rows.forEach(function (r) {
+      var tr = document.createElement("tr");
+      var th = document.createElement("th");
+      th.className = "rowlabel"; th.textContent = r[1]; tr.appendChild(th);
+      var td = document.createElement("td");
+      var val = latest ? fmt(latest[r[0]], r[2]) : null;
+      if (val === null) { td.className = "na"; td.textContent = "—"; }
+      else { td.textContent = val; }
+      tr.appendChild(td);
+      body.appendChild(tr);
+    });
+  }
+
+  // ---- status header ---------------------------------------------------
+  function renderStatus(runObj) {
+    var epochs = runObj ? runObj.epochs : [];
+    var last = epochs.length ? epochs[epochs.length - 1] : null;
+    var total = data.total_epochs != null ? data.total_epochs : "?";
+    var cur = last ? (last.epoch != null ? last.epoch : epochs.length) : "—";
+    document.getElementById("lr-epoch").textContent = "Epoch " + cur + " / " + total;
+    var bestEl = document.getElementById("lr-best");
+    var best = epochs.filter(function (e) { return e.is_best; }).pop();
+    if (best) {
+      var score = fmt(best.best_metric_score, "f4");
+      bestEl.textContent = "★ best epoch " + best.epoch + (score ? " (" + (best.best_metric || "score") + " " + score + ")" : "");
+    } else { bestEl.textContent = ""; }
+    var note = document.getElementById("lr-poll-note");
+    note.textContent = TERMINAL[data.status] ? "run finished (" + data.status + ") — live updates stopped" : "status: " + data.status + " — updating live";
+  }
+
+  // ---- internal-run picker ---------------------------------------------
+  function findRun(name) {
+    for (var i = 0; i < data.runs.length; i++) if (data.runs[i].run_name === name) return data.runs[i];
+    return null;
+  }
+
+  function renderPicker() {
+    var sel = document.getElementById("lr-run-select");
+    sel.innerHTML = "";
+    data.runs.forEach(function (r) {
+      var opt = document.createElement("option");
+      opt.value = r.run_name;
+      opt.textContent = r.run_name + " (" + r.epochs.length + " epochs"
+        + (r.has_hard_images ? ", " + r.hard_image_count + " hard imgs" : "") + ")";
+      sel.appendChild(opt);
+    });
+    if (selectedRun && findRun(selectedRun)) sel.value = selectedRun;
+    else selectedRun = data.runs.length ? data.runs[0].run_name : null;
+  }
+
+  // ---- hardest-val viewer (lifted from hard_images_viewer.html) --------
+  var PRED_COLOR = "#00c853", GT_COLOR = "#ff3d00";
+  var vImg = document.getElementById("pv-img");
+  var vCanvas = document.getElementById("pv-canvas");
+  var vCtx = vCanvas.getContext("2d");
+  var idxInput = document.getElementById("pv-index");
+  var countEl = document.getElementById("pv-count");
+  var confInput = document.getElementById("pv-conf");
+  var confVal = document.getElementById("pv-conf-val");
+  var gtToggle = document.getElementById("pv-gt");
+  var vStatus = document.getElementById("pv-status");
+  var vError = document.getElementById("pv-error");
+  var breakdownEl = document.getElementById("pv-breakdown");
+  var vViewer = document.getElementById("pv-viewer");
+  var vEmpty = document.getElementById("pv-empty");
+
+  var vQuery = "";     // run=..&run_name=.. for the selected run
+  var vCount = 0;
+  var vIndex = 0;
+  var vCurrent = null;
+
+  function vDraw() {
+    var w = vImg.clientWidth, h = vImg.clientHeight;
+    if (!w || !h) return;
+    vCanvas.width = w; vCanvas.height = h;
+    vCanvas.style.width = w + "px"; vCanvas.style.height = h + "px";
+    vCtx.clearRect(0, 0, w, h);
+    if (!vCurrent) return;
+    if (gtToggle.checked && vCurrent.ground_truth) {
+      vCurrent.ground_truth.forEach(function (b) { vBox(b, w, h, GT_COLOR, b.class_name); });
+    }
+    var thr = parseFloat(confInput.value);
+    (vCurrent.predictions || []).forEach(function (b) {
+      if (b.confidence < thr) return;
+      vBox(b, w, h, PRED_COLOR, b.class_name + " " + Math.round(b.confidence * 100) + "%");
+    });
+  }
+
+  function vBox(b, w, h, color, label) {
+    var x = (b.cx - b.w / 2) * w, y = (b.cy - b.h / 2) * h;
+    vCtx.lineWidth = 2; vCtx.strokeStyle = color;
+    vCtx.strokeRect(x, y, b.w * w, b.h * h);
+    if (label) {
+      vCtx.font = "13px sans-serif";
+      var tw = vCtx.measureText(label).width;
+      var ty = y - 16 >= 0 ? y - 16 : y;
+      vCtx.fillStyle = color;
+      vCtx.fillRect(x, ty, tw + 8, 16);
+      vCtx.fillStyle = "#fff";
+      vCtx.fillText(label, x + 4, ty + 12);
+    }
+  }
+
+  function vBreakdown() {
+    if (!vCurrent || vCurrent.difficulty == null) { breakdownEl.textContent = ""; return; }
+    breakdownEl.textContent = "This image · difficulty " + vCurrent.difficulty
+      + " = " + vCurrent.missed + " missed + " + vCurrent.false_positives + " false positive(s) + "
+      + vCurrent.wrong_class + " wrong class + " + vCurrent.loc_error + " localization slack";
+  }
+
+  function vLoad(i) {
+    if (i < 0 || i >= vCount) return;
+    vIndex = i;
+    idxInput.value = i + 1;
+    vCurrent = null;
+    vError.textContent = "";
+    vStatus.textContent = "Loading image " + (i + 1) + " / " + vCount + "…";
+    vImg.src = IMAGE_URL + "?" + vQuery + "&index=" + i;
+    fetch(DATA_URL + "?" + vQuery + "&index=" + i)
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        if (vIndex !== i) return;
+        if (!res.ok) { vError.textContent = res.j.error || "failed to load"; vStatus.textContent = ""; return; }
+        vCurrent = res.j;
+        var np = (vCurrent.predictions || []).length, ng = (vCurrent.ground_truth || []).length;
+        vStatus.textContent = (vCurrent.image || "") + " — " + np + " prediction(s), " + ng + " ground-truth box(es)";
+        vBreakdown();
+        vDraw();
+      })
+      .catch(function (e) { if (vIndex === i) { vError.textContent = String(e); vStatus.textContent = ""; } });
+  }
+
+  function setViewer(runObj) {
+    if (runObj && runObj.has_hard_images && runObj.hard_image_count > 0) {
+      vViewer.style.display = "";
+      vEmpty.style.display = "none";
+      vQuery = runObj.query;
+      vCount = runObj.hard_image_count;
+      idxInput.max = vCount;
+      countEl.textContent = vCount;
+      vLoad(0);
+    } else {
+      vViewer.style.display = "none";
+      vEmpty.style.display = "";
+      vCount = 0; vCurrent = null;
+    }
+  }
+
+  vImg.addEventListener("load", vDraw);
+  window.addEventListener("resize", vDraw);
+  confInput.addEventListener("input", function () { confVal.textContent = confInput.value; vDraw(); });
+  gtToggle.addEventListener("change", vDraw);
+  document.getElementById("pv-prev").addEventListener("click", function () { vLoad(vIndex - 1); });
+  document.getElementById("pv-next").addEventListener("click", function () { vLoad(vIndex + 1); });
+  idxInput.addEventListener("change", function () {
+    var v = parseInt(idxInput.value, 10);
+    if (!isNaN(v)) vLoad(Math.min(Math.max(v - 1, 0), vCount - 1));
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.target.tagName === "INPUT") return;
+    if (e.key === "ArrowLeft") vLoad(vIndex - 1);
+    else if (e.key === "ArrowRight") vLoad(vIndex + 1);
+  });
+
+  // ---- wiring ----------------------------------------------------------
+  function selectRun(name) {
+    selectedRun = name;
+    var runObj = findRun(name);
+    var epochs = runObj ? runObj.epochs : [];
+    updateCharts(epochs);
+    renderTable(epochs.length ? epochs[epochs.length - 1] : null);
+    renderStatus(runObj);
+    setViewer(runObj);
+  }
+
+  document.getElementById("lr-run-select").addEventListener("change", function (e) {
+    selectRun(e.target.value);
+  });
+
+  // initial render
+  renderPicker();
+  buildCharts(selectedRun && findRun(selectedRun) ? findRun(selectedRun).epochs : []);
+  selectRun(selectedRun);
+
+  // ---- polling ---------------------------------------------------------
+  var inFlight = false, timer = null;
+  function poll() {
+    if (inFlight) return;
+    if (TERMINAL[data.status]) { if (timer) clearInterval(timer); return; }
+    inFlight = true;
+    fetch(METRICS_URL + "?run=" + RUN_ID)
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (fresh) {
+        inFlight = false;
+        if (!fresh || fresh.error) return;
+        var prevSelected = selectedRun;
+        data = fresh;
+        renderPicker();
+        var name = (prevSelected && findRun(prevSelected)) ? prevSelected : selectedRun;
+        // charts/table/status/viewer refresh for the still-selected run;
+        // the viewer only reloads the image list when the run actually changed.
+        var wasEmpty = vCount === 0;
+        var runObj = findRun(name);
+        selectedRun = name;
+        document.getElementById("lr-run-select").value = name || "";
+        updateCharts(runObj ? runObj.epochs : []);
+        renderTable(runObj && runObj.epochs.length ? runObj.epochs[runObj.epochs.length - 1] : null);
+        renderStatus(runObj);
+        // Reset the viewer only when the selected run changed, or when hard
+        // images first appear for a run that had none — otherwise leave the
+        // user's current image / position untouched.
+        var nowHas = runObj && runObj.has_hard_images && runObj.hard_image_count > 0;
+        if (name !== prevSelected || (wasEmpty && nowHas)) setViewer(runObj);
+        if (TERMINAL[data.status] && timer) clearInterval(timer);
+      })
+      .catch(function () { inFlight = false; });
+  }
+  if (!TERMINAL[data.status]) timer = setInterval(poll, POLL_MS);
+})();
+</script>
+{% endblock %}

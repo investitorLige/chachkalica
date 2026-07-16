@@ -217,16 +217,12 @@ def build_rfdetr(
     try:
         wrapper = variant_cls(**constructor_kwargs)
     except Exception as exc:  # noqa: BLE001
-        if constructor_kwargs.get("pretrain_weights", "unset") is None:
-            raise  # scratch was requested already, so this is a real build error
-        # Fall back to random init (not a crash) if the published pretrained
-        # weights can't be fetched — e.g. no network or a blocked host.
-        print(
-            f"[rfdetr] Pretrained weights unavailable ({exc}); "
-            f"training from scratch (random init)."
-        )
-        constructor_kwargs["pretrain_weights"] = None
-        wrapper = variant_cls(**constructor_kwargs)
+        if constructor_kwargs.get("pretrain_weights", "unset") is not None:
+            raise RuntimeError(
+                "RF-DETR pretrained weights were requested but could not be loaded; "
+                "refusing to silently train from random initialization."
+            ) from exc
+        raise
     model_config = wrapper.model_config
     network = wrapper.model.model  # the underlying LW-DETR nn.Module
 

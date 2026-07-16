@@ -3,3 +3,5 @@
 
 # Service operational logs (friendy_chachkalica/service.py -> logs/{train,eval,other}/)
 logs/
+
+person_model_test/

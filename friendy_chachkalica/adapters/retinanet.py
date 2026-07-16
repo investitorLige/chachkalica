@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -7,14 +8,6 @@ try:
     from ..formats import xyxy_prediction_to_friendy
 except ImportError:
     from formats import xyxy_prediction_to_friendy
-
-
-# torchvision's RetinaNet reserves label 0 for the background class, so real
-# (foreground) classes must occupy labels 1..num_classes. The rest of the
-# pipeline (datasets, class dicts, metrics) works in 0-indexed dataset ids, so
-# the adapter shifts labels by this offset on the way in/out to hide the
-# background slot from everything outside torchvision.
-_BACKGROUND_CLASS_OFFSET = 1
 
 
 @dataclass
@@ -37,14 +30,14 @@ class RetinaNetAdapter:
 
     def training_step(self, images, targets):
         self.model.train()
-        return self._loss_forward(images, _shift_targets_to_model_labels(targets))
+        return self._loss_forward(images, targets)
 
     def validation_step(self, images, targets):
         was_training = self.model.training
         self.model.train()
         _set_batch_norm_eval(self.model)
         try:
-            return self._loss_forward(images, _shift_targets_to_model_labels(targets))
+            return self._loss_forward(images, targets)
         finally:
             self.model.train(was_training)
 
@@ -53,11 +46,19 @@ class RetinaNetAdapter:
         return sum(loss for loss in losses.values()), losses
 
     @torch.no_grad()
-    def predict(self, images):
+    def predict(self, images, score_threshold: Optional[float] = None):
         self.model.eval()
-        predictions = self.model(images)
+        original_threshold = self.model.score_thresh
+        if score_threshold is not None:
+            self.model.score_thresh = float(score_threshold)
+        try:
+            predictions = self.model(images)
+        finally:
+            # Evaluation can request a low mAP floor without permanently
+            # changing the model's configured serving threshold.
+            self.model.score_thresh = original_threshold
         return [
-            retinanet_prediction_to_friendy(_shift_prediction_to_dataset_labels(prediction), image)
+            retinanet_prediction_to_friendy(prediction, image)
             for prediction, image in zip(predictions, images)
         ]
 
@@ -95,35 +96,88 @@ def build_retinanet(
         else _resolve_weights(ResNet50_Weights, weights_backbone)
     )
 
-    # torchvision counts the background as one of num_classes, so add a slot for
-    # it on top of the foreground classes the caller asked for.
-    model_num_classes = num_classes + _BACKGROUND_CLASS_OFFSET
-
     try:
-        model = builder(
-            weights=model_weights,
-            weights_backbone=backbone_weights,
-            num_classes=model_num_classes,
+        model = _build_retinanet_model(
+            builder=builder,
+            model_weights=model_weights,
+            backbone_weights=backbone_weights,
+            model_num_classes=num_classes,
             trainable_backbone_layers=trainable_backbone_layers,
-            **kwargs,
+            builder_kwargs=kwargs,
         )
     except Exception as exc:  # noqa: BLE001
-        if model_weights is None and backbone_weights is None:
-            raise  # no weights were requested, so this is a real build error
-        # Fall back to random init (not a crash) if the pretrained weights can't
-        # be downloaded — e.g. no network or a blocked torchvision host.
-        print(
-            f"[retinanet] Pretrained weights unavailable ({exc}); "
-            f"training from scratch (random init)."
-        )
-        model = builder(
-            weights=None,
-            weights_backbone=None,
-            num_classes=model_num_classes,
-            trainable_backbone_layers=trainable_backbone_layers,
-            **kwargs,
-        )
+        if model_weights is not None or backbone_weights is not None:
+            raise RuntimeError(
+                "RetinaNet pretrained weights were requested but could not be loaded; "
+                "refusing to silently train from random initialization."
+            ) from exc
+        raise
     return RetinaNetAdapter(model=model, num_classes=num_classes)
+
+
+def _build_retinanet_model(
+    builder,
+    model_weights,
+    backbone_weights,
+    model_num_classes: int,
+    trainable_backbone_layers: Optional[int],
+    builder_kwargs: Dict[str, Any],
+):
+    if model_weights is not None:
+        # torchvision requires the pretrained detector's native COCO class count
+        # while loading its state dict. Load it first, then replace only the final
+        # classification convolution so the backbone, FPN, regression head, and
+        # classification feature tower retain their pretrained parameters.
+        model = builder(
+            weights=model_weights,
+            weights_backbone=None,
+            trainable_backbone_layers=trainable_backbone_layers,
+            **builder_kwargs,
+        )
+        old_num_classes = model.head.classification_head.num_classes
+        _replace_retinanet_classifier(model, model_num_classes)
+        print(
+            "[retinanet] Loaded pretrained detector weights and reinitialized "
+            f"the classifier ({old_num_classes} -> {model_num_classes} classes)."
+        )
+        return model
+
+    return builder(
+        weights=None,
+        weights_backbone=backbone_weights,
+        num_classes=model_num_classes,
+        trainable_backbone_layers=trainable_backbone_layers,
+        **builder_kwargs,
+    )
+
+
+def _replace_retinanet_classifier(model, num_classes: int) -> None:
+    classification_head = model.head.classification_head
+    old_logits = classification_head.cls_logits
+    num_anchors = classification_head.num_anchors
+
+    new_logits = torch.nn.Conv2d(
+        in_channels=old_logits.in_channels,
+        out_channels=num_anchors * num_classes,
+        kernel_size=old_logits.kernel_size,
+        stride=old_logits.stride,
+        padding=old_logits.padding,
+        dilation=old_logits.dilation,
+        groups=old_logits.groups,
+        bias=old_logits.bias is not None,
+        padding_mode=old_logits.padding_mode,
+    ).to(device=old_logits.weight.device, dtype=old_logits.weight.dtype)
+
+    torch.nn.init.normal_(new_logits.weight, std=0.01)
+    if new_logits.bias is not None:
+        prior_probability = 0.01
+        torch.nn.init.constant_(
+            new_logits.bias,
+            -math.log((1 - prior_probability) / prior_probability),
+        )
+
+    classification_head.cls_logits = new_logits
+    classification_head.num_classes = num_classes
 
 
 def retinanet_prediction_to_friendy(
@@ -137,27 +191,6 @@ def retinanet_prediction_to_friendy(
         image_width=image_width,
         image_height=image_height,
     )
-
-
-def _shift_targets_to_model_labels(targets):
-    """Shift 0-indexed dataset labels up to torchvision's 1-indexed foreground labels."""
-    shifted = []
-    for target in targets:
-        shifted_target = dict(target)
-        shifted_target["labels"] = target["labels"] + _BACKGROUND_CLASS_OFFSET
-        shifted.append(shifted_target)
-    return shifted
-
-
-def _shift_prediction_to_dataset_labels(prediction):
-    """Shift torchvision's 1-indexed foreground labels back to 0-indexed dataset ids.
-
-    torchvision's postprocessing already drops the background class, so predicted
-    labels are always >= 1 and this never produces a negative id.
-    """
-    shifted = dict(prediction)
-    shifted["labels"] = prediction["labels"] - _BACKGROUND_CLASS_OFFSET
-    return shifted
 
 
 def _resolve_weights(enum_cls, value):

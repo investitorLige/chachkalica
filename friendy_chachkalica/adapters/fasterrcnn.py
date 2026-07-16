@@ -53,9 +53,17 @@ class FasterRCNNAdapter:
         return sum(loss for loss in losses.values()), losses
 
     @torch.no_grad()
-    def predict(self, images):
+    def predict(self, images, score_threshold: Optional[float] = None):
         self.model.eval()
-        predictions = self.model(images)
+        original_threshold = self.model.roi_heads.score_thresh
+        if score_threshold is not None:
+            self.model.roi_heads.score_thresh = float(score_threshold)
+        try:
+            predictions = self.model(images)
+        finally:
+            # Evaluation can request a low mAP floor without permanently
+            # changing the model's configured serving threshold.
+            self.model.roi_heads.score_thresh = original_threshold
         return [
             fasterrcnn_prediction_to_friendy(_shift_prediction_to_dataset_labels(prediction), image)
             for prediction, image in zip(predictions, images)
@@ -102,6 +110,7 @@ def build_fasterrcnn(
         fasterrcnn_resnet50_fpn,
         fasterrcnn_resnet50_fpn_v2,
     )
+    from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
     from torchvision.models import MobileNet_V3_Large_Weights, ResNet50_Weights
 
     builder_by_variant = {
@@ -150,32 +159,64 @@ def build_fasterrcnn(
     head_kwargs = {k: v for k, v in head_kwargs.items() if v is not None}
 
     try:
-        model = builder(
-            weights=model_weights,
-            weights_backbone=backbone_weights,
-            num_classes=model_num_classes,
+        model = _build_fasterrcnn_model(
+            builder=builder,
+            model_weights=model_weights,
+            backbone_weights=backbone_weights,
+            model_num_classes=model_num_classes,
             trainable_backbone_layers=trainable_backbone_layers,
-            **head_kwargs,
-            **kwargs,
+            predictor_factory=FastRCNNPredictor,
+            builder_kwargs={**head_kwargs, **kwargs},
         )
     except Exception as exc:  # noqa: BLE001
-        if model_weights is None and backbone_weights is None:
-            raise  # no weights were requested, so this is a real build error
-        # Fall back to random init (not a crash) if the pretrained weights can't
-        # be downloaded — e.g. no network or a blocked torchvision host.
-        print(
-            f"[fasterrcnn] Pretrained weights unavailable ({exc}); "
-            f"training from scratch (random init)."
-        )
-        model = builder(
-            weights=None,
-            weights_backbone=None,
-            num_classes=model_num_classes,
-            trainable_backbone_layers=trainable_backbone_layers,
-            **head_kwargs,
-            **kwargs,
-        )
+        if model_weights is not None or backbone_weights is not None:
+            raise RuntimeError(
+                "Faster R-CNN pretrained weights were requested but could not be loaded; "
+                "refusing to silently train from random initialization."
+            ) from exc
+        raise
     return FasterRCNNAdapter(model=model, num_classes=num_classes)
+
+
+def _build_fasterrcnn_model(
+    builder,
+    model_weights,
+    backbone_weights,
+    model_num_classes: int,
+    trainable_backbone_layers: Optional[int],
+    predictor_factory,
+    builder_kwargs: Dict[str, Any],
+):
+    if model_weights is not None:
+        # Load the native COCO predictor first so torchvision can restore the
+        # complete detector state dict, then replace only the task-specific box
+        # predictor. The backbone, FPN, RPN, and RoI feature layers stay pretrained.
+        model = builder(
+            weights=model_weights,
+            weights_backbone=None,
+            trainable_backbone_layers=trainable_backbone_layers,
+            **builder_kwargs,
+        )
+        old_predictor = model.roi_heads.box_predictor
+        in_features = old_predictor.cls_score.in_features
+        old_num_classes = old_predictor.cls_score.out_features
+        model.roi_heads.box_predictor = predictor_factory(
+            in_features,
+            model_num_classes,
+        )
+        print(
+            "[fasterrcnn] Loaded pretrained detector weights and reinitialized "
+            f"the box predictor ({old_num_classes} -> {model_num_classes} classes)."
+        )
+        return model
+
+    return builder(
+        weights=None,
+        weights_backbone=backbone_weights,
+        num_classes=model_num_classes,
+        trainable_backbone_layers=trainable_backbone_layers,
+        **builder_kwargs,
+    )
 
 
 def fasterrcnn_prediction_to_friendy(

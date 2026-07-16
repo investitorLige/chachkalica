@@ -183,15 +183,13 @@ def build_yolox(
         **builder_options,
     )
     if weights:
-        # Fall back to random init (not a crash) if the pretrained weights can't
-        # be fetched/loaded — e.g. no network, a blocked host, or a bad path.
         try:
             _load_checkpoint(model, weights)
         except Exception as exc:  # noqa: BLE001
-            print(
-                f"[yolox] Pretrained weights {weights!r} unavailable ({exc}); "
-                f"training from scratch (random init)."
-            )
+            raise RuntimeError(
+                f"YOLOX pretrained weights {weights!r} were requested but could "
+                "not be loaded; refusing to silently train from random initialization."
+            ) from exc
 
     return YOLOXAdapter(
         model=model,
@@ -242,14 +240,30 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint_ref: str) -> None:
         checkpoint = torch.hub.load_state_dict_from_url(checkpoint_ref, map_location="cpu")
     else:
         checkpoint = torch.load(checkpoint_ref, map_location="cpu")
-    state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        raise ValueError(
+            "This is a Friendy training checkpoint. Select it as 'Your model' "
+            "so the checked warm-start loader is used."
+        )
+    state_dict = (
+        checkpoint.get("model", checkpoint)
+        if isinstance(checkpoint, dict)
+        else checkpoint
+    )
+    if not isinstance(state_dict, dict):
+        raise ValueError(
+            "YOLOX pretrained checkpoint does not contain a state dict")
 
     model_state = model.state_dict()
     compatible = {
         key: tensor for key, tensor in state_dict.items()
-        if key in model_state and tensor.shape == model_state[key].shape
+        if key in model_state and torch.is_tensor(tensor) and tensor.shape == model_state[key].shape
     }
     reinit = [key for key in state_dict if key not in compatible]
+    if not compatible:
+        raise ValueError(
+            "YOLOX pretrained checkpoint has no tensors compatible with this model"
+        )
     model.load_state_dict(compatible, strict=False)
     if reinit:
         print(
