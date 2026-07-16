@@ -196,11 +196,22 @@ def build_rtdetr(
     ignore_mismatched_sizes: bool = True,
     **config_kwargs: Any,
 ) -> RTDETRAdapter:
-    (
-        RTDetrConfig,
-        RTDetrForObjectDetection,
-        RTDetrImageProcessor,
-    ) = _load_transformers_rtdetr()
+    # RT-DETRv2 ships as its own model class (RTDetrV2ForObjectDetection): the
+    # v2 checkpoints (PekingU/rtdetr_v2_*) won't load through the v1 class. We
+    # route by repo id so a v2 selection in the weights dropdown "just works",
+    # while the image processor is shared between the two.
+    if _is_rtdetr_v2(weights):
+        (
+            RTDetrConfig,
+            RTDetrForObjectDetection,
+            RTDetrImageProcessor,
+        ) = _load_transformers_rtdetr_v2()
+    else:
+        (
+            RTDetrConfig,
+            RTDetrForObjectDetection,
+            RTDetrImageProcessor,
+        ) = _load_transformers_rtdetr()
 
     input_max_size = config_kwargs.pop("input_max_size", input_max_size)
     input_size_multiple = config_kwargs.pop("input_size_multiple", input_size_multiple)
@@ -282,6 +293,19 @@ def rtdetr_prediction_to_friendy(
     )
 
 
+def _is_rtdetr_v2(weights) -> bool:
+    """True when ``weights`` names an RT-DETRv2 checkpoint (repo id or path).
+
+    v2 checkpoints must be built with ``RTDetrV2ForObjectDetection``; the v1
+    class silently fails to load them. Matches both the HuggingFace repo-id
+    spelling (``PekingU/rtdetr_v2_r50vd``) and the class-name spelling.
+    """
+    if not isinstance(weights, str):
+        return False
+    normalized = weights.lower()
+    return "rtdetr_v2" in normalized or "rtdetrv2" in normalized
+
+
 def _load_transformers_rtdetr():
     try:
         from transformers import (
@@ -296,3 +320,25 @@ def _load_transformers_rtdetr():
         ) from exc
 
     return RTDetrConfig, RTDetrForObjectDetection, RTDetrImageProcessor
+
+
+def _load_transformers_rtdetr_v2():
+    """RT-DETRv2 config/model classes (+ the shared v1 image processor).
+
+    RT-DETRv2 landed in a later transformers release than v1, so a clear error
+    beats an AttributeError if the installed transformers is too old.
+    """
+    try:
+        from transformers import (
+            RTDetrV2Config,
+            RTDetrV2ForObjectDetection,
+            RTDetrImageProcessor,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "RT-DETRv2 weights need a transformers new enough to ship "
+            "RTDetrV2ForObjectDetection. Upgrade with `pip install -U transformers` "
+            "(see requirements-rtdetr.txt)."
+        ) from exc
+
+    return RTDetrV2Config, RTDetrV2ForObjectDetection, RTDetrImageProcessor

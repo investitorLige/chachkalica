@@ -3,10 +3,76 @@
 // row. Fields are tagged with class "xm-spec-field" and data-arch="<arch>"; we
 // toggle the enclosing admin .form-row so labels/help hide with the widget.
 //
+// The pretrained-weights dropdown (class "xm-weights-field") is one such field,
+// but its <option>s are additionally variant-aware: an option tagged
+// data-variant="<v>" is shown only while that variant is selected in the row
+// (e.g. RF-DETR's Objects365 weights, which only fit the "base" variant). The
+// shared "Custom weights (path or URL)" text field (class "xm-weights-custom")
+// is shown only while the visible weights dropdown is set to the "__custom__"
+// sentinel.
+//
 // Vanilla JS on purpose: relying on django.jQuery meant the script ran before
 // jQuery was defined and threw, leaving every arch's fields visible.
 (function () {
     "use strict";
+
+    var CUSTOM = "__custom__";
+
+    function setRowVisible(field, visible) {
+        var formRow = field.closest(".form-row") || field;
+        formRow.style.display = visible ? "" : "none";
+    }
+
+    // Filter the weights <select>'s options by the row's selected variant, then
+    // reset the selection if the current choice was hidden.
+    function syncWeightsOptions(row, arch) {
+        var select = row.querySelector(
+            '.xm-weights-field[data-arch="' + arch + '"]'
+        );
+        if (!select) {
+            return;
+        }
+        // RT-DETR has no variant field (size == checkpoint), so nothing to
+        // filter — its options carry no data-variant and all stay visible.
+        var variantSelect = row.querySelector(
+            'select[id$="-xm_' + arch + '_variant"]'
+        );
+        var variant = variantSelect ? variantSelect.value : "";
+
+        var current = select.value;
+        var currentHidden = false;
+        Array.prototype.forEach.call(select.options, function (opt) {
+            var optVariant = opt.getAttribute("data-variant");
+            var show = !optVariant || optVariant === variant;
+            opt.hidden = !show;
+            opt.disabled = !show;
+            if (!show && opt.value === current) {
+                currentHidden = true;
+            }
+        });
+        if (currentHidden) {
+            // Fall back to the first still-visible option (None / default).
+            for (var i = 0; i < select.options.length; i++) {
+                if (!select.options[i].hidden) {
+                    select.value = select.options[i].value;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Show the shared custom-weights text field only when the visible weights
+    // dropdown is on the "__custom__" sentinel.
+    function syncCustomWeights(row, arch) {
+        var custom = row.querySelector(".xm-weights-custom");
+        if (!custom) {
+            return;
+        }
+        var select = row.querySelector(
+            '.xm-weights-field[data-arch="' + arch + '"]'
+        );
+        setRowVisible(custom, !!select && select.value === CUSTOM);
+    }
 
     function syncRow(row) {
         if (!row || !row.querySelectorAll) {
@@ -18,10 +84,10 @@
         }
         var arch = archSelect.value;
         row.querySelectorAll(".xm-spec-field").forEach(function (field) {
-            var matches = field.getAttribute("data-arch") === arch;
-            var formRow = field.closest(".form-row") || field;
-            formRow.style.display = matches ? "" : "none";
+            setRowVisible(field, field.getAttribute("data-arch") === arch);
         });
+        syncWeightsOptions(row, arch);
+        syncCustomWeights(row, arch);
     }
 
     function rowFor(el) {
@@ -55,11 +121,31 @@
 
         document.addEventListener("change", function (event) {
             var target = event.target;
-            if (target && target.matches && target.matches('select[id$="-arch"]')) {
+            if (!target || !target.matches) {
+                return;
+            }
+            if (target.matches('select[id$="-arch"]')) {
                 syncRow(rowFor(target));
             }
-            if (target && target.matches && target.matches('select[id$="-xm_rfdetr_variant"]')) {
+            // A variant change re-filters the weights options for its row.
+            if (target.matches('select[id*="_variant"]')) {
+                var row = rowFor(target);
+                var archSelect = row.querySelector('select[id$="-arch"]');
+                if (archSelect) {
+                    syncWeightsOptions(row, archSelect.value);
+                    syncCustomWeights(row, archSelect.value);
+                }
+            }
+            if (target.matches('select[id$="-xm_rfdetr_variant"]')) {
                 fillRfdetrResolution(target);
+            }
+            // Toggling the weights dropdown shows/hides the custom text field.
+            if (target.matches(".xm-weights-field")) {
+                var wrow = rowFor(target);
+                var warchSelect = wrow.querySelector('select[id$="-arch"]');
+                if (warchSelect) {
+                    syncCustomWeights(wrow, warchSelect.value);
+                }
             }
         });
 

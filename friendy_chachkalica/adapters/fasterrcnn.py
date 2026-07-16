@@ -9,6 +9,14 @@ except ImportError:
     from formats import xyxy_prediction_to_friendy
 
 
+# torchvision's Faster R-CNN reserves label 0 for the background class, so real
+# (foreground) classes must occupy labels 1..num_classes. The rest of the
+# pipeline (datasets, class dicts, metrics) works in 0-indexed dataset ids, so
+# the adapter shifts labels by this offset on the way in/out to hide the
+# background slot from everything outside torchvision.
+_BACKGROUND_CLASS_OFFSET = 1
+
+
 @dataclass
 class FasterRCNNAdapter:
     model: torch.nn.Module
@@ -29,14 +37,14 @@ class FasterRCNNAdapter:
 
     def training_step(self, images, targets):
         self.model.train()
-        return self._loss_forward(images, targets)
+        return self._loss_forward(images, _shift_targets_to_model_labels(targets))
 
     def validation_step(self, images, targets):
         was_training = self.model.training
         self.model.train()
         _set_batch_norm_eval(self.model)
         try:
-            return self._loss_forward(images, targets)
+            return self._loss_forward(images, _shift_targets_to_model_labels(targets))
         finally:
             self.model.train(was_training)
 
@@ -49,7 +57,7 @@ class FasterRCNNAdapter:
         self.model.eval()
         predictions = self.model(images)
         return [
-            fasterrcnn_prediction_to_friendy(prediction, image)
+            fasterrcnn_prediction_to_friendy(_shift_prediction_to_dataset_labels(prediction), image)
             for prediction, image in zip(predictions, images)
         ]
 
@@ -111,6 +119,10 @@ def build_fasterrcnn(
         "mobilenet_v3_large": MobileNet_V3_Large_Weights,
     }
 
+    # torchvision counts the background as one of num_classes, so add a slot for
+    # it on top of the foreground classes the caller asked for.
+    model_num_classes = num_classes + _BACKGROUND_CLASS_OFFSET
+
     builder, weight_enum = builder_by_variant[variant]
     backbone_weight_enum = backbone_weight_enum_by_family[_VARIANT_BACKBONES[variant]]
 
@@ -141,7 +153,7 @@ def build_fasterrcnn(
         model = builder(
             weights=model_weights,
             weights_backbone=backbone_weights,
-            num_classes=num_classes,
+            num_classes=model_num_classes,
             trainable_backbone_layers=trainable_backbone_layers,
             **head_kwargs,
             **kwargs,
@@ -158,7 +170,7 @@ def build_fasterrcnn(
         model = builder(
             weights=None,
             weights_backbone=None,
-            num_classes=num_classes,
+            num_classes=model_num_classes,
             trainable_backbone_layers=trainable_backbone_layers,
             **head_kwargs,
             **kwargs,
@@ -177,6 +189,27 @@ def fasterrcnn_prediction_to_friendy(
         image_width=image_width,
         image_height=image_height,
     )
+
+
+def _shift_targets_to_model_labels(targets):
+    """Shift 0-indexed dataset labels up to torchvision's 1-indexed foreground labels."""
+    shifted = []
+    for target in targets:
+        shifted_target = dict(target)
+        shifted_target["labels"] = target["labels"] + _BACKGROUND_CLASS_OFFSET
+        shifted.append(shifted_target)
+    return shifted
+
+
+def _shift_prediction_to_dataset_labels(prediction):
+    """Shift torchvision's 1-indexed foreground labels back to 0-indexed dataset ids.
+
+    torchvision's postprocessing already drops the background class, so predicted
+    labels are always >= 1 and this never produces a negative id.
+    """
+    shifted = dict(prediction)
+    shifted["labels"] = prediction["labels"] - _BACKGROUND_CLASS_OFFSET
+    return shifted
 
 
 def _resolve_weights(enum_cls, value):

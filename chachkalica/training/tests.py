@@ -14,7 +14,12 @@ from django.test import TestCase
 from fleet.models import Annotator, Dataset, FleetSettings
 from training import model_specs
 from training.forms import ExperimentModelForm
-from training.models import Experiment, ExperimentDataset, ExperimentModel
+from training.models import (
+    Experiment,
+    ExperimentDataset,
+    ExperimentModel,
+    TrainedModel,
+)
 from training.services import config_gen
 
 
@@ -337,3 +342,113 @@ class RFDETRResolutionValidationTests(TestCase):
         form, rfield = self._form(400, variant="nano")
         self.assertFalse(form.is_valid())
         self.assertIn(rfield, form.errors)
+
+
+class WeightsDropdownTests(TestCase):
+    """The pretrained-weights dropdown resolves into params['weights'] and keeps
+    the legacy ``pretrained`` column in sync."""
+
+    def _save(self, arch, weights_value, custom="", extra=None):
+        wfield = model_specs.weights_field_name(arch)
+        data = {"arch": arch, "params": "{}", wfield: weights_value}
+        if custom:
+            data["weights_custom"] = custom
+        if extra:
+            data.update(extra)
+        form = ExperimentModelForm(data=data, instance=ExperimentModel())
+        self.assertTrue(form.is_valid(), form.errors)
+        return form.save(commit=False)
+
+    def test_default_option_sets_weights_true(self):
+        obj = self._save(ExperimentModel.YOLOX, model_specs.WEIGHTS_DEFAULT)
+        self.assertIs(obj.params["weights"], True)
+        self.assertTrue(obj.pretrained)
+
+    def test_none_option_omits_weights_and_clears_pretrained(self):
+        obj = self._save(ExperimentModel.YOLOX, model_specs.WEIGHTS_NONE)
+        self.assertNotIn("weights", obj.params)
+        self.assertFalse(obj.pretrained)
+
+    def test_catalog_option_passes_through(self):
+        obj = self._save(ExperimentModel.RTDETR, "PekingU/rtdetr_v2_r50vd")
+        self.assertEqual(obj.params["weights"], "PekingU/rtdetr_v2_r50vd")
+        self.assertFalse(obj.pretrained)
+
+    def test_custom_option_uses_text_field(self):
+        obj = self._save(
+            ExperimentModel.YOLOX, model_specs.WEIGHTS_CUSTOM,
+            custom="/ckpts/mine.pth",
+        )
+        self.assertEqual(obj.params["weights"], "/ckpts/mine.pth")
+
+    def test_custom_without_text_is_rejected(self):
+        wfield = model_specs.weights_field_name(ExperimentModel.YOLOX)
+        form = ExperimentModelForm(
+            data={"arch": ExperimentModel.YOLOX, "params": "{}",
+                  wfield: model_specs.WEIGHTS_CUSTOM},
+            instance=ExperimentModel(),
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn("weights_custom", form.errors)
+
+    def test_rtdetr_has_no_default_option_but_lists_v1_and_v2(self):
+        choices = dict(model_specs.weights_base_choices(ExperimentModel.RTDETR))
+        self.assertNotIn(model_specs.WEIGHTS_DEFAULT, choices)
+        self.assertIn("PekingU/rtdetr_r50vd", choices)
+        self.assertIn("PekingU/rtdetr_v2_r18vd", choices)
+
+    def test_rfdetr_o365_is_variant_tagged_to_base(self):
+        vmap = model_specs.weights_variant_map(ExperimentModel.RFDETR)
+        self.assertEqual(vmap.get("rf-detr-base-o365.pth"), "base")
+
+    def test_trained_model_appears_as_option(self):
+        TrainedModel.objects.create(
+            name="my-yolox", arch=ExperimentModel.YOLOX,
+            checkpoint_path="/runs/best.pt",
+        )
+        form = ExperimentModelForm(instance=ExperimentModel(arch=ExperimentModel.YOLOX))
+        choices = dict(form.fields[
+            model_specs.weights_field_name(ExperimentModel.YOLOX)
+        ].choices)
+        self.assertIn("/runs/best.pt", choices)
+        # A model of a different arch must not leak into another arch's dropdown.
+        rtdetr_choices = dict(form.fields[
+            model_specs.weights_field_name(ExperimentModel.RTDETR)
+        ].choices)
+        self.assertNotIn("/runs/best.pt", rtdetr_choices)
+
+    def test_existing_string_weights_preselects_dropdown(self):
+        m = ExperimentModel(arch=ExperimentModel.RTDETR,
+                            params={"weights": "PekingU/rtdetr_v2_r34vd"})
+        form = ExperimentModelForm(instance=m)
+        field = form.fields[model_specs.weights_field_name(ExperimentModel.RTDETR)]
+        self.assertEqual(field.initial, "PekingU/rtdetr_v2_r34vd")
+
+    def test_existing_custom_path_selects_custom_and_fills_text(self):
+        m = ExperimentModel(arch=ExperimentModel.YOLOX,
+                            params={"weights": "/some/where.pth"})
+        form = ExperimentModelForm(instance=m)
+        field = form.fields[model_specs.weights_field_name(ExperimentModel.YOLOX)]
+        self.assertEqual(field.initial, model_specs.WEIGHTS_CUSTOM)
+        self.assertEqual(form.fields["weights_custom"].initial, "/some/where.pth")
+
+    def test_bytetrack_option_is_variant_tagged_when_present(self):
+        from unittest import mock
+
+        fake = [{
+            "value": "/app/data/training/weights/bytetrack_s_mot17.pth.tar",
+            "label": "ByteTrack person — CrowdHuman+MOT17 (s)",
+            "variant": "yolox-s",
+        }]
+        with mock.patch(
+            "training.forms.model_specs.bytetrack_yolox_options", return_value=fake
+        ):
+            form = ExperimentModelForm(
+                instance=ExperimentModel(arch=ExperimentModel.YOLOX)
+            )
+        field = form.fields[model_specs.weights_field_name(ExperimentModel.YOLOX)]
+        self.assertIn(fake[0]["value"], dict(field.choices))
+        # Tagged so the JS shows it only for the yolox-s variant.
+        self.assertEqual(field.widget.variant_map.get(fake[0]["value"]), "yolox-s")
+        # The trailing "Custom path or URL…" sentinel stays last.
+        self.assertEqual(field.choices[-1][0], model_specs.WEIGHTS_CUSTOM)

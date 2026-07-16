@@ -35,7 +35,10 @@ def export_retinanet(adapter, *, num_classes, params, class_map, onnx_path: str 
             # [C,H,W] images; a [1,3,H,W] tensor yields a single detection dict.
             detections = self.model(pixel_values)
             det = detections[0]
-            return det["boxes"], det["scores"], det["labels"]
+            # torchvision reserves label 0 for background and emits foreground
+            # classes as 1..num_classes; shift back to the 0-indexed dataset ids
+            # the meta class_map (and every other arch) uses.
+            return det["boxes"], det["scores"], det["labels"] - 1
 
     wrapper = RetinaNetExport(adapter.model.eval())
     export_detection_wrapper(wrapper, onnx_path)

@@ -13,6 +13,7 @@ from fleet.services import data_quality_solve
 from fleet.services import datasets as datasets_svc
 from fleet.services import lsapi
 from fleet.services import merge as merge_svc
+from fleet.services import shape_split
 
 _PPE_NAMES = [
     "gloves", "goggles", "helmet", "no_gloves",
@@ -630,3 +631,131 @@ class PromoteAnnotatorLabelsTests(TestCase):
         self._annotator_dir("ds", "ann1")  # exists but no .txt files
         with self.assertRaises(FileNotFoundError):
             datasets_svc.promote_annotator_labels(dataset, ann)
+
+
+# A genuine (non-axis-aligned) pentagon: 5 points, tight bbox (0.5, 0.6, 0.6, 0.6).
+_PENTAGON = "0.3 0.3 0.7 0.3 0.8 0.6 0.5 0.9 0.2 0.6"
+
+
+class ShapeSplitTests(TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = Path(self.tmp.name)
+        fs = FleetSettings.load()
+        fs.source_dir = str(self.src)
+        fs.save()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_consistent_polygon_bbox_reports_no_mismatch(self):
+        # App-format (header'd) labels store bbox and polygon as separate tokens,
+        # so this is the only format where they could actually disagree.
+        dataset = _make_dataset(
+            self.src, "ds", "# tools: bbox, polygon\n", ["person"], ["a.jpg"],
+            labels={"a.jpg.txt": f"100 100\n0 0.1 0.1 0.2 0.2\n0 0.5 0.6 0.6 0.6 {_PENTAGON}\n"},
+        )
+        report = shape_split.check_shape_consistency(dataset)
+        self.assertEqual(report["total_regions"], 2)
+        self.assertEqual(report["bbox_regions"], 1)
+        self.assertEqual(report["polygon_regions"], 1)
+        self.assertEqual(report["mismatched_bbox_regions"], 0)
+
+    def test_mismatched_bbox_is_detected(self):
+        dataset = _make_dataset(
+            self.src, "ds", "# tools: bbox, polygon\n", ["person"], ["a.jpg"],
+            labels={"a.jpg.txt": f"100 100\n0 0.9 0.9 0.1 0.1 {_PENTAGON}\n"},
+        )
+        report = shape_split.check_shape_consistency(dataset)
+        self.assertEqual(report["polygon_regions"], 1)
+        self.assertEqual(report["mismatched_bbox_regions"], 1)
+
+    def test_split_writes_boxes_and_polygons_datasets(self):
+        dataset = _make_dataset(
+            self.src, "ds", "# tools: bbox, polygon\n", ["person", "car"], ["a.jpg", "b.jpg"],
+            labels={
+                # a.jpg: one plain box (car) + one polygon (person) with a bogus stored bbox.
+                "a.jpg.txt": f"100 100\n1 0.2 0.2 0.1 0.1\n0 0.9 0.9 0.1 0.1 {_PENTAGON}\n",
+                # b.jpg: box only, no polygon at all.
+                "b.jpg.txt": "100 100\n1 0.5 0.5 0.2 0.2\n",
+            },
+        )
+
+        result = shape_split.split_by_shape(dataset, "ds-boxes", "ds-polygons")
+
+        self.assertFalse(result["skipped"])
+        self.assertEqual(result["images"], 2)
+        self.assertEqual(result["box_labels"], 2)
+        self.assertEqual(result["polygon_labels"], 1)
+        self.assertEqual(result["mismatched_bbox_regions"], 1)
+
+        boxes_dir = self.src / "ds-boxes"
+        polygons_dir = self.src / "ds-polygons"
+
+        self.assertTrue(Dataset.objects.get(name="ds-boxes").has_labels)
+        self.assertTrue(Dataset.objects.get(name="ds-polygons").has_labels)
+
+        self.assertEqual(
+            (boxes_dir / "classes.txt").read_text(encoding="utf-8"),
+            "# tools: bbox\nperson\ncar\n",
+        )
+        self.assertEqual(
+            (polygons_dir / "classes.txt").read_text(encoding="utf-8"),
+            "# tools: polygon\nperson\ncar\n",
+        )
+
+        # Both images are copied into both outputs.
+        self.assertEqual(
+            sorted(p.name for p in (boxes_dir / "images").iterdir()), ["a.jpg", "b.jpg"],
+        )
+        self.assertEqual(
+            sorted(p.name for p in (polygons_dir / "images").iterdir()), ["a.jpg", "b.jpg"],
+        )
+
+        # Boxes output: every region, box-only, bbox recomputed from the polygon's extent.
+        self.assertEqual(
+            (boxes_dir / "labels" / "a.jpg.txt").read_text(encoding="utf-8"),
+            "100 100\n1 0.2 0.2 0.1 0.1\n0 0.5 0.6 0.6 0.6\n",
+        )
+        self.assertEqual(
+            (boxes_dir / "labels" / "b.jpg.txt").read_text(encoding="utf-8"),
+            "100 100\n1 0.5 0.5 0.2 0.2\n",
+        )
+
+        # Polygons output: only the polygon region, with the corrected bbox + its points.
+        self.assertFalse((polygons_dir / "labels" / "b.jpg.txt").exists())
+        self.assertEqual(
+            (polygons_dir / "labels" / "a.jpg.txt").read_text(encoding="utf-8"),
+            f"100 100\n0 0.5 0.6 0.6 0.6 {_PENTAGON}\n",
+        )
+
+    def test_no_polygons_is_skipped(self):
+        dataset = _make_dataset(
+            self.src, "boxonly", "# tools: bbox\n", ["person"], ["a.jpg"],
+            labels={"a.jpg.txt": "0 0.5 0.5 0.2 0.2\n"},
+        )
+        result = shape_split.split_by_shape(dataset, "boxonly-boxes", "boxonly-polygons")
+        self.assertTrue(result["skipped"])
+        self.assertFalse((self.src / "boxonly-boxes").exists())
+        self.assertFalse((self.src / "boxonly-polygons").exists())
+        self.assertFalse(Dataset.objects.filter(name="boxonly-boxes").exists())
+
+    def test_cloud_dataset_aborts(self):
+        dataset = _make_dataset(
+            self.src, "ds", "# tools: bbox, polygon\n", ["person"], ["a.jpg"],
+            labels={"a.jpg.txt": f"100 100\n0 0.5 0.6 0.6 0.6 {_PENTAGON}\n"},
+        )
+        dataset.storage_type = Dataset.CLOUD
+        dataset.save()
+        with self.assertRaises(RuntimeError):
+            shape_split.split_by_shape(dataset, "ds-boxes", "ds-polygons")
+
+    def test_duplicate_name_aborts_and_leaves_no_dir(self):
+        dataset = _make_dataset(
+            self.src, "ds", "# tools: bbox, polygon\n", ["person"], ["a.jpg"],
+            labels={"a.jpg.txt": f"100 100\n0 0.5 0.6 0.6 0.6 {_PENTAGON}\n"},
+        )
+        Dataset.objects.create(name="ds-boxes", storage_type=Dataset.LOCAL)
+        with self.assertRaises(RuntimeError):
+            shape_split.split_by_shape(dataset, "ds-boxes", "ds-polygons")
+        self.assertFalse((self.src / "ds-polygons").exists())

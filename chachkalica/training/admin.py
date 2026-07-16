@@ -93,9 +93,18 @@ class ExperimentModelInline(admin.StackedInline):
 
     def get_fields(self, request, obj=None):
         # arch first, then every arch's builder-option widgets (JS shows only the
-        # selected arch's), then the shared knobs. The spec fields are declared on
-        # the form, so listing them here is safe for the inline formset factory.
-        return ["arch", *model_specs.spec_field_names(), "pretrained", "num_classes", "params"]
+        # selected arch's), then the per-arch pretrained-weights dropdowns and the
+        # shared custom path/URL field, then the shared knobs. All these fields are
+        # declared on the form, so listing them here is safe for the inline
+        # formset factory.
+        return [
+            "arch",
+            *model_specs.spec_field_names(),
+            *model_specs.weights_field_names(),
+            "weights_custom",
+            "num_classes",
+            "params",
+        ]
 
     class Media:
         js = ("training/experiment_model_form.js",)

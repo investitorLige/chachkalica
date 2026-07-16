@@ -7,6 +7,14 @@ it renders a real widget per builder option (see :mod:`training.model_specs`) fo
 ones belonging to the currently selected ``arch``. On save the selected arch's
 values are folded back into ``params``.
 
+Pretrained weights are a dropdown of their own (one per arch): the published,
+license-checked checkpoints from ``model_specs.WEIGHTS_CATALOG``, plus the
+operator's own promoted :class:`~training.models.TrainedModel` checkpoints for
+that arch, plus a free-text custom path/URL. The selection resolves into
+``params["weights"]`` on save, so ``config_gen`` needs no changes. Options can be
+tied to a single variant (e.g. RF-DETR's Objects365 base weights); the JS shows
+those only while their variant is selected.
+
 Fields for the non-selected archs are still submitted but ignored: :meth:`save`
 only reads the specs for the chosen ``arch``, and first strips every spec-owned
 key so switching arch never leaves a stale kwarg a different adapter would reject.
@@ -15,7 +23,27 @@ key so switching arch never leaves a stale kwarg a different adapter would rejec
 from django import forms
 
 from training import model_specs
-from training.models import ExperimentModel
+from training.models import ExperimentModel, TrainedModel
+
+
+class VariantAwareSelect(forms.Select):
+    """A ``<select>`` that tags each ``<option>`` with ``data-variant`` when the
+    option belongs to a single variant.
+
+    ``experiment_model_form.js`` reads the attribute to show an option only while
+    its variant is selected; options with no variant are always shown.
+    """
+
+    def __init__(self, *args, variant_map=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.variant_map = variant_map or {}
+
+    def create_option(self, name, value, *args, **kwargs):
+        option = super().create_option(name, value, *args, **kwargs)
+        variant = self.variant_map.get(str(value))
+        if variant:
+            option["attrs"]["data-variant"] = variant
+        return option
 
 
 def _build_field(spec: dict, arch: str) -> forms.Field:
@@ -63,19 +91,72 @@ def _spec_fields() -> dict:
     }
 
 
+def _weights_field(arch: str) -> forms.Field:
+    """The pretrained-weights dropdown for one arch (static options only).
+
+    The operator's own trained models are appended per instance in ``__init__``.
+    """
+    return forms.ChoiceField(
+        required=False,
+        label="Pretrained weights",
+        choices=model_specs.weights_base_choices(arch),
+        widget=VariantAwareSelect(
+            attrs={"class": "xm-spec-field xm-weights-field", "data-arch": arch},
+            variant_map=model_specs.weights_variant_map(arch),
+        ),
+        help_text="Where each model's weights start from. 'COCO pretrained' loads "
+                  "the architecture's published weights for the selected size; the "
+                  "listed checkpoints and your own trained models are alternatives; "
+                  "'Custom path or URL' uses the field below.",
+    )
+
+
+def _weights_fields() -> dict:
+    """One weights dropdown field per arch (declared on the class, like specs)."""
+    return {
+        model_specs.weights_field_name(arch): _weights_field(arch)
+        for arch in model_specs.ARCH_FIELD_SPECS
+    }
+
+
+def _default_new_weights(arch: str) -> str:
+    """The weights option a freshly added row of this arch starts on."""
+    if arch == ExperimentModel.RTDETR:
+        return "PekingU/rtdetr_r50vd"  # RT-DETR's original default size/checkpoint
+    if arch in model_specs.WEIGHTS_DEFAULT_ARCHS:
+        return model_specs.WEIGHTS_DEFAULT  # COCO pretrained
+    return model_specs.WEIGHTS_NONE
+
+
 class ExperimentModelForm(forms.ModelForm):
+    # Free-text path/URL used when a weights dropdown is set to "Custom path or
+    # URL…". Shared across archs — only the selected arch's dropdown is read.
+    weights_custom = forms.CharField(
+        required=False,
+        label="Custom weights (path or URL)",
+        widget=forms.TextInput(attrs={"class": "xm-weights-custom", "size": "60"}),
+        help_text="Local checkpoint path or download URL. Used only when the "
+                  "Pretrained weights dropdown is set to 'Custom path or URL…'.",
+    )
+
     class Meta:
         model = ExperimentModel
-        fields = ["arch", "pretrained", "num_classes", "params"]
+        # `pretrained` is no longer a form field — the weights dropdown supersedes
+        # it. The DB column stays (config_gen still honours it for legacy rows);
+        # save() keeps it in sync with the dropdown selection.
+        fields = ["arch", "num_classes", "params"]
 
     # Inject the per-option widgets into the class namespace so the metaclass
-    # picks them up as declared fields (see _spec_fields).
+    # picks them up as declared fields (see _spec_fields / _weights_fields).
     locals().update(_spec_fields())
+    locals().update(_weights_fields())
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         params = dict(getattr(self.instance, "params", None) or {})
         arch = self.instance.arch or ""
+
+        self._append_dynamic_weights()
 
         # Seed each field of the *selected* arch with the stored value; only the
         # selected arch's fields are ever read back, so cross-arch key sharing
@@ -88,8 +169,7 @@ class ExperimentModelForm(forms.ModelForm):
             if spec["kind"] == "choice":
                 stored_str = str(stored)
                 if stored_str not in [c[0] for c in field.choices]:
-                    # Preserve a hand-set value not in our list (e.g. a custom
-                    # rtdetr weights repo) as a selectable option.
+                    # Preserve a hand-set value not in our list as a selectable option.
                     field.choices = list(field.choices) + [
                         (stored_str, f"(custom) {stored_str}")
                     ]
@@ -97,15 +177,80 @@ class ExperimentModelForm(forms.ModelForm):
             else:
                 field.initial = stored
 
+        if arch:
+            self._seed_weights(arch, params)
+
         # The raw JSON stays for open-ended ModelConfig kwargs the specs don't cover.
         self.fields["params"].help_text = (
             "Advanced: extra architecture kwargs as JSON. The fields above override "
             "any matching keys here on save."
         )
 
+    def _append_dynamic_weights(self) -> None:
+        """Add runtime weights options the static catalog can't hold.
+
+        Two sources: the locally re-hosted ByteTrack YOLOX weights (variant-tagged,
+        existence-gated) and the operator's own promoted trained models (per arch,
+        no variant). Both are inserted before the trailing "Custom path or URL…"
+        sentinel, and variant-tagged ones also extend the widget's variant map so
+        the JS filters them by the selected variant.
+        """
+        bytetrack = model_specs.bytetrack_yolox_options()
+        if bytetrack:
+            self._add_weight_options(ExperimentModel.YOLOX, bytetrack)
+
+        by_arch: dict[str, list[dict]] = {}
+        for tm in TrainedModel.objects.exclude(checkpoint_path="").order_by("name"):
+            by_arch.setdefault(tm.arch, []).append(
+                {"value": tm.checkpoint_path, "label": f"Your model: {tm.name}"}
+            )
+        for arch, options in by_arch.items():
+            self._add_weight_options(arch, options)
+
+    def _add_weight_options(self, arch: str, entries: list[dict]) -> None:
+        """Splice weights options into an arch's dropdown + widget variant map."""
+        field = self.fields.get(model_specs.weights_field_name(arch))
+        if field is None:
+            return
+        choices = list(field.choices)
+        choices[-1:-1] = [(e["value"], e["label"]) for e in entries]
+        field.choices = choices
+        variant_map = dict(getattr(field.widget, "variant_map", {}) or {})
+        for entry in entries:
+            if entry.get("variant"):
+                variant_map[str(entry["value"])] = entry["variant"]
+        field.widget.variant_map = variant_map
+
+    def _seed_weights(self, arch: str, params: dict) -> None:
+        """Set the weights dropdown (and custom field) to reflect stored state."""
+        fname = model_specs.weights_field_name(arch)
+        field = self.fields[fname]
+        known = {c[0] for c in field.choices}
+
+        if "weights" in params:
+            stored = params["weights"]
+            if stored is True:
+                field.initial = model_specs.WEIGHTS_DEFAULT
+            elif isinstance(stored, str) and stored:
+                if stored in known:
+                    field.initial = stored
+                else:
+                    field.initial = model_specs.WEIGHTS_CUSTOM
+                    self.fields["weights_custom"].initial = stored
+            else:  # False / None / "" → explicit scratch
+                field.initial = model_specs.WEIGHTS_NONE
+        elif self.instance.pk and self.instance.pretrained:
+            # Legacy row saved via the old checkbox.
+            field.initial = model_specs.WEIGHTS_DEFAULT
+        elif self.instance.pk:
+            field.initial = model_specs.WEIGHTS_NONE
+        else:  # brand-new row
+            field.initial = _default_new_weights(arch)
+
     def clean(self):
         cleaned = super().clean()
         arch = cleaned.get("arch") or ""
+
         # RF-DETR's DINOv2 backbone needs the square input divisible by 56; a bad
         # value only surfaces as an epoch-1 crash deep in the trainer, so reject it
         # here at config time instead.
@@ -127,6 +272,18 @@ class ExperimentModelForm(forms.ModelForm):
                     f"RF-DETR '{variant}' resolution must be divisible by {multiple} "
                     f"(got {resolution}).",
                 )
+
+        # A "Custom path or URL…" selection needs the accompanying text filled in.
+        if arch:
+            weights_sel = cleaned.get(model_specs.weights_field_name(arch))
+            if weights_sel == model_specs.WEIGHTS_CUSTOM and not (
+                cleaned.get("weights_custom") or ""
+            ).strip():
+                self.add_error(
+                    "weights_custom",
+                    "Enter a checkpoint path or URL, or pick a different "
+                    "'Pretrained weights' option.",
+                )
         return cleaned
 
     def save(self, commit=True):
@@ -134,16 +291,34 @@ class ExperimentModelForm(forms.ModelForm):
         arch = self.cleaned_data.get("arch") or ""
 
         params = dict(self.cleaned_data.get("params") or {})
-        # Drop every spec-owned key, then re-apply only the selected arch's values,
-        # so options from a previously selected arch don't linger.
+        # Drop every spec-owned key and the weights key, then re-apply only the
+        # selected arch's values, so options from a previously selected arch don't
+        # linger.
         for key in model_specs.ALL_SPEC_KEYS:
             params.pop(key, None)
+        params.pop(model_specs.WEIGHTS_KEY, None)
         for spec in model_specs.ARCH_FIELD_SPECS.get(arch, []):
             fname = model_specs.field_name(arch, spec["key"])
             value = self.cleaned_data.get(fname)
             if value in (None, ""):
                 continue  # blank / "(default)" → let the adapter default apply
             params[spec["key"]] = value
+
+        # Resolve the weights dropdown into params["weights"] (or leave it unset
+        # for random init), and keep the legacy `pretrained` column consistent.
+        weights_sel = self.cleaned_data.get(model_specs.weights_field_name(arch))
+        obj.pretrained = weights_sel == model_specs.WEIGHTS_DEFAULT
+        if weights_sel == model_specs.WEIGHTS_DEFAULT:
+            params[model_specs.WEIGHTS_KEY] = True
+        elif weights_sel == model_specs.WEIGHTS_CUSTOM:
+            custom = (self.cleaned_data.get("weights_custom") or "").strip()
+            if custom:
+                params[model_specs.WEIGHTS_KEY] = custom
+        elif weights_sel not in (None, model_specs.WEIGHTS_NONE):
+            params[model_specs.WEIGHTS_KEY] = weights_sel
+        # WEIGHTS_NONE (or an unfilled custom, already flagged in clean) → no
+        # weights key → the adapter trains from scratch.
+
         obj.params = params
 
         if commit:
