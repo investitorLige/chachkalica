@@ -5,11 +5,12 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+import yaml
 
 from friendy_chachkalica.adapters.rfdetr import build_rfdetr
 from friendy_chachkalica.adapters.rtdetr import build_rtdetr
 from friendy_chachkalica.adapters.yolox import _load_checkpoint
-from friendy_chachkalica.config import ModelConfig
+from friendy_chachkalica.config import ModelConfig, load_config
 from friendy_chachkalica.train import (
     _load_warm_start_state,
     _read_initial_checkpoint,
@@ -18,6 +19,47 @@ from friendy_chachkalica.train import (
 
 
 class WarmStartCheckpointTests(unittest.TestCase):
+    def test_config_parses_init_checkpoint_separately_from_adapter_params(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "experiment.yaml"
+            config_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "name": "warm-start-test",
+                        "output_dir": "output",
+                        "datasets": {
+                            "train": [
+                                {
+                                    "name": "dataset",
+                                    "images": "images",
+                                    "labels": "labels",
+                                    "classes": ["object"],
+                                }
+                            ]
+                        },
+                        "models": [
+                            {
+                                "name": "yolox",
+                                "num_classes": 1,
+                                "init_checkpoint": "checkpoints/best.pt",
+                                "variant": "yolox-s",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(
+            config.models[0].init_checkpoint,
+            root / "checkpoints" / "best.pt",
+        )
+        self.assertNotIn("init_checkpoint", config.models[0].params)
+        self.assertEqual(config.models[0].params["variant"], "yolox-s")
+
     def test_checkpoint_architecture_must_match(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "model.pt"

@@ -194,6 +194,7 @@ def build_rtdetr(
     input_max_size: Optional[int] = 640,
     input_size_multiple: int = 32,
     ignore_mismatched_sizes: bool = True,
+    trainable_backbone_layers: Optional[int] = None,
     **config_kwargs: Any,
 ) -> RTDETRAdapter:
     # RT-DETRv2 ships as its own model class (RTDetrV2ForObjectDetection): the
@@ -258,6 +259,9 @@ def build_rtdetr(
                 "not be loaded; refusing to silently train from random initialization."
             ) from exc
 
+    if trainable_backbone_layers is not None:
+        _freeze_rtdetr_backbone(model, trainable_backbone_layers)
+
     return RTDETRAdapter(
         model=model,
         image_processor=RTDetrImageProcessor(),
@@ -269,6 +273,22 @@ def build_rtdetr(
         input_max_size=input_max_size,
         input_size_multiple=input_size_multiple,
     )
+
+
+def _freeze_rtdetr_backbone(model, trainable_backbone_layers: int) -> None:
+    """Freeze the ResNet backbone's stem/stages, torchvision-style.
+
+    ``trainable_backbone_layers`` follows torchvision's ``trainable_backbone_layers``
+    convention exactly: 0 freezes the whole backbone (stem + all 4 stages), 5 leaves
+    everything trainable. The backbone's BatchNorm is already frozen structurally by
+    HF (``RTDetrFrozenBatchNorm2d``, ``freeze_backbone_batch_norms=True`` default), so
+    no BatchNorm eval-mode bookkeeping is needed here.
+    """
+    trainable_backbone_layers = max(0, min(5, trainable_backbone_layers))
+    resnet = model.model.backbone.model
+    ordered = list(reversed(list(resnet.encoder.stages))) + [resnet.embedder]
+    for module in ordered[trainable_backbone_layers:]:
+        module.requires_grad_(False)
 
 
 def _ceil_to_multiple(value: int, multiple: int) -> int:

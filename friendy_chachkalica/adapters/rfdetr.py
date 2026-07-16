@@ -169,6 +169,7 @@ def build_rfdetr(
     score_threshold: float = 0.5,
     nms_threshold: Optional[float] = None,
     resolution: Optional[int] = None,
+    freeze_backbone: bool = False,
     **config_kwargs: Any,
 ) -> RFDETRAdapter:
     """Build an RF-DETR adapter.
@@ -187,6 +188,8 @@ def build_rfdetr(
             ``predict`` (DETR inference stays NMS-free) and never affects mAP.
         resolution: Optional square input resolution override; defaults to the
             variant's native resolution.
+        freeze_backbone: Freeze the DINOv2 encoder (the multi-scale projector
+            stays trainable).
         **config_kwargs: Extra RF-DETR ModelConfig kwargs.
     """
     variant_key = str(variant).strip().lower()
@@ -226,6 +229,9 @@ def build_rfdetr(
     model_config = wrapper.model_config
     network = wrapper.model.model  # the underlying LW-DETR nn.Module
 
+    if freeze_backbone:
+        _freeze_rfdetr_backbone(network)
+
     # A minimal TrainConfig is enough: the criterion/postprocess builder only reads loss
     # coefficients and architectural fields, not the dataset paths.
     criterion, postprocess = build_criterion_from_config(
@@ -244,6 +250,26 @@ def build_rfdetr(
         image_mean=tuple(wrapper.means),
         image_std=tuple(wrapper.stds),
     )
+
+
+def _freeze_rfdetr_backbone(network: torch.nn.Module) -> None:
+    """Freeze the DINOv2 ViT encoder, mirroring rfdetr's own upstream ``freeze_encoder``.
+
+    The multi-scale projector on top of the encoder is left trainable, matching
+    that upstream semantic. This reaches into the LW-DETR module's internal
+    layout (``network.backbone[0].encoder``) since rfdetr's public ``ModelConfig``
+    (pydantic, ``extra="forbid"``) has no ``freeze_encoder`` field to pass through.
+    """
+    try:
+        encoder = network.backbone[0].encoder
+    except (AttributeError, IndexError, KeyError) as exc:
+        raise RuntimeError(
+            "RF-DETR's backbone structure was not the expected "
+            "`network.backbone[0].encoder` shape; freeze_backbone can't be applied "
+            "against this rfdetr package version."
+        ) from exc
+    for param in encoder.parameters():
+        param.requires_grad_(False)
 
 
 def _load_rfdetr():

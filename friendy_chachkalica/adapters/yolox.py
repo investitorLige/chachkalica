@@ -43,6 +43,7 @@ class YOLOXAdapter:
     num_classes: int
     score_threshold: float = 0.3
     nms_threshold: float = 0.45
+    frozen_backbone_stages: tuple = ()
     name: str = "yolox"
 
     def to(self, device):
@@ -59,6 +60,8 @@ class YOLOXAdapter:
 
     def training_step(self, images, targets):
         self.model.train()
+        for stage in self.frozen_backbone_stages:
+            _set_batch_norm_eval(stage)
         return self._loss_forward(images, targets)
 
     def validation_step(self, images, targets):
@@ -156,6 +159,7 @@ def build_yolox(
     variant: str = DEFAULT_YOLOX_VARIANT,
     score_threshold: float = 0.3,
     nms_threshold: float = 0.45,
+    trainable_backbone_layers: Optional[int] = None,
     **builder_options: Any,
 ) -> YOLOXAdapter:
     try:
@@ -191,11 +195,16 @@ def build_yolox(
                 "not be loaded; refusing to silently train from random initialization."
             ) from exc
 
+    frozen_backbone_stages = ()
+    if trainable_backbone_layers is not None:
+        frozen_backbone_stages = _freeze_yolox_backbone(model, trainable_backbone_layers)
+
     return YOLOXAdapter(
         model=model,
         num_classes=num_classes,
         score_threshold=score_threshold,
         nms_threshold=nms_threshold,
+        frozen_backbone_stages=frozen_backbone_stages,
     )
 
 
@@ -221,6 +230,24 @@ def yolox_detection_to_friendy(
         image_width=image_width,
         image_height=image_height,
     )
+
+
+def _freeze_yolox_backbone(model: torch.nn.Module, trainable_backbone_layers: int) -> tuple:
+    """Freeze the CSPDarknet backbone's stages, torchvision-style.
+
+    ``trainable_backbone_layers`` follows torchvision's ``trainable_backbone_layers``
+    convention exactly: 0 freezes the whole backbone (stem + all 4 dark stages), 5
+    leaves everything trainable. Returns the frozen stage modules so the adapter can
+    force their BatchNorm layers back into eval mode every training step (freezing
+    ``requires_grad`` alone does not stop BatchNorm running stats from drifting).
+    """
+    trainable_backbone_layers = max(0, min(5, trainable_backbone_layers))
+    darknet = model.backbone.backbone
+    ordered = [darknet.dark5, darknet.dark4, darknet.dark3, darknet.dark2, darknet.stem]
+    frozen = tuple(ordered[trainable_backbone_layers:])
+    for stage in frozen:
+        stage.requires_grad_(False)
+    return frozen
 
 
 def _make_divisible(value: int, divisor: int) -> int:

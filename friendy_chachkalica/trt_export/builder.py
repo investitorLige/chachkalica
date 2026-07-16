@@ -55,10 +55,30 @@ def _try_build(trt, logger, onnx_bytes, input_name, min_hw, opt_hw, max_hw, *, f
     else:  # pragma: no cover - legacy TRT
         config.max_workspace_size = workspace_bytes
 
+    # TensorRT >= 11 dropped Builder.platform_has_fast_fp16 (fast FP16 support is
+    # no longer queryable this way); default to attempting FP16 there and let the
+    # existing build-failed-fp16 -> retry-fp32 fallback above handle a platform
+    # that can't actually build it.
+    #
+    # TensorRT 11 also removed BuilderFlag.FP16 (and INT8/BF16/...) entirely:
+    # networks are now always "strongly typed" and run at whatever precision the
+    # ONNX graph's own tensors declare, rather than a precision requested via a
+    # builder flag (see NVIDIA's TensorRT 10->11 migration guide). Real FP16 on
+    # TRT 11 needs the graph itself cast to fp16 (e.g. via ModelOpt AutoCast)
+    # before this call; that's out of scope here, so we just build at the
+    # graph's native precision (fp32, for a plain torch.onnx.export) instead of
+    # raising on the missing flag.
     used_fp16 = False
-    if fp16 and builder.platform_has_fast_fp16:
-        config.set_flag(trt.BuilderFlag.FP16)
+    fp16_flag = getattr(trt.BuilderFlag, "FP16", None)
+    if fp16 and fp16_flag is not None and getattr(builder, "platform_has_fast_fp16", True):
+        config.set_flag(fp16_flag)
         used_fp16 = True
+    elif fp16:
+        print(
+            f"[trt] FP16 requested but unavailable via BuilderFlag on TensorRT {trt.__version__} "
+            "(TensorRT >= 11 uses strongly-typed networks; precision comes from the ONNX "
+            "graph's own tensor dtypes). Building at the graph's native precision instead."
+        )
 
     profile = builder.create_optimization_profile()
     profile.set_shape(

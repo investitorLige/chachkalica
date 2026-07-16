@@ -85,6 +85,12 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
                     "precision/recall/F1 only — inference stays NMS-free and mAP is "
                     "unaffected. Blank = the experiment's operating NMS threshold.",
         },
+        {
+            "key": "freeze_backbone", "label": "Freeze backbone", "kind": "bool",
+            "default": False,
+            "help": "Freeze the DINOv2 encoder; the multi-scale projector on top of it "
+                    "keeps training.",
+        },
     ],
     "rtdetr": [
         # RT-DETR's backbone size *is* its pretrained checkpoint, so the size
@@ -112,6 +118,11 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
             "key": "ignore_mismatched_sizes", "label": "Ignore mismatched sizes",
             "kind": "bool", "default": True,
             "help": "Re-init the head when the pretrained class count differs.",
+        },
+        {
+            "key": "trainable_backbone_layers", "label": "Trainable backbone layers",
+            "kind": "int",
+            "help": "How many backbone stages to fine-tune (0–5). Blank = fully trainable.",
         },
     ],
     "fasterrcnn": [
@@ -199,6 +210,11 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
         {
             "key": "nms_threshold", "label": "NMS threshold", "kind": "float",
             "default": 0.45, "help": "IoU threshold for non-maximum suppression.",
+        },
+        {
+            "key": "trainable_backbone_layers", "label": "Trainable backbone layers",
+            "kind": "int",
+            "help": "How many backbone stages to fine-tune (0–5). Blank = fully trainable.",
         },
     ],
 }
