@@ -14,6 +14,7 @@ friendy_chachkalica service (and ingesting metrics) is a later phase — a
 :class:`TrainingRun` here records the generated config and its eventual status.
 """
 
+from django.core.validators import MinValueValidator
 from django.db import models
 
 from fleet.models import Annotator, Dataset
@@ -162,6 +163,7 @@ class Experiment(models.Model):
                   "precision-recall curve.",
     )
     eval_operating_nms_threshold = models.FloatField(
+        verbose_name="operating_nms_iou_threshold",
         null=True, blank=True,
         help_text="Class-aware NMS IoU applied to val/test precision/recall/F1 and the "
                   "confusion matrix only — mAP always stays NMS-free. Dedupes the NMS-free "
@@ -171,18 +173,55 @@ class Experiment(models.Model):
     iou_thresholds = models.JSONField(default=default_iou_thresholds, blank=True)
 
     # --- train / eval pipeline (chachak) ---
-    # When set, the model is trained (tiling pipelines only), validated, and
-    # tested through this chachak pipeline — one consistent image representation
-    # across all three phases. Blank = plain full-frame training/eval.
+    # When set, the model is trained, validated, and tested through this chachak
+    # pipeline — one consistent image representation across all three phases: the
+    # train loop applies the same transform (tiling, or person-cropping via the
+    # detector) as eval. Blank = plain full-frame training/eval.
     pipeline = models.CharField(
         max_length=32, choices=pipelines.PIPELINE_CHOICES, blank=True,
-        help_text="Run train (tiling only), val, and test through this chachak pipeline. "
-                  "Blank = plain full-frame training and eval.",
+        help_text="Run train, val, and test through this chachak pipeline. Training "
+                  "applies the same transform as eval (tile the frame, or crop around "
+                  "detected people). Blank = plain full-frame training and eval.",
     )
     detector_checkpoint = models.CharField(
         max_length=1024, blank=True,
         help_text="Person-detector checkpoint; required for people_detect_first / "
-                  "batch_people (and any chain that includes them). Used for val/test only.",
+                  "batch_people (and any chain that includes them). Runs at train, "
+                  "val, and test: it selects the person crops the model is trained "
+                  "and evaluated on. Objects outside every detected person crop are "
+                  "not seen during training.",
+    )
+    detector_expand_ratio = models.FloatField(
+        default=0.10,
+        validators=[MinValueValidator(0.0)],
+        verbose_name="Person-box expand ratio",
+        help_text="Grow each detected person box by this fraction before cropping, to "
+                  "avoid clipping objects that sit at or just past the person's edge "
+                  "(e.g. a hard hat above the head). 0.10 = +10% on width and height "
+                  "(5% per side); 0 crops the detector box exactly. Applied identically "
+                  "at train, val, and test. Larger values pull in more context but risk "
+                  "dragging neighbouring people/clutter back into the crop. Only used by "
+                  "people_detect_first / batch_people.",
+    )
+    tile_size_px = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1)],
+        verbose_name="Tile size (pixels)",
+        help_text=(
+            "Fixed square source-image tile size used by batch_detect. Set this to the "
+            "'trained @' resolution shown beside the selected pretrained weights when "
+            "you want to preserve that model's native pixel scale. For example, 560 "
+            "produces 560×560 tiles. When set, this overrides Tile width % and Tile "
+            "height %. Full-size windows are shifted flush to the right/bottom edge "
+            "where possible; only an image smaller than this size is zero-padded on "
+            "the right/bottom, with no stretching or upscaling. The saved value is used "
+            "consistently for training, validation, and pipeline inference. For RF-DETR, "
+            "keep the model Input resolution equal to this value. If an experiment "
+            "contains models with different native resolutions, choose one common tile "
+            "size deliberately or use separate experiments. Blank keeps the legacy "
+            "percentage-based tiling behavior."
+        ),
     )
     tile_width_pct = models.FloatField(
         null=True, blank=True,
@@ -199,6 +238,7 @@ class Experiment(models.Model):
         help_text="Fraction (0–1) by which adjacent tiles overlap. Blank = default.",
     )
     merge_nms_iou = models.FloatField(
+        verbose_name="merge_nms_iou_threshold",
         null=True, blank=True,
         help_text="Class-aware NMS IoU used to merge predictions across tiles/crops. "
                   "Blank = chachak's default.",
@@ -234,10 +274,12 @@ class ExperimentDataset(models.Model):
     SOURCE = "source"        # data/source/<name>/labels
     ANNOTATOR = "annotator"  # data/target/<name>/<annotator>
     EXPLICIT = "explicit"    # an arbitrary absolute path
+    NONE = "none"            # prediction-only run; no ground truth
     LABEL_SOURCE_CHOICES = [
         (SOURCE, "source labels"),
         (ANNOTATOR, "annotator output"),
         (EXPLICIT, "explicit path"),
+        (NONE, "no label source (prediction only)"),
     ]
 
     experiment = models.ForeignKey(Experiment, on_delete=models.CASCADE, related_name="datasets")
@@ -522,10 +564,14 @@ class EvalRun(models.Model):
     SOURCE = ExperimentDataset.SOURCE
     ANNOTATOR = ExperimentDataset.ANNOTATOR
     EXPLICIT = ExperimentDataset.EXPLICIT
+    NONE = ExperimentDataset.NONE
 
     trained_model = models.ForeignKey(
         TrainedModel, on_delete=models.CASCADE, related_name="eval_runs"
     )
+    # Extra models combined with `trained_model` into one merged evaluation —
+    # see TrainedModelAdmin.evaluate. Empty for an ordinary single-model eval.
+    combined_models = models.ManyToManyField(TrainedModel, blank=True, related_name="+")
     dataset = models.ForeignKey(Dataset, on_delete=models.PROTECT, related_name="+")
     label_source = models.CharField(
         max_length=16,
@@ -560,7 +606,18 @@ class EvalRun(models.Model):
         ordering = ["-created_at"]
 
     def __str__(self) -> str:
-        return f"Eval #{self.pk} — {self.trained_model.name} on {self.dataset.name}"
+        return f"Eval #{self.pk} — {self._models_label()} on {self.dataset.name}"
+
+    def _models_label(self) -> str:
+        names = [self.trained_model.name, *(m.name for m in self.combined_models.all())]
+        return " + ".join(names)
+
+    @property
+    def is_combined(self) -> bool:
+        return self.pk is not None and self.combined_models.exists()
+
+    def all_models(self) -> list:
+        return [self.trained_model, *self.combined_models.all()]
 
     def metric(self, key: str):
         return self.metrics.get(key) if isinstance(self.metrics, dict) else None

@@ -56,8 +56,12 @@ def _write_from_result(target: Path, dataset, annotator_name, filename, result, 
     path = writer.label_path(target, dataset, annotator_name, filename)
     if not objects:
         deleted = writer.delete(path)
+        writer.delete(writer.legacy_label_path(target, dataset, annotator_name, filename))
         return "deleted (no regions)" if deleted else "noop (no regions)"
     writer.write_atomic(path, txt_format.objects_to_text(width, height, objects))
+    legacy_path = writer.legacy_label_path(target, dataset, annotator_name, filename)
+    if legacy_path != path:
+        writer.delete(legacy_path)
     return f"wrote {len(objects)} object(s)"
 
 

@@ -34,7 +34,7 @@ Use ← / → or the buttons to step through.</p>
 
 <div id="pv-metric">
   Ranking metric: <code>{{ metric }}</code> — {{ metric_description }}
-  (ranked/saved at IoU ≥ {{ iou_threshold }}, score ≥ {{ score_threshold }}; up to {{ max_display_predictions|default:"20" }} highest-confidence predictions saved per image; use the confidence slider to filter visible predictions).
+  (ranked/saved at IoU ≥ {{ iou_threshold }}, score ≥ {{ score_threshold }}{% if operating_nms_threshold %}, class-aware NMS {{ operating_nms_threshold }}{% endif %}; up to {{ max_display_predictions|default:"20" }} highest-confidence predictions saved per image; use the confidence slider to filter visible predictions).
   <div id="pv-breakdown"></div>
 </div>
 
@@ -127,9 +127,16 @@ Use ← / → or the buttons to step through.</p>
 
   function showBreakdown() {
     if (!current || current.difficulty == null) { breakdownEl.textContent = ""; return; }
-    breakdownEl.textContent = "This image · difficulty " + current.difficulty
-      + " = " + current.missed + " missed + " + current.false_positives + " false positive(s) + "
-      + current.wrong_class + " wrong class + " + current.loc_error + " localization slack";
+    if (current.f1 != null) {
+      breakdownEl.textContent = "This image · difficulty " + current.difficulty
+        + " = 1 - F1 " + current.f1 + " + 0.25 × localization penalty "
+        + current.localization_penalty + " · " + current.missed + " missed, "
+        + current.false_positives + " false positive(s), " + current.wrong_class + " wrong class";
+    } else {
+      breakdownEl.textContent = "This image · difficulty " + current.difficulty
+        + " = " + current.missed + " missed + " + current.false_positives + " false positive(s) + "
+        + current.wrong_class + " wrong class + " + current.loc_error + " localization slack";
+    }
   }
 
   function load(i) {
@@ -137,20 +144,24 @@ Use ← / → or the buttons to step through.</p>
     index = i;
     idxInput.value = i + 1;
     current = null;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
     errorEl.textContent = "";
     statusEl.textContent = "Loading image " + (i + 1) + " / " + COUNT + "…";
-    img.src = "image/?" + QUERY + "&index=" + i;
     fetch("data/?" + QUERY + "&index=" + i)
       .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
       .then(function (res) {
         if (index !== i) return;  // superseded by a newer navigation
         if (!res.ok) { errorEl.textContent = res.j.error || "failed to load"; statusEl.textContent = ""; return; }
         current = res.j;
-        var np = (current.predictions || []).length, ng = (current.ground_truth || []).length;
-        statusEl.textContent = (current.image || "") + " — " + np + " prediction(s), "
-          + ng + " ground-truth box(es)";
+        img.src = "image/?" + QUERY + "&image_token=" + encodeURIComponent(current.image_token);
+        var saved = (current.predictions || []).length;
+        var np = current.num_predictions == null ? saved : current.num_predictions;
+        var ng = (current.ground_truth || []).length;
+        statusEl.textContent = (current.image || "") + " — " + np + " prediction(s)"
+          + (saved < np ? " (" + saved + " highest-confidence saved)" : "")
+          + ", " + ng + " ground-truth box(es)";
         showBreakdown();
-        draw();
+        // The image load event draws boxes only after this exact signed image arrives.
       })
       .catch(function (e) { if (index === i) { errorEl.textContent = String(e); statusEl.textContent = ""; } });
   }

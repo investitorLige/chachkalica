@@ -94,11 +94,26 @@ class TrtModel:
         self._device = "cuda" if ("cuda" in name or "gpu" in name) else "cuda"
 
         self._logger = trt.Logger(trt.Logger.WARNING)
+        # Register the standard TensorRT plugins (EfficientNMS_TRT et al.) before
+        # deserializing: engines for the fused-NMS archs (retinanet, yolox,
+        # fasterrcnn) embed that plugin, and deserialization fails if its creator
+        # isn't registered in this process. The builder registers them too, so a
+        # build+load in one process worked without this — but a fresh runtime
+        # (the real trt_infer path) must register them itself.
+        trt.init_libnvinfer_plugins(self._logger, "")
         runtime = trt.Runtime(self._logger)
         self.engine = runtime.deserialize_cuda_engine(self.path.read_bytes())
         if self.engine is None:
             raise RuntimeError(f"failed to deserialize TensorRT engine: {self.path}")
         self.context = self.engine.create_execution_context()
+        if self.context is None:
+            raise RuntimeError(
+                f"failed to create a TensorRT execution context for {self.path} — "
+                "TensorRT logged the reason above (commonly a device-memory allocation "
+                "failure sized far larger than the model should need, which usually means "
+                "the engine's optimization profile is too wide for this graph; try a "
+                "narrower --min-hw/--max-hw)"
+            )
 
         self._input_names, self._output_names = [], []
         for i in range(self.engine.num_io_tensors):

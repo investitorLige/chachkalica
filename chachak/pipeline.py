@@ -19,7 +19,7 @@ other's logic without a heavyweight stage framework.
 
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -31,6 +31,7 @@ try:
         merge_predictions,
         remap_local_preds_to_frame,
         tile_frame,
+        tile_frame_pixels,
         xywhn_preds_to_xyxy,
     )
     from .infer import infer_in_chunks
@@ -42,6 +43,7 @@ except ImportError:  # run as a flat script
         merge_predictions,
         remap_local_preds_to_frame,
         tile_frame,
+        tile_frame_pixels,
         xywhn_preds_to_xyxy,
     )
     from infer import infer_in_chunks
@@ -67,12 +69,17 @@ def _tile_infer(adapter, image: torch.Tensor, config) -> List[torch.Tensor]:
     :func:`merge_predictions`.
     """
     frame_w, frame_h = _frame_size(image)
-    tiles = tile_frame(
-        image,
-        config.tiling.tile_width_pct / 100.0,
-        config.tiling.tile_height_pct / 100.0,
-        config.tiling.overlap,
-    )
+    if config.tiling.tile_size_px is not None:
+        tiles = tile_frame_pixels(
+            image, config.tiling.tile_size_px, config.tiling.overlap
+        )
+    else:
+        tiles = tile_frame(
+            image,
+            config.tiling.tile_width_pct / 100.0,
+            config.tiling.tile_height_pct / 100.0,
+            config.tiling.overlap,
+        )
     tile_images = [tile for tile, _, _ in tiles]
     preds = infer_in_chunks(
         adapter, tile_images, config.infer_batch_size, _inference_score_threshold(config)
@@ -104,26 +111,52 @@ class Pipeline:
         """Return one full-frame-normalized ``(N, 6)`` tensor per input frame."""
         raise NotImplementedError
 
-    # -- shared crop→infer→remap back-end (used by the two people pipelines) --
-    def _crop_infer_remap(
-        self,
-        images: List[torch.Tensor],
-        person_boxes_per_frame: Sequence[torch.Tensor],
-    ) -> List[torch.Tensor]:
-        """Crop each person box, run the trained model, remap and merge per frame."""
+    # -- shared person-crop back-end (used by the two people pipelines) --
+    def _person_boxes(self, images: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Per-frame person boxes as xyxy tensors in frame pixels.
+
+        Implemented by the people pipelines (full-frame detection vs tiled
+        detection). Not defined for tiling/chain pipelines.
+        """
+        raise NotImplementedError
+
+    def crop_regions(
+        self, images: List[torch.Tensor]
+    ) -> List[List[tuple]]:
+        """Per-frame list of ``(crop_chw, (x0, y0), (crop_w, crop_h))`` regions.
+
+        These are the person crops the pipeline feeds the trained model: each
+        detected person box expanded by ``detector.expand_ratio`` and clipped to
+        the frame. Shared by inference (:meth:`_crop_infer_remap`) and by
+        training-time cropping (``friendy_chachkalica.cropping.crop_batch``) so
+        the model sees the exact same crops in both regimes. Zero-area crops are
+        skipped; a frame with no person detections yields an empty list.
+        """
+        config = self.config
+        person_boxes = self._person_boxes(images)
+        regions: List[List[tuple]] = []
+        for image, boxes in zip(images, person_boxes):
+            frame_w, frame_h = _frame_size(image)
+            frame_regions = []
+            for box in boxes:
+                expanded = expand_box(box, config.detector.expand_ratio, frame_w, frame_h)
+                crop, offset, (crop_w, crop_h) = crop_image(image, expanded)
+                if crop_w < 1 or crop_h < 1:
+                    continue
+                frame_regions.append((crop, offset, (crop_w, crop_h)))
+            regions.append(frame_regions)
+        return regions
+
+    def _crop_infer_remap(self, images: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Crop each person region, run the trained model, remap and merge per frame."""
         config = self.config
         crops: List[torch.Tensor] = []
         crop_frame_idx: List[int] = []
         crop_meta = []  # (offset_xy, (crop_w, crop_h))
         frame_sizes = [_frame_size(image) for image in images]
 
-        for f_idx, image in enumerate(images):
-            frame_w, frame_h = frame_sizes[f_idx]
-            for box in person_boxes_per_frame[f_idx]:
-                expanded = expand_box(box, config.detector.expand_ratio, frame_w, frame_h)
-                crop, offset, (crop_w, crop_h) = crop_image(image, expanded)
-                if crop_w < 1 or crop_h < 1:
-                    continue
+        for f_idx, regions in enumerate(self.crop_regions(images)):
+            for crop, offset, (crop_w, crop_h) in regions:
                 crops.append(crop)
                 crop_frame_idx.append(f_idx)
                 crop_meta.append((offset, (crop_w, crop_h)))
@@ -160,6 +193,7 @@ class Pipeline:
         prediction_classes: Optional[Dict[int, str]] = None,
         target_classes: Optional[Dict[int, str]] = None,
         eval_classes: Optional[Dict[int, str]] = None,
+        compute_metrics: bool = True,
     ) -> Dict[str, Any]:
         """Run the pipeline over a Friendy eval dataloader and score the result."""
         output_dir = Path(output_dir)
@@ -195,6 +229,11 @@ class Pipeline:
         prediction_path = output_dir / "predictions.pt"
         torch.save(records, prediction_path)
         print(f"[chachak] Saved predictions: {prediction_path} records={len(records)}")
+
+        if not compute_metrics:
+            return {"prediction_path": prediction_path, "records": records,
+                    "metrics": {"prediction_only": True,
+                                "eval_seconds": round(time.perf_counter() - started, 3)}}
 
         metrics = evaluate_detection(
             all_predictions,
@@ -240,7 +279,7 @@ class PeopleDetectFirstPipeline(Pipeline):
 
     name = "people_detect_first"
 
-    def process_batch(self, images, targets):
+    def _person_boxes(self, images):
         if self.detector is None:
             raise ValueError("people_detect_first requires a detector")
         det_preds = self.detector.predict(images)
@@ -248,7 +287,10 @@ class PeopleDetectFirstPipeline(Pipeline):
         for image, preds in zip(images, det_preds):
             frame_w, frame_h = _frame_size(image)
             person_boxes.append(xywhn_preds_to_xyxy(preds.detach().cpu(), frame_w, frame_h))
-        return self._crop_infer_remap(images, person_boxes)
+        return person_boxes
+
+    def process_batch(self, images, targets):
+        return self._crop_infer_remap(images)
 
 
 class BatchPeoplePipeline(Pipeline):
@@ -256,7 +298,7 @@ class BatchPeoplePipeline(Pipeline):
 
     name = "batch_people"
 
-    def process_batch(self, images, targets):
+    def _person_boxes(self, images):
         if self.detector is None:
             raise ValueError("batch_people requires a detector")
         config = self.config
@@ -281,7 +323,10 @@ class BatchPeoplePipeline(Pipeline):
             # Collapse duplicate person boxes from overlapping tiles before cropping.
             merged = merge_predictions(remapped, frame_w, frame_h, config.detector.nms_iou)
             person_boxes.append(xywhn_preds_to_xyxy(merged, frame_w, frame_h))
-        return self._crop_infer_remap(images, person_boxes)
+        return person_boxes
+
+    def process_batch(self, images, targets):
+        return self._crop_infer_remap(images)
 
 
 class ChainedPipeline(Pipeline):

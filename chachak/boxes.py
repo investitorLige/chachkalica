@@ -58,6 +58,53 @@ def _tile_starts(total: int, size: int, stride: int) -> List[int]:
     return starts
 
 
+def _fixed_tile_starts(total: int, size: int, stride: int) -> List[int]:
+    """Starts for full-size windows, with the final one shifted flush to the edge."""
+    if total <= size:
+        return [0]
+    starts = list(range(0, total - size + 1, stride))
+    final = total - size
+    if starts[-1] != final:
+        starts.append(final)
+    return starts
+
+
+def tile_frame_pixels(
+    image: torch.Tensor,
+    tile_size_px: int,
+    overlap: float,
+) -> List[Tuple[torch.Tensor, Tuple[int, int], Tuple[int, int]]]:
+    """Split a CHW frame into fixed square source-pixel tiles.
+
+    Windows remain ``tile_size_px`` square and the last window is shifted flush
+    to the far edge whenever the frame is large enough. A frame dimension smaller
+    than the requested size is zero-padded on the right/bottom; pixels are never
+    resized. Returned local sizes describe the padded square canvas so prediction
+    remapping and normalized training targets use the same coordinate frame.
+    """
+    tile_size_px = int(tile_size_px)
+    if tile_size_px <= 0:
+        raise ValueError(f"tile_size_px must be greater than 0, got {tile_size_px}")
+    if not 0.0 <= overlap < 1.0:
+        raise ValueError(f"overlap must be in [0, 1), got {overlap}")
+
+    channels, height, width = image.shape
+    stride = max(1, int(round(tile_size_px * (1.0 - overlap))))
+    tiles = []
+    for y in _fixed_tile_starts(height, tile_size_px, stride):
+        for x in _fixed_tile_starts(width, tile_size_px, stride):
+            content_w = min(tile_size_px, width - x)
+            content_h = min(tile_size_px, height - y)
+            crop = image[:, y : y + content_h, x : x + content_w]
+            if content_w == tile_size_px and content_h == tile_size_px:
+                tile = crop
+            else:
+                tile = image.new_zeros((channels, tile_size_px, tile_size_px))
+                tile[:, :content_h, :content_w] = crop
+            tiles.append((tile, (x, y), (tile_size_px, tile_size_px)))
+    return tiles
+
+
 def tile_frame(
     image: torch.Tensor,
     tile_w_frac: float,
@@ -156,6 +203,11 @@ def remap_local_preds_to_frame(
     )
     boxes = boxes + offset
     boxes = clip_xyxy(boxes, frame_w, frame_h)
+    valid = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+    boxes = boxes[valid]
+    preds = preds[valid]
+    if boxes.numel() == 0:
+        return preds.reshape(-1, 6)
     xywhn = xyxy_to_xywhn(boxes, frame_w, frame_h)
     return torch.cat([xywhn, preds[:, 4:6]], dim=1)
 

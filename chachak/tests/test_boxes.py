@@ -19,6 +19,25 @@ import boxes  # noqa: E402
 
 
 class TileFrameTest(unittest.TestCase):
+    def test_fixed_pixel_tiles_shift_last_window_flush_to_edge(self):
+        image = torch.zeros((3, 100, 100))
+        tiles = boxes.tile_frame_pixels(image, 40, overlap=0.0)
+
+        starts = sorted({offset for _, offset, _ in tiles})
+        self.assertIn((60, 60), starts)
+        self.assertTrue(all(tuple(tile.shape) == (3, 40, 40) for tile, _, _ in tiles))
+        self.assertTrue(all(size == (40, 40) for _, _, size in tiles))
+
+    def test_fixed_pixel_tile_pads_only_when_frame_is_smaller(self):
+        image = torch.ones((3, 20, 30))
+        [(tile, offset, size)] = boxes.tile_frame_pixels(image, 40, overlap=0.2)
+
+        self.assertEqual(offset, (0, 0))
+        self.assertEqual(size, (40, 40))
+        self.assertTrue(torch.equal(tile[:, :20, :30], image))
+        self.assertEqual(float(tile[:, 20:, :].sum()), 0.0)
+        self.assertEqual(float(tile[:, :, 30:].sum()), 0.0)
+
     def test_tiles_cover_whole_frame_including_edges(self):
         image = torch.zeros((3, 100, 100))
         # 40% of 100 -> 40px tiles.
@@ -60,6 +79,13 @@ class TileFrameTest(unittest.TestCase):
 
 
 class RemapTest(unittest.TestCase):
+    def test_prediction_fully_inside_padding_is_dropped(self):
+        preds = torch.tensor([[0.9, 0.9, 0.1, 0.1, 0.9, 0.0]])
+        remapped = boxes.remap_local_preds_to_frame(
+            preds, (0, 0), 64, 64, 40, 40
+        )
+        self.assertEqual(tuple(remapped.shape), (0, 6))
+
     def test_center_box_round_trips_to_full_frame(self):
         frame_w, frame_h = 640, 480
         offset = (100, 50)

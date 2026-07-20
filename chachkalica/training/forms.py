@@ -20,6 +20,8 @@ only reads the specs for the chosen ``arch``, and first strips every spec-owned
 key so switching arch never leaves a stale kwarg a different adapter would reject.
 """
 
+import json
+
 from django import forms
 
 from training import model_specs
@@ -27,22 +29,37 @@ from training.models import ExperimentModel, TrainedModel
 
 
 class VariantAwareSelect(forms.Select):
-    """A ``<select>`` that tags each ``<option>`` with ``data-variant`` when the
-    option belongs to a single variant.
+    """A ``<select>`` that tags each ``<option>`` with metadata the JS reads.
 
-    ``experiment_model_form.js`` reads the attribute to show an option only while
-    its variant is selected; options with no variant are always shown.
+    ``data-variant``: the option belongs to a single variant, so
+    ``experiment_model_form.js`` shows it only while that variant is selected
+    (options with no variant are always shown).
+
+    ``data-train-res`` / ``data-train-res-map``: the resolution the checkpoint was
+    pretrained at, annotated onto the option's label. A fixed-resolution option
+    carries ``data-train-res``; the variant-resolved "default" option carries a
+    ``data-train-res-map`` JSON ``{variant: res}`` the JS resolves against the row.
     """
 
-    def __init__(self, *args, variant_map=None, **kwargs):
+    def __init__(self, *args, variant_map=None, res_map=None, default_res=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.variant_map = variant_map or {}
+        self.res_map = res_map or {}
+        self.default_res = default_res
 
     def create_option(self, name, value, *args, **kwargs):
         option = super().create_option(name, value, *args, **kwargs)
         variant = self.variant_map.get(str(value))
         if variant:
             option["attrs"]["data-variant"] = variant
+        res = self.res_map.get(str(value))
+        if res:
+            option["attrs"]["data-train-res"] = res
+        elif str(value) == model_specs.WEIGHTS_DEFAULT and self.default_res is not None:
+            if isinstance(self.default_res, dict):
+                option["attrs"]["data-train-res-map"] = json.dumps(self.default_res)
+            else:
+                option["attrs"]["data-train-res"] = self.default_res
         return option
 
 
@@ -103,6 +120,8 @@ def _weights_field(arch: str) -> forms.Field:
         widget=VariantAwareSelect(
             attrs={"class": "xm-spec-field xm-weights-field", "data-arch": arch},
             variant_map=model_specs.weights_variant_map(arch),
+            res_map=model_specs.weights_res_map(arch),
+            default_res=model_specs.weights_default_res(arch),
         ),
         help_text="Published/native options use the architecture's own weight "
                   "format. 'Your model' performs a checked Friendy warm-start and "
@@ -225,10 +244,14 @@ class ExperimentModelForm(forms.ModelForm):
             (entry["value"], entry["label"]) for entry in entries]
         field.choices = choices
         variant_map = dict(getattr(field.widget, "variant_map", {}) or {})
+        res_map = dict(getattr(field.widget, "res_map", {}) or {})
         for entry in entries:
             if entry.get("variant"):
                 variant_map[str(entry["value"])] = entry["variant"]
+            if entry.get("train_res"):
+                res_map[str(entry["value"])] = entry["train_res"]
         field.widget.variant_map = variant_map
+        field.widget.res_map = res_map
 
     def _seed_weights(self, arch: str, params: dict) -> None:
         """Set the weights dropdown (and custom field) to reflect stored state."""

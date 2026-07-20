@@ -25,11 +25,12 @@ PIPELINE_CHOICES = [
 # Pipelines that require a person-detector checkpoint.
 DETECTOR_PIPELINES = {PEOPLE_DETECT_FIRST, BATCH_PEOPLE}
 
-# Pipelines that support being trained *through* (tiling only, for now). Other
-# pipelines still route val/test inference through chachak but train on full
-# frames — they decide crops from a detector at inference, which has no
-# training-time analogue.
-TRAINABLE_PIPELINES = {BATCH_DETECT}
+# Pipelines that support being trained *through*: the training loop applies the
+# same frame transform (tiling, or person-cropping via the detector) it uses at
+# val/test, so the model trains on the exact sub-frames it is served on. Keep in
+# sync with friendy_chachkalica.train._TRAINABLE_PIPELINES. Only ``chain`` is
+# excluded — merging several pipelines has no single train-time transform.
+TRAINABLE_PIPELINES = {BATCH_DETECT, PEOPLE_DETECT_FIRST, BATCH_PEOPLE}
 
 # Pipelines offered in the Experiment UI: only those supported end-to-end
 # (train + val + test) today. The rest are hidden until train-loop support

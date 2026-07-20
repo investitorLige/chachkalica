@@ -1,11 +1,25 @@
 {% extends "admin/base_site.html" %}
 
 {% block content %}
+{% if is_combined %}
+<p>Evaluate <strong>{{ models|length }} models combined</strong> against a dataset:</p>
+<ul>
+  {% for m in models %}
+    <li><strong>{{ m.name }}</strong> ({{ m.arch }}) — <code>{{ m.checkpoint_path }}</code></li>
+  {% endfor %}
+</ul>
+<p class="help">Each model's predictions are remapped onto the dataset's class space and
+merged per image, then scored as a single result — one eval row for all
+{{ models|length }} models. Leave <em>Pipeline</em> blank for a plain evaluation, or choose
+one to run every model through the same <strong>chachak pipeline</strong> — only that
+pipeline's fields are shown.</p>
+{% else %}
 <p>Evaluate model <strong>{{ model.name }}</strong> ({{ model.arch }}) against a dataset.</p>
 <p class="help">The model's checkpoint and training class space come from
 <code>{{ model.checkpoint_path }}</code>. Leave <em>Pipeline</em> blank for a plain
 evaluation, or choose one to run the model through a <strong>chachak pipeline</strong> —
 only that pipeline's fields are shown.</p>
+{% endif %}
 
 <form action="" method="post">
   {% csrf_token %}

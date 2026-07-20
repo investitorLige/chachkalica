@@ -116,17 +116,19 @@ class YoloDetectionDataset:
     def __init__(self, images_dir, labels_dir, classes, transforms=None, require_labels=False):
         self.transforms = transforms
         self.images_root = Path(images_dir).resolve()
-        self.labels_root = Path(labels_dir).resolve()
+        self.labels_root = Path(labels_dir).resolve() if labels_dir is not None else None
         self.names = dict(classes)
         self.image_paths = _resolve_image_dir(self.images_root)
 
-        if not self.labels_root.is_dir():
+        if self.labels_root is not None and not self.labels_root.is_dir():
             raise FileNotFoundError(f"Could not resolve labels directory: {self.labels_root}")
 
         label_count = 0
         bad_class_lines = 0
         unnormalized_lines = 0
         for image_path in self.image_paths:
+            if self.labels_root is None:
+                continue
             label_path = _image_to_label_path(image_path, self.images_root, self.labels_root)
             if not label_path.exists():
                 continue
@@ -157,7 +159,7 @@ class YoloDetectionDataset:
         # dataset that is genuinely all-background. For eval sets this silently
         # produces meaningless loss/mAP (every prediction scored against empty
         # ground truth), so fail loud. Train tolerates it with a warning.
-        if label_count == 0:
+        if label_count == 0 and self.labels_root is not None:
             message = (
                 f"No labels matched any of {len(self.image_paths)} images under "
                 f"{self.labels_root} (checked both '<stem>.txt' and "
@@ -174,13 +176,16 @@ class YoloDetectionDataset:
     def __getitem__(self, index):
         import numpy as np
         import torch
-        from PIL import Image
+        from PIL import Image, ImageOps
 
         image_path = self.image_paths[index]
-        image = Image.open(image_path).convert("RGB")
+        # Match browser/display orientation before deriving dimensions and boxes.
+        image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
         width, height = image.size
-        label_path = _image_to_label_path(image_path, self.images_root, self.labels_root)
-        boxes, labels = _read_yolo_label_file(label_path, width, height)
+        label_path = (_image_to_label_path(image_path, self.images_root, self.labels_root)
+                      if self.labels_root is not None else None)
+        boxes, labels = (_read_yolo_label_file(label_path, width, height)
+                         if label_path is not None else ([], []))
 
         image = np.asarray(image).copy()
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
@@ -195,7 +200,7 @@ class YoloDetectionDataset:
             "area": area,
             "iscrowd": torch.zeros((len(labels),), dtype=torch.int64),
             "image_path": str(image_path),
-            "label_path": str(label_path),
+            "label_path": str(label_path) if label_path is not None else None,
             "orig_size": torch.tensor([height, width], dtype=torch.int64),
         }
 
@@ -378,7 +383,7 @@ def build_eval_dataloader(
 
     # Eval requires labels: a val/test set with none makes every loss and mAP
     # meaningless, so surface it as a hard error instead of "training complete".
-    dataset = build_dataset(dataset_config, require_labels=True)
+    dataset = build_dataset(dataset_config, require_labels=dataset_config.labels is not None)
     print(
         f"[data] Building eval dataloader dataset={dataset_config.name} "
         f"batch_size={batch_size} workers={num_workers} shuffle=False"

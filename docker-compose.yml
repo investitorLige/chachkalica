@@ -114,9 +114,9 @@ services:
       - "${FC_HOST_PORT:-8201}:${FC_PORT:-8200}"
     volumes:
       # Same host data dir at the same container path as web/worker — see the
-      # SHARED FILESYSTEM note above. source/ is a read-only input subtree.
+      # SHARED FILESYSTEM note above. source/ stays writable for label promotion.
       - ./chachkalica/data:/app/data
-      - ./chachkalica/data/source:/app/data/source:ro
+      - ./chachkalica/data/source:/app/data/source
     restart: unless-stopped
 
     # ───────────────────────────────── GPU ─────────────────────────────────

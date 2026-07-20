@@ -17,6 +17,7 @@ _DEFAULT_IOU = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
 
 @dataclass(frozen=True)
 class TilingConfig:
+    tile_size_px: Optional[int] = None
     tile_width_pct: float = 50.0
     tile_height_pct: float = 50.0
     overlap: float = 0.2
@@ -40,7 +41,7 @@ class PipelineConfig:
     pipeline: str
     model_checkpoint: Path
     images: Path
-    labels: Path
+    labels: Optional[Path]
     classes: Dict[int, str]
     output_dir: Path
     device: str = "auto"
@@ -53,6 +54,11 @@ class PipelineConfig:
     tiling: TilingConfig = field(default_factory=TilingConfig)
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     chain: List[str] = field(default_factory=list)
+    # Extra model checkpoints combined with `model_checkpoint`, run through the
+    # same pipeline; each model's predictions are remapped onto `classes` by
+    # name and merged per image before scoring (see run.py:run_pipeline). Empty
+    # for an ordinary single-model pipeline eval.
+    extra_checkpoints: List[Path] = field(default_factory=list)
 
 
 def _resolve_path(value: Any, base_dir: Path) -> Path:
@@ -81,6 +87,11 @@ def _parse_tiling(raw: Any) -> TilingConfig:
     if not isinstance(raw, dict):
         raise ValueError("tiling must be a mapping")
     defaults = TilingConfig()
+    tile_size_px = raw.get("tile_size_px", defaults.tile_size_px)
+    if tile_size_px is not None:
+        tile_size_px = int(tile_size_px)
+        if tile_size_px <= 0:
+            raise ValueError("tiling.tile_size_px must be greater than 0")
     overlap = float(raw.get("overlap", defaults.overlap))
     if not 0.0 <= overlap < 1.0:
         raise ValueError("tiling.overlap must be in [0, 1)")
@@ -93,6 +104,7 @@ def _parse_tiling(raw: Any) -> TilingConfig:
         if not 0.0 < value <= 100.0:
             raise ValueError(f"tiling.{label} must be in (0, 100]")
     return TilingConfig(
+        tile_size_px=tile_size_px,
         tile_width_pct=tile_width_pct,
         tile_height_pct=tile_height_pct,
         overlap=overlap,
@@ -170,12 +182,16 @@ def pipeline_config_from_dict(raw: Dict[str, Any], base_dir: Path) -> PipelineCo
     if needs_detector and detector.checkpoint is None:
         raise ValueError(f"pipeline '{pipeline}' requires detector.checkpoint")
 
+    extra_checkpoints = [
+        _resolve_path(checkpoint, base_dir) for checkpoint in (raw.get("extra_checkpoints") or [])
+    ]
+
     config = PipelineConfig(
         name=name,
         pipeline=pipeline,
         model_checkpoint=_resolve_path(_require(raw, "model_checkpoint"), base_dir),
         images=_resolve_path(_require(raw, "images"), base_dir),
-        labels=_resolve_path(_require(raw, "labels"), base_dir),
+        labels=(_resolve_path(raw["labels"], base_dir) if raw.get("labels") else None),
         classes=classes,
         output_dir=_resolve_path(raw.get("output_dir", f"runs/{name}"), base_dir),
         device=str(raw.get("device", "auto")),
@@ -191,6 +207,7 @@ def pipeline_config_from_dict(raw: Dict[str, Any], base_dir: Path) -> PipelineCo
         tiling=_parse_tiling(raw.get("tiling")),
         detector=detector,
         chain=list(chain),
+        extra_checkpoints=extra_checkpoints,
     )
     print(
         f"[chachak] Config: pipeline={config.pipeline} name={config.name} "

@@ -103,5 +103,11 @@ def infer_in_chunks(
     results: List[torch.Tensor] = []
     for start in range(0, len(images), max(1, chunk_size)):
         chunk = images[start : start + chunk_size]
-        results.extend(predict_adapter(adapter, chunk, score_threshold))
+        chunk_results = predict_adapter(adapter, chunk, score_threshold)
+        if len(chunk_results) != len(chunk):
+            raise RuntimeError(
+                "adapter prediction count mismatch: "
+                f"images={len(chunk)} predictions={len(chunk_results)}"
+            )
+        results.extend(chunk_results)
     return results

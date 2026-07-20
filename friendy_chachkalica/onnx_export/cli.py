@@ -21,6 +21,8 @@ import torch
 
 try:
     from ..registry import build_model
+    from ..trt_export.arch import get_fp16_node_block, get_fp16_op_block, is_fp16_trusted
+    from ..trt_export.fp16_cast import cast_onnx_bytes_to_fp16
     from .registry import get_exporter
 except ImportError:  # run as a flat script
     import sys
@@ -28,6 +30,12 @@ except ImportError:  # run as a flat script
     sys.path.append(str(Path(__file__).resolve().parents[1]))
     from registry import build_model  # type: ignore
     from onnx_export.registry import get_exporter  # type: ignore
+    from trt_export.arch import (  # type: ignore
+        get_fp16_node_block,
+        get_fp16_op_block,
+        is_fp16_trusted,
+    )
+    from trt_export.fp16_cast import cast_onnx_bytes_to_fp16  # type: ignore
 
 
 def _as_class_map(classes: Union[Dict, List, None]) -> Dict[int, str]:
@@ -38,9 +46,61 @@ def _as_class_map(classes: Union[Dict, List, None]) -> Dict[int, str]:
     return {index: str(name) for index, name in enumerate(classes)}
 
 
+def _write_fp16_sidecar(
+    fp32_onnx_path: Path,
+    arch: str,
+    *,
+    force: bool = False,
+) -> Union[Path, None]:
+    """Cast the fp32 ONNX at ``fp32_onnx_path`` to a separate ``<name>.fp16.onnx``.
+
+    A separate artifact — never a replacement. Graph I/O stays fp32
+    (``keep_io_types``), so the fp32 ``.meta.json`` applies verbatim; we copy it to
+    ``<name>.fp16.meta.json`` so the fp16 model loads standalone via onnx_infer's
+    ``<stem>.meta.json`` convention.
+
+    IMPORTANT: this file is for the onnxruntime(-GPU) consumer only. Do NOT feed it
+    to the TRT builder: on strongly-typed TRT (>=11) engine precision comes from the
+    graph dtypes, so an fp16 graph forces an fp16 engine regardless of the requested
+    precision — bypassing the per-arch UNTRUSTED_FP16 fp32 floor. The TRT path builds
+    fp16 itself from the canonical fp32 ``.onnx``.
+    """
+    if not is_fp16_trusted(arch) and not force:
+        raise SystemExit(
+            f"[export] Refusing fp16 export for {arch!r}: its plain-fp16 output is "
+            f"not trusted (known parity break; see UNTRUSTED_FP16). Re-run with "
+            f"--force-fp16 to write it anyway."
+        )
+
+    fp16_onnx_path = fp32_onnx_path.with_suffix(".fp16.onnx")
+    fp16_meta_path = fp16_onnx_path.with_suffix(".meta.json")
+    fp32_meta_path = fp32_onnx_path.with_suffix(".meta.json")
+
+    fp16_bytes, method = cast_onnx_bytes_to_fp16(
+        fp32_onnx_path.read_bytes(),
+        extra_fp32_ops=get_fp16_op_block(arch),
+        node_block_substrings=get_fp16_node_block(arch),
+    )
+    if fp16_bytes is None:
+        raise SystemExit(
+            "[export] --fp16 requested but no ONNX float16 converter is importable "
+            "(need onnxruntime or onnxconverter_common)."
+        )
+
+    fp16_onnx_path.write_bytes(fp16_bytes)
+    # Contract A/B unchanged (I/O kept fp32) -> the fp32 meta applies verbatim.
+    fp16_meta_path.write_text(fp32_meta_path.read_text())
+    print(f"[export] Wrote {fp16_onnx_path} (fp16 via {method}; I/O kept fp32)")
+    print(f"[export] Wrote {fp16_meta_path}")
+    return fp16_onnx_path
+
+
 def export_checkpoint(
     checkpoint_path: Union[str, Path],
     onnx_path: Union[str, Path, None] = None,
+    *,
+    fp16: bool = False,
+    force_fp16: bool = False,
 ) -> Path:
     checkpoint_path = Path(checkpoint_path)
     onnx_path = Path(onnx_path) if onnx_path else checkpoint_path.with_suffix(".onnx")

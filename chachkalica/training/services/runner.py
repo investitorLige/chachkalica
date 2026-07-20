@@ -128,6 +128,34 @@ def predict_image(payload: dict, ts: TrainingSettings | None = None) -> dict:
     return resp.json()
 
 
+# Promoting predictions to labels reads a predictions.pt + a checkpoint and writes
+# YOLO .txt files — file work, but a large predictions set is not instant.
+PROMOTE_TIMEOUT = 600
+
+
+def promote_labels(payload: dict, ts: TrainingSettings | None = None) -> dict:
+    """Write a run's predictions into a dataset's source labels via the trainer.
+
+    Synchronous (like ``export_onnx``): the trainer reads the ``*_predictions.pt``
+    in its own torch env, remaps classes by name, backs up existing labels, and
+    writes the new ``labels/*.txt`` on the shared filesystem, returning a summary.
+    """
+    resp = requests.post(
+        f"{base_url(ts)}/promote_labels", json=payload, timeout=PROMOTE_TIMEOUT)
+    if resp.status_code >= 400:
+        detail = resp.text
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and body.get("detail"):
+            detail = str(body["detail"])
+        raise RuntimeError(
+            f"trainer /promote_labels returned HTTP {resp.status_code}: {detail}"
+        )
+    return resp.json()
+
+
 # ONNX export rebuilds the model and traces it — well past the short module
 # TIMEOUT, especially for the DETR-family archs.
 EXPORT_TIMEOUT = 600

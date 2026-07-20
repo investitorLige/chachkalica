@@ -52,9 +52,13 @@ def sync_project(project: Project) -> dict:
         path = writer.label_path(tgt, dataset, username, filename)
         if objects:
             writer.write_atomic(path, txt_format.objects_to_text(width, height, objects))
+            legacy_path = writer.legacy_label_path(tgt, dataset, username, filename)
+            if legacy_path != path:
+                writer.delete(legacy_path)
             present.add(path.name)
         else:
             writer.delete(path)
+            writer.delete(writer.legacy_label_path(tgt, dataset, username, filename))
 
     # Prune txts whose task/annotation no longer exists in Label Studio.
     pruned = 0

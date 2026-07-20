@@ -1,6 +1,8 @@
 import argparse
 import json
+import os
 import random
+import tempfile
 import time
 import traceback
 from collections.abc import Mapping
@@ -39,14 +41,22 @@ except ImportError:
     from registry import build_model
 
 try:
+    from .cropping import crop_batch
     from .tiling import tile_batch
 except ImportError:
+    from cropping import crop_batch
     from tiling import tile_batch
 
-# Pipelines the model can be *trained through*: only tiling (batch_detect) has a
-# well-defined training-time analogue (train on tiles). Other pipelines route
-# val/test inference through chachak but train on full frames.
-_TRAINABLE_PIPELINES = {"batch_detect"}
+# Pipelines the model can be *trained through* — each has a training-time
+# analogue that turns a full frame into the same sub-frames the model is
+# validated/served on:
+#   * batch_detect            -> tile the frame                 (tiling.tile_batch)
+#   * people_detect_first     -> crop around detected people    (cropping.crop_batch)
+#   * batch_people            -> tile, detect people, then crop (cropping.crop_batch)
+# The crop pipelines run the person detector at train time too, so training sees
+# the exact person crops inference produces. Keep this in sync with
+# chachkalica.training.pipelines.TRAINABLE_PIPELINES.
+_TRAINABLE_PIPELINES = {"batch_detect", "people_detect_first", "batch_people"}
 
 
 class ExperimentTrainingError(RuntimeError):
@@ -88,6 +98,29 @@ def _pipeline_needs_detector(spec: Any) -> bool:
     return False
 
 
+def _transform_train_batch(
+    images: List[torch.Tensor],
+    targets: List[Dict[str, Any]],
+    config: ExperimentConfig,
+    pipeline: Any,
+):
+    """Apply a trainable pipeline's train-time transform to one loader batch.
+
+    Tiling pipelines tile each frame; person-crop pipelines crop around detected
+    people (running the frozen detector held by ``pipeline``). Both expand one
+    frame into several sub-frame samples with re-mapped targets. Assumes
+    ``config.pipeline.name`` is in :data:`_TRAINABLE_PIPELINES`.
+    """
+    if _pipeline_needs_detector(config.pipeline):
+        if pipeline is None:
+            raise ValueError(
+                f"pipeline '{config.pipeline.name}' crops around detected people "
+                "at train time but no detector pipeline was built"
+            )
+        return crop_batch(images, targets, pipeline)
+    return tile_batch(images, targets, config.pipeline.tiling)
+
+
 def build_run_pipeline(adapter: Any, config: ExperimentConfig, device: torch.device):
     """Build a chachak pipeline wrapping the *live* in-memory ``adapter``, or None.
 
@@ -125,8 +158,13 @@ def build_run_pipeline(adapter: Any, config: ExperimentConfig, device: torch.dev
     if config.evaluation.map_score_threshold is not None:
         raw["map_score_threshold"] = config.evaluation.map_score_threshold
     if spec.detector_checkpoint is not None:
-        raw["detector"] = {"checkpoint": str(spec.detector_checkpoint)}
+        detector_raw: Dict[str, Any] = {"checkpoint": str(spec.detector_checkpoint)}
+        if spec.detector_expand_ratio is not None:
+            detector_raw["expand_ratio"] = spec.detector_expand_ratio
+        raw["detector"] = detector_raw
     tiling: Dict[str, Any] = {}
+    if spec.tiling.tile_size_px is not None:
+        tiling["tile_size_px"] = spec.tiling.tile_size_px
     if spec.tiling.tile_width_pct is not None:
         tiling["tile_width_pct"] = spec.tiling.tile_width_pct
     if spec.tiling.tile_height_pct is not None:
@@ -533,6 +571,15 @@ def train_model(
     eval_pipeline = build_run_pipeline(adapter, config, device)
     if eval_pipeline is not None:
         print(f"[train] Val/test inference routed through chachak pipeline: {config.pipeline.name}")
+        if config.pipeline.name in _TRAINABLE_PIPELINES:
+            if _pipeline_needs_detector(config.pipeline):
+                print(
+                    "[train] Training on person crops: the person detector runs "
+                    "each batch and ground-truth objects outside every detected "
+                    "person crop are not seen (detector recall bounds train too)."
+                )
+            else:
+                print("[train] Training on tiled frames.")
 
     last_checkpoint = run_dir / "last.pt"
     if resume and last_checkpoint.exists():
@@ -578,6 +625,7 @@ def train_model(
             scaler=scaler,
             config=config,
             device=device,
+            pipeline=eval_pipeline,
         )
 
         val_summary = None
@@ -601,6 +649,7 @@ def train_model(
                 config=config,
                 source_classes=run.val_dataset.classes if run.val_dataset is not None else None,
                 model_classes=train_dataset_config.classes,
+                pipeline=eval_pipeline,
             )
             print(f"[train] Run {run_name} epoch {epoch}: evaluating validation mAP")
             val_map_summary = evaluate_map(
@@ -754,26 +803,28 @@ def train_one_epoch(
     scaler: Optional[torch.amp.GradScaler],
     config: ExperimentConfig,
     device: torch.device,
+    pipeline: Any = None,
 ) -> Dict[str, Any]:
     adapter.train()
     total_loss = 0.0
     total_images = 0
     loss_totals: Dict[str, float] = {}
 
-    # A tiling pipeline turns each frame into several smaller tile samples, so a
-    # loader batch expands into more (smaller) samples than batch_size. We
-    # re-chunk the expanded samples back into batch_size micro-batches, each its
-    # own optimizer step, to keep per-step memory in line with untiled training.
-    tile = config.pipeline is not None and config.pipeline.name in _TRAINABLE_PIPELINES
+    # A trainable pipeline turns each frame into several sub-frame samples
+    # (tiles, or person crops), so a loader batch expands into more (smaller)
+    # samples than batch_size. We re-chunk the expanded samples back into
+    # batch_size micro-batches, each its own optimizer step, to keep per-step
+    # memory in line with untransformed training.
+    transform = config.pipeline is not None and config.pipeline.name in _TRAINABLE_PIPELINES
     micro_bs = max(1, config.training.batch_size)
 
     for images, targets in loader:
         images, targets = _move_batch_to_device(images, targets, device)
 
-        if tile:
-            images, targets = tile_batch(images, targets, config.pipeline.tiling)
+        if transform:
+            images, targets = _transform_train_batch(images, targets, config, pipeline)
             if not images:
-                continue  # every tile in this batch was all-background
+                continue  # nothing to train on (all background / no detections)
 
         for start in range(0, len(images), micro_bs):
             chunk_images = images[start : start + micro_bs]
@@ -824,26 +875,38 @@ def evaluate_loss(
     config: ExperimentConfig,
     source_classes: Optional[Dict[int, str]] = None,
     model_classes: Optional[Dict[int, str]] = None,
+    pipeline: Any = None,
 ) -> Dict[str, Any]:
     total_loss = 0.0
     total_images = 0
     loss_totals: Dict[str, float] = {}
 
+    transform = config.pipeline is not None and config.pipeline.name in _TRAINABLE_PIPELINES
+    micro_bs = max(1, config.evaluation.batch_size or config.training.batch_size)
+
     for images, targets in loader:
         images, targets = _move_batch_to_device(images, targets, device)
         targets = _remap_targets_to_model_classes(targets, source_classes, model_classes)
-        loss_step = getattr(adapter, "validation_step", adapter.training_step)
-        with _autocast_context(config, device, adapter):
-            loss, loss_items = loss_step(images, targets)
-        _require_finite_loss(
-            loss,
-            loss_items,
-            phase="validation",
-        )
-        batch_size = len(images)
-        total_loss += float(loss.detach().cpu()) * batch_size
-        total_images += batch_size
-        _accumulate_losses(loss_totals, loss_items, batch_size)
+        if transform:
+            images, targets = _transform_train_batch(images, targets, config, pipeline)
+            if not images:
+                continue
+
+        for start in range(0, len(images), micro_bs):
+            chunk_images = images[start : start + micro_bs]
+            chunk_targets = targets[start : start + micro_bs]
+            loss_step = getattr(adapter, "validation_step", adapter.training_step)
+            with _autocast_context(config, device, adapter):
+                loss, loss_items = loss_step(chunk_images, chunk_targets)
+            _require_finite_loss(
+                loss,
+                loss_items,
+                phase="validation",
+            )
+            batch_size = len(chunk_images)
+            total_loss += float(loss.detach().cpu()) * batch_size
+            total_images += batch_size
+            _accumulate_losses(loss_totals, loss_items, batch_size)
 
     return _summarize_losses(total_loss, total_images, loss_totals)
 
@@ -879,6 +942,7 @@ def evaluate_map(
             predictions = _predict_with_config(
                 adapter, images, config, pipeline=pipeline, targets=targets
             )
+            _require_prediction_batch(images, targets, predictions, phase="validation")
             predictions = _apply_eval_nms(predictions, config)
             for target, prediction in zip(targets, predictions):
                 prediction = prediction.detach().cpu()
@@ -894,6 +958,13 @@ def evaluate_map(
                 )
     finally:
         adapter.train(was_training)
+
+    if not compute_metrics:
+        return {
+            "prediction_only": True,
+            "evaluated_at": started_at.isoformat(timespec="seconds"),
+            "eval_seconds": round(time.perf_counter() - start_perf, 3),
+        }
 
     metrics = evaluate_detection(
         all_predictions,
@@ -923,6 +994,7 @@ def evaluate_map(
             prediction_classes=prediction_classes,
             target_classes=target_classes,
             eval_classes=target_classes,
+            operating_nms_threshold=operating_nms_threshold,
         )
     return metrics
 
@@ -940,6 +1012,7 @@ def predict_dataset(
     eval_classes: Optional[Dict[int, str]] = None,
     operating_nms_threshold: Optional[float] = None,
     pipeline: Any = None,
+    compute_metrics: bool = True,
 ) -> Dict[str, Any]:
     adapter.eval()
     records = []
@@ -953,6 +1026,7 @@ def predict_dataset(
         predictions = _predict_with_config(
             adapter, images, config, pipeline=pipeline, targets=targets
         )
+        _require_prediction_batch(images, targets, predictions, phase="evaluation")
         predictions = _apply_eval_nms(predictions, config)
         print(f"[train] Predicted batch {batch_index}: images={len(images)}")
         for target, prediction in zip(targets, predictions):
@@ -970,6 +1044,13 @@ def predict_dataset(
             )
     torch.save(records, output_path)
     print(f"[train] Saved predictions: {output_path} records={len(records)}")
+
+    if not compute_metrics:
+        return {
+            "prediction_only": True,
+            "evaluated_at": started_at.isoformat(timespec="seconds"),
+            "eval_seconds": round(time.perf_counter() - start_perf, 3),
+        }
 
     metrics = evaluate_detection(
         all_predictions,
@@ -1002,6 +1083,7 @@ def predict_dataset(
         prediction_classes=prediction_classes,
         target_classes=target_classes,
         eval_classes=eval_classes,
+        operating_nms_threshold=operating_nms_threshold,
     )
     return metrics
 
@@ -1016,6 +1098,7 @@ def _write_hard_images(
     prediction_classes: Optional[Dict[int, str]],
     target_classes: Optional[Dict[int, str]],
     eval_classes: Optional[Dict[int, str]],
+    operating_nms_threshold: Optional[float] = None,
     top_k: int = 50,
     iou_threshold: float = 0.5,
     score_threshold: Optional[float] = None,
@@ -1026,20 +1109,19 @@ def _write_hard_images(
     Writes ``<split>_hard_images.json`` next to ``<split>_predictions.pt`` (self-contained:
     image paths + normalized boxes + class names), which the admin viewer renders. Guarded so
     a split with no ground truth is skipped and any failure never sinks the eval that already
-    produced its metrics. The saved artifact keeps low-confidence predictions so the browser
-    confidence slider can decide what to display.
+    produced its metrics. Ranking uses the deployed operating confidence and NMS;
+    AP's low-confidence collection floor remains exclusive to AP integration.
     """
     if not all_targets or not any(int(target['labels'].numel()) for target in all_targets):
         print("[train] Skipping hard-images artifact: no ground-truth labels in split")
         return
 
     if score_threshold is None:
-        if config is not None and config.evaluation.map_score_threshold is not None:
-            score_threshold = config.evaluation.map_score_threshold
-        elif config is not None:
-            score_threshold = config.evaluation.score_threshold
-        else:
-            score_threshold = 0.001
+        score_threshold = (
+            config.evaluation.score_threshold
+            if config is not None
+            else 0.25
+        )
 
     predictions_path = Path(predictions_path)
     if predictions_path.name.endswith("_predictions.pt"):
@@ -1049,8 +1131,12 @@ def _write_hard_images(
     output_path = predictions_path.with_name(out_name)
 
     try:
+        ranking_predictions = [
+            apply_class_aware_nms(prediction, operating_nms_threshold)
+            for prediction in all_predictions
+        ]
         images = select_hard_images(
-            all_predictions,
+            ranking_predictions,
             all_targets,
             records,
             top_k=top_k,
@@ -1066,15 +1152,41 @@ def _write_hard_images(
             "metric_description": HARD_IMAGE_METRIC_DESCRIPTION,
             "iou_threshold": float(iou_threshold),
             "score_threshold": float(score_threshold),
+            "operating_nms_threshold": (
+                None if operating_nms_threshold is None else float(operating_nms_threshold)
+            ),
             "max_display_predictions": int(max_display_predictions),
             "top_k": int(top_k),
             "num_images_ranked": len(all_targets),
             "images": images,
         }
-        output_path.write_text(json.dumps(payload, indent=2))
+        _atomic_write_json(output_path, payload)
         print(f"[train] Saved hard images: {output_path} count={len(images)}")
     except Exception as exc:  # noqa: BLE001 - artifact is best-effort; never break the eval
         print(f"[train] WARNING: failed to write hard images ({output_path}): {exc}")
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    """Publish JSON atomically so live readers never observe a partial epoch."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2)
+            file.write(chr(10))
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _print_eval_map_debug(
@@ -1107,6 +1219,17 @@ def _print_eval_map_debug(
         missing = sorted(target_names - pred_names)
         if missing:
             print(f"[train] Val mAP debug: target classes not predicted by this model: {missing}")
+
+
+def _require_prediction_batch(images, targets, predictions, *, phase: str) -> None:
+    image_count = len(images)
+    target_count = len(targets)
+    prediction_count = -1 if predictions is None else len(predictions)
+    if image_count != target_count or prediction_count != image_count:
+        raise RuntimeError(
+            f"{phase} batch cardinality mismatch: images={image_count} "
+            f"targets={target_count} predictions={prediction_count}"
+        )
 
 
 def _apply_eval_nms(

@@ -9,3 +9,5 @@ uvicorn
 # ONNX export (torch.onnx writer) + architecture-free inference (onnx_infer service).
 onnx
 onnxruntime
+# DataFrame -> CSV reporting (inferlica/benchmark).
+pandas

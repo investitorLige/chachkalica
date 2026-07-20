@@ -24,7 +24,7 @@ try:
     from ..onnx_export.cli import export_checkpoint
     from ..onnx_export.common import INPUT_NAME
     from ..registry import build_model
-    from .arch import get_trt_prep
+    from .arch import get_fp16_node_block, get_fp16_op_block, get_trt_prep, is_fp16_trusted
     from .builder import build_engine_from_onnx
     from .profile import profile_from_meta
 except ImportError:  # run flat (cwd on sys.path), mirroring onnx_export/cli.py
@@ -34,7 +34,12 @@ except ImportError:  # run flat (cwd on sys.path), mirroring onnx_export/cli.py
     from onnx_export.cli import export_checkpoint  # type: ignore
     from onnx_export.common import INPUT_NAME  # type: ignore
     from registry import build_model  # type: ignore
-    from trt_export.arch import get_trt_prep  # type: ignore
+    from trt_export.arch import (  # type: ignore
+        get_fp16_node_block,
+        get_fp16_op_block,
+        get_trt_prep,
+        is_fp16_trusted,
+    )
     from trt_export.builder import build_engine_from_onnx  # type: ignore
     from trt_export.profile import profile_from_meta  # type: ignore
 
@@ -60,11 +65,13 @@ def build_engine(
     source_path: Union[str, Path],
     engine_path: Union[str, Path, None] = None,
     *,
-    precision: str = "fp16",
+    precision: str = "auto",
     adapter=None,
     min_hw: Optional[HW] = None,
     opt_hw: Optional[HW] = None,
     max_hw: Optional[HW] = None,
+    extra_fp32_ops=None,
+    node_block_substrings=None,
     workspace_gb: float = 4.0,
 ) -> Path:
     """Compile ``source_path`` (a ``.pt`` or ``.onnx``) into a TensorRT engine.
@@ -72,6 +79,12 @@ def build_engine(
     ``adapter`` (optional) is a pre-built torch adapter for the EfficientNMS archs
     (retinanet/yolox); pass it to build from a ``.onnx`` without the ``.pt`` (used
     by tests / callers that already hold the adapter). Ignored for passthrough archs.
+
+    ``precision`` is ``"auto"`` (default), ``"fp16"``, or ``"fp32"``. ``auto`` builds
+    fp16 except for archs still on the fp16 safety floor (``UNTRUSTED_FP16``), which
+    build fp32; ``fp16``/``fp32`` are honored verbatim (explicit wins over the floor).
+    On strongly-typed TRT the arch's per-arch fp32 keep-list (``ARCH_FP16_OP_BLOCK``)
+    is applied to any fp16 build; ``extra_fp32_ops`` extends it (used by the sweep).
 
     Returns the written ``.engine`` path.
     """
@@ -94,6 +107,19 @@ def build_engine(
         raise FileNotFoundError(f"meta sidecar not found next to ONNX: {meta_path}")
     meta = json.loads(meta_path.read_text())
     arch = meta.get("arch")
+
+    # Resolve auto -> per-arch precision (untrusted archs floor to fp32); explicit
+    # fp16/fp32 pass through. The per-arch fp32 keep-list applies to any fp16 build.
+    if precision == "auto":
+        precision = "fp16" if is_fp16_trusted(arch) else "fp32"
+        if precision == "fp32":
+            print(f"[trt] {arch}: on the fp16 safety floor -> building fp32 (pass precision='fp16' to override)")
+    resolved_fp32_ops = get_fp16_op_block(arch) + [
+        op for op in (extra_fp32_ops or []) if op not in get_fp16_op_block(arch)
+    ]
+    resolved_node_block = get_fp16_node_block(arch) + [
+        s for s in (node_block_substrings or []) if s not in get_fp16_node_block(arch)
+    ]
 
     engine_path = Path(engine_path) if engine_path else onnx_path.with_suffix(".engine")
     engine_path.parent.mkdir(parents=True, exist_ok=True)
@@ -133,6 +159,8 @@ def build_engine(
         max_hw=prof_max,
         input_name=INPUT_NAME,
         precision=precision,
+        extra_fp32_ops=resolved_fp32_ops,
+        node_block_substrings=resolved_node_block,
         workspace_gb=workspace_gb,
     )
 
@@ -176,7 +204,7 @@ def main() -> None:
     )
     parser.add_argument("source", help="Path to a .pt checkpoint or an exported .onnx")
     parser.add_argument("--output", "-o", help="Engine output path (default: source with .engine)")
-    parser.add_argument("--precision", choices=["fp16", "fp32"], default="fp16")
+    parser.add_argument("--precision", choices=["auto", "fp16", "fp32"], default="auto")
     parser.add_argument("--min-hw", type=_parse_hw, help="Min input HxW (e.g. 64x64); overrides meta")
     parser.add_argument("--opt-hw", type=_parse_hw, help="Optimum input HxW; overrides meta")
     parser.add_argument("--max-hw", type=_parse_hw, help="Max input HxW; overrides meta")

@@ -22,8 +22,11 @@ SCHEMA_VERSION = 1
 #   "none"         — pass the image through unchanged (the graph handles any
 #                    internal resize, e.g. torchvision detection models).
 #   "square"       — resize to (size, size) ignoring aspect ratio.
-#   "longest_side" — scale so the longest side == max_size, preserving aspect.
-RESIZE_MODES = {"none", "square", "longest_side"}
+#   "longest_side" — scale so the longest side == max_size, preserving aspect
+#                    (only ever downscales; no padding to a fixed canvas).
+#   "letterbox"    — scale (up or down) so the longest side == size exactly,
+#                    preserving aspect, then pad bottom-right to (size, size).
+RESIZE_MODES = {"none", "square", "longest_side", "letterbox"}
 INPUT_SCALES = {"unit", "byte"}  # 0..1 floats vs 0..255 floats
 
 # box_coords — the frame the graph emits boxes in:
@@ -51,8 +54,8 @@ class InputSpec:
             raise MetaSchemaError(f"input.resize_mode {self.resize_mode!r} not in {RESIZE_MODES}")
         if self.input_scale not in INPUT_SCALES:
             raise MetaSchemaError(f"input.input_scale {self.input_scale!r} not in {INPUT_SCALES}")
-        if self.resize_mode == "square" and not self.size:
-            raise MetaSchemaError("input.resize_mode 'square' requires input.size")
+        if self.resize_mode in ("square", "letterbox") and not self.size:
+            raise MetaSchemaError(f"input.resize_mode {self.resize_mode!r} requires input.size")
         if self.resize_mode == "longest_side" and not self.max_size:
             raise MetaSchemaError("input.resize_mode 'longest_side' requires input.max_size")
 
@@ -76,8 +79,12 @@ class ModelMeta:
     # Clip boxes to the original image bounds after the coordinate inverse.
     # Matches archs whose torch path clips (YOLOX's clip_xyxy); a no-op for archs
     # that already emit in-bounds boxes (RetinaNet clips internally); must stay
-    # False for archs whose torch path does not clip (RT-DETR/RF-DETR) so the
-    # service doesn't diverge from them.
+    # False for archs whose torch path does not clip (RT-DETR) so the service
+    # doesn't diverge from them. RF-DETR is an exception: under "letterbox"
+    # resize_mode its canvas includes real padding, so predictions can land in
+    # the pad margin and need clipping on both the torch and exported paths —
+    # RF-DETR sets this True (see friendy_chachkalica/adapters/rfdetr.py predict()
+    # and onnx_export/arch/rfdetr.py's build_meta call, which must agree).
     clip_boxes: bool = False
     schema_version: int = SCHEMA_VERSION
 

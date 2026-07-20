@@ -14,6 +14,7 @@ from pathlib import Path
 import django_rq
 from django.contrib import admin, messages
 from django.contrib.admin.helpers import ACTION_CHECKBOX_NAME
+from django.core import signing
 from django.http import FileResponse, Http404, JsonResponse
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
@@ -39,11 +40,42 @@ from training.models import (
 )
 from training import model_specs, pipelines
 from training.forms import ExperimentModelForm
-from training.services import config_gen, ingest, promote, runner, teardown
+from training.services import combine, config_gen, ingest, promote, runner, teardown
+
+
+_HARD_IMAGE_TOKEN_SALT = "training.hard-image-path"
 
 
 def _queue():
     return django_rq.get_queue("default")
+
+
+def _models_title(models) -> str:
+    return " + ".join(m.name for m in models)
+
+
+def _hard_image_token(image_path):
+    return signing.dumps(str(image_path), salt=_HARD_IMAGE_TOKEN_SALT, compress=True)
+
+
+def _hard_image_path_from_request(request, images):
+    """Resolve an immutable signed image token, with index fallback for old pages."""
+    token = request.GET.get("image_token")
+    if token:
+        try:
+            return signing.loads(
+                token,
+                salt=_HARD_IMAGE_TOKEN_SALT,
+                max_age=3600,
+            )
+        except signing.BadSignature as exc:
+            raise Http404("invalid or expired image token") from exc
+
+    index = _preview_index(request, len(images))
+    raw_path = images[index].get("image_path")
+    if not raw_path:
+        raise Http404("no image path recorded")
+    return raw_path
 
 
 @admin.register(TrainingSettings)
@@ -138,8 +170,9 @@ class ExperimentAdmin(admin.ModelAdmin):
         (
             "Training / Eval pipeline",
             {
-                "fields": ["pipeline", "tile_width_pct", "tile_height_pct",
-                           "overlap", "merge_nms_iou"],
+                "fields": ["pipeline", "detector_checkpoint", "detector_expand_ratio",
+                           "tile_size_px", "tile_width_pct", "tile_height_pct", "overlap",
+                           "merge_nms_iou"],
                 "description": "Optionally run train, val, and test through a chachak "
                                "pipeline. Only the selected pipeline's fields apply.",
             },
@@ -150,8 +183,9 @@ class ExperimentAdmin(admin.ModelAdmin):
         js = ("training/experiment_pipeline_form.js",)
 
     def formfield_for_dbfield(self, db_field, request, **kwargs):
-        # Offer only pipelines supported end-to-end today (blank = full-frame,
-        # plus batch_detect). Others are hidden until train-loop support lands.
+        # Offer only pipelines supported end-to-end today (train + val + test):
+        # blank = full-frame, plus every pipeline in TRAINABLE_PIPELINES. `chain`
+        # stays hidden (no single train-time transform).
         field = super().formfield_for_dbfield(db_field, request, **kwargs)
         if db_field.name == "pipeline" and field is not None:
             field.choices = [("", "---------"), *pipelines.EXPERIMENT_PIPELINE_CHOICES]
@@ -377,6 +411,7 @@ class TrainingRunAdmin(admin.ModelAdmin):
             "metric_description": payload.get("metric_description", ""),
             "iou_threshold": payload.get("iou_threshold"),
             "score_threshold": payload.get("score_threshold"),
+            "operating_nms_threshold": payload.get("operating_nms_threshold"),
             "max_display_predictions": payload.get("max_display_predictions"),
             "metrics_url": reverse("admin:training_trainingrun_live_report_metrics"),
             "back_label": "Back to training runs",
@@ -397,10 +432,7 @@ class TrainingRunAdmin(admin.ModelAdmin):
             raise Http404("unknown training run")
         artifact = self._selected_hard_image_artifact(run, request.GET.get("run_name"))
         images = artifact["payload"].get("images", []) if artifact else []
-        index = _preview_index(request, len(images))
-        raw_path = images[index].get("image_path")
-        if not raw_path:
-            raise Http404("no image path recorded")
+        raw_path = _hard_image_path_from_request(request, images)
         image_path = Path(raw_path).resolve()
         root = source_root().resolve()
         if root not in image_path.parents or not image_path.is_file():
@@ -422,11 +454,17 @@ class TrainingRunAdmin(admin.ModelAdmin):
             "predictions": entry.get("predictions", []),
             "ground_truth": entry.get("ground_truth", []),
             "image": entry.get("image_name", ""),
+            "image_token": _hard_image_token(entry.get("image_path", "")),
             "difficulty": entry.get("difficulty"),
+            "precision": entry.get("precision"),
+            "recall": entry.get("recall"),
+            "f1": entry.get("f1"),
             "missed": entry.get("missed"),
             "false_positives": entry.get("false_positives"),
             "wrong_class": entry.get("wrong_class"),
             "loc_error": entry.get("loc_error"),
+            "localization_penalty": entry.get("localization_penalty"),
+            "total_errors": entry.get("total_errors"),
             "num_predictions": entry.get("num_predictions"),
             "num_ground_truth": entry.get("num_ground_truth"),
             "index": index,
@@ -709,14 +747,34 @@ class TrainedModelAdmin(admin.ModelAdmin):
         actions: leave *Pipeline* blank for a plain :class:`EvalRun`, or pick one
         to create a :class:`PipelineEvalRun`. The form renders only the knobs the
         chosen pipeline uses (detector / tiling / chain).
+
+        Selecting 2+ models evaluates them *combined*: each model's predictions
+        are remapped onto the dataset's class space and merged per image, scored
+        as a single result. Only valid for complementary detectors — models
+        whose class lists share any class name are refused (they'd double-detect
+        that class), see :func:`combine.overlapping_class_names`.
         """
         from eval_pipelines.models import PipelineEvalRun
 
-        if queryset.count() != 1:
-            self.message_user(request, "Select exactly one model to evaluate.",
+        models = list(queryset)
+        if not models:
+            self.message_user(request, "Select at least one model to evaluate.",
                               level=messages.WARNING)
             return None
-        model = queryset.first()
+
+        overlap = combine.overlapping_class_names(models) if len(models) > 1 else set()
+        if overlap:
+            self.message_user(
+                request,
+                "Can't combine these models — they share class(es) "
+                f"{', '.join(sorted(overlap))}. Combined evaluation only supports "
+                "models with disjoint class spaces.",
+                level=messages.WARNING,
+            )
+            return None
+
+        model = models[0]
+        extra_models = models[1:]
 
         if request.POST.get("apply"):
             dataset = Dataset.objects.filter(pk=request.POST.get("dataset") or None).first()
@@ -749,6 +807,8 @@ class TrainedModelAdmin(admin.ModelAdmin):
                     map_score_threshold=_map_score_threshold(),
                     score_threshold=_score_threshold(),
                 )
+                if extra_models:
+                    eval_run.combined_models.set(extra_models)
                 try:
                     config_gen.write_eval_request(eval_run)
                 except (ValueError, FileNotFoundError, RuntimeError) as exc:
@@ -760,7 +820,8 @@ class TrainedModelAdmin(admin.ModelAdmin):
                 eval_run.status = EvalRun.QUEUED
                 eval_run.save(update_fields=["status"])
                 self.message_user(
-                    request, f"Eval #{eval_run.pk} queued for {model.name} on {dataset.name}.")
+                    request,
+                    f"Eval #{eval_run.pk} queued for {_models_title(models)} on {dataset.name}.")
                 return None
 
             # A pipeline was chosen — a PipelineEvalRun.
@@ -774,6 +835,7 @@ class TrainedModelAdmin(admin.ModelAdmin):
                 annotator=annotator, explicit_labels_path=explicit,
                 pipeline=pipeline,
                 detector_checkpoint=(request.POST.get("detector_checkpoint") or "").strip(),
+                detector_expand_ratio=_float("detector_expand_ratio"),
                 tile_width_pct=_float("tile_width_pct"),
                 tile_height_pct=_float("tile_height_pct"),
                 overlap=_float("overlap"),
@@ -781,6 +843,8 @@ class TrainedModelAdmin(admin.ModelAdmin):
                 map_score_threshold=_map_score_threshold(),
                 score_threshold=_score_threshold(),
             )
+            if extra_models:
+                pe.combined_models.set(extra_models)
             try:
                 config_gen.write_pipeline_request(pe)
             except (ValueError, FileNotFoundError, RuntimeError) as exc:
@@ -793,13 +857,16 @@ class TrainedModelAdmin(admin.ModelAdmin):
             pe.save(update_fields=["status"])
             self.message_user(
                 request,
-                f"Pipeline eval #{pe.pk} ({pipeline}) queued for {model.name} on {dataset.name}.")
+                f"Pipeline eval #{pe.pk} ({pipeline}) queued for "
+                f"{_models_title(models)} on {dataset.name}.")
             return None
 
         context = {
             **self.admin_site.each_context(request),
-            "title": f"Evaluate {model.name}",
+            "title": f"Evaluate {_models_title(models)}",
             "model": model,
+            "models": models,
+            "is_combined": len(models) > 1,
             "datasets": Dataset.objects.all(),
             "annotators": Annotator.objects.filter(status=Annotator.ACTIVE).order_by("username"),
             "label_source_choices": PipelineEvalRun._meta.get_field("label_source").choices,
@@ -811,10 +878,10 @@ class TrainedModelAdmin(admin.ModelAdmin):
             # Pre-fill the pipeline fields from the experiment the model came from,
             # so a later manual eval defaults to the params the model was trained
             # with. Empty dict when the model has no originating experiment or that
-            # experiment had no pipeline.
-            "pipeline_defaults": self._experiment_pipeline_defaults(model),
+            # experiment had no pipeline. Only applied for a single selected model.
+            "pipeline_defaults": self._experiment_pipeline_defaults(model) if len(models) == 1 else {},
             "action": "evaluate",
-            "selected": [str(model.pk)],
+            "selected": [str(m.pk) for m in models],
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
         }
         return TemplateResponse(request, "admin/training/evaluate_model.html", context)
@@ -1211,6 +1278,7 @@ class TrainedModelAdmin(admin.ModelAdmin):
             "metric_description": payload.get("metric_description", ""),
             "iou_threshold": payload.get("iou_threshold"),
             "score_threshold": payload.get("score_threshold"),
+            "operating_nms_threshold": payload.get("operating_nms_threshold"),
             "max_display_predictions": payload.get("max_display_predictions"),
             "query": urlencode({"model": model.pk}),
             "run_choices": [],
@@ -1226,10 +1294,7 @@ class TrainedModelAdmin(admin.ModelAdmin):
             raise Http404("unknown model")
         payload = self._load_hard_images(model)
         images = payload.get("images", []) if payload else []
-        index = _preview_index(request, len(images))
-        raw_path = images[index].get("image_path")
-        if not raw_path:
-            raise Http404("no image path recorded")
+        raw_path = _hard_image_path_from_request(request, images)
         image_path = Path(raw_path).resolve()
         root = source_root().resolve()
         if root not in image_path.parents or not image_path.is_file():
@@ -1251,11 +1316,17 @@ class TrainedModelAdmin(admin.ModelAdmin):
             "predictions": entry.get("predictions", []),
             "ground_truth": entry.get("ground_truth", []),
             "image": entry.get("image_name", ""),
+            "image_token": _hard_image_token(entry.get("image_path", "")),
             "difficulty": entry.get("difficulty"),
+            "precision": entry.get("precision"),
+            "recall": entry.get("recall"),
+            "f1": entry.get("f1"),
             "missed": entry.get("missed"),
             "false_positives": entry.get("false_positives"),
             "wrong_class": entry.get("wrong_class"),
             "loc_error": entry.get("loc_error"),
+            "localization_penalty": entry.get("localization_penalty"),
+            "total_errors": entry.get("total_errors"),
             "num_predictions": entry.get("num_predictions"),
             "num_ground_truth": entry.get("num_ground_truth"),
             "index": index,

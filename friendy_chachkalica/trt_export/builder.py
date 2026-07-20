@@ -8,13 +8,22 @@ Contract A), so this path is architecture-agnostic; only the optimization
 profile (input H/W range, from ``profile.py``) is meta-derived.
 
 FP16 is the default and falls back to FP32 if the platform lacks fast FP16 or the
-FP16 build fails. Kept compatible across TensorRT 8.6 → 10 API differences.
+FP16 build fails. Kept compatible across TensorRT 8.6 → 11:
+
+* TRT 8.6 → 10 request FP16 via ``BuilderFlag.FP16``.
+* TRT >= 11 removed all precision flags (networks are "strongly typed"); FP16 is
+  instead baked into the ONNX graph dtypes before the build — see ``fp16_cast``.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional, Tuple
+
+try:
+    from .fp16_cast import cast_onnx_bytes_to_fp16
+except ImportError:  # run flat (cwd on sys.path), mirroring cli.py
+    from fp16_cast import cast_onnx_bytes_to_fp16  # type: ignore
 
 HW = Tuple[int, int]
 
@@ -36,9 +45,13 @@ def _make_network(builder, trt):
     return builder.create_network()
 
 
-def _try_build(trt, logger, onnx_bytes, input_name, min_hw, opt_hw, max_hw, *, fp16, workspace_gb):
-    """Build once at the requested precision. Returns ``(engine_bytes, used_fp16)``
-    or ``(None, used_fp16)`` if the builder produced no engine (caller falls back).
+def _try_build(trt, logger, onnx_bytes, input_name, min_hw, opt_hw, max_hw, *, request_fp16_flag, workspace_gb):
+    """Build once. Returns ``(engine_bytes_or_None, flag_was_set)``.
+
+    ``request_fp16_flag`` sets ``BuilderFlag.FP16`` when that flag exists (TRT
+    8.6→10) and the platform reports fast FP16. On TRT >= 11 the flag is gone —
+    FP16 there comes from the graph dtypes (the caller pre-casts the ONNX), so
+    this stays a no-op and returns ``flag_was_set=False``.
     """
     builder = trt.Builder(logger)
     network = _make_network(builder, trt)
@@ -55,30 +68,11 @@ def _try_build(trt, logger, onnx_bytes, input_name, min_hw, opt_hw, max_hw, *, f
     else:  # pragma: no cover - legacy TRT
         config.max_workspace_size = workspace_bytes
 
-    # TensorRT >= 11 dropped Builder.platform_has_fast_fp16 (fast FP16 support is
-    # no longer queryable this way); default to attempting FP16 there and let the
-    # existing build-failed-fp16 -> retry-fp32 fallback above handle a platform
-    # that can't actually build it.
-    #
-    # TensorRT 11 also removed BuilderFlag.FP16 (and INT8/BF16/...) entirely:
-    # networks are now always "strongly typed" and run at whatever precision the
-    # ONNX graph's own tensors declare, rather than a precision requested via a
-    # builder flag (see NVIDIA's TensorRT 10->11 migration guide). Real FP16 on
-    # TRT 11 needs the graph itself cast to fp16 (e.g. via ModelOpt AutoCast)
-    # before this call; that's out of scope here, so we just build at the
-    # graph's native precision (fp32, for a plain torch.onnx.export) instead of
-    # raising on the missing flag.
-    used_fp16 = False
+    flag_was_set = False
     fp16_flag = getattr(trt.BuilderFlag, "FP16", None)
-    if fp16 and fp16_flag is not None and getattr(builder, "platform_has_fast_fp16", True):
+    if request_fp16_flag and fp16_flag is not None and getattr(builder, "platform_has_fast_fp16", True):
         config.set_flag(fp16_flag)
-        used_fp16 = True
-    elif fp16:
-        print(
-            f"[trt] FP16 requested but unavailable via BuilderFlag on TensorRT {trt.__version__} "
-            "(TensorRT >= 11 uses strongly-typed networks; precision comes from the ONNX "
-            "graph's own tensor dtypes). Building at the graph's native precision instead."
-        )
+        flag_was_set = True
 
     profile = builder.create_optimization_profile()
     profile.set_shape(
@@ -91,8 +85,8 @@ def _try_build(trt, logger, onnx_bytes, input_name, min_hw, opt_hw, max_hw, *, f
 
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
-        return None, used_fp16
-    return bytes(serialized), used_fp16
+        return None, flag_was_set
+    return bytes(serialized), flag_was_set
 
 
 def build_engine_from_onnx(
@@ -104,6 +98,8 @@ def build_engine_from_onnx(
     max_hw: HW,
     input_name: str = "pixel_values",
     precision: str = "fp16",
+    extra_fp32_ops=None,
+    node_block_substrings=None,
     workspace_gb: float = 4.0,
     logger=None,
 ) -> dict:
@@ -127,22 +123,58 @@ def build_engine_from_onnx(
     onnx_bytes = onnx_path.read_bytes()
     want_fp16 = str(precision).lower() == "fp16"
 
-    serialized, used_fp16 = _try_build(
-        trt, trt_logger, onnx_bytes, input_name, min_hw, opt_hw, max_hw,
-        fp16=want_fp16, workspace_gb=workspace_gb,
+    # How FP16 is requested depends on the TRT major version:
+    #   TRT 8.6 → 10: set BuilderFlag.FP16 (handled inside _try_build).
+    #   TRT >= 11 ("strongly typed", flag removed): bake fp16 into the ONNX graph
+    #     dtypes here, before parsing. Graph I/O is kept fp32 by the caster, so
+    #     the engine's input/output contract (and .meta.json / trt_infer) is
+    #     unchanged; only interior compute runs in fp16.
+    fp16_via_flag = hasattr(trt.BuilderFlag, "FP16")
+    build_bytes = onnx_bytes
+    graph_cast_fp16 = False
+    cast_method = None
+    if want_fp16 and not fp16_via_flag:
+        fp16_bytes, cast_method = cast_onnx_bytes_to_fp16(
+            onnx_bytes, extra_fp32_ops=extra_fp32_ops, node_block_substrings=node_block_substrings
+        )
+        if fp16_bytes is not None:
+            build_bytes = fp16_bytes
+            graph_cast_fp16 = True
+            print(
+                f"[trt] TensorRT {trt.__version__}: cast ONNX graph to fp16 via "
+                f"{cast_method} (strongly-typed network; graph I/O kept fp32)"
+            )
+        else:
+            raise TrtBuildError(
+                f"FP16 requested on TensorRT {trt.__version__} (strongly-typed, no "
+                "BuilderFlag.FP16) but no ONNX fp16 converter is importable — install "
+                "onnxruntime or onnxconverter_common, or pass precision='fp32' to build "
+                "an explicit FP32 engine. Refusing to silently ship an FP32 engine as fp16."
+            )
+
+    serialized, flag_was_set = _try_build(
+        trt, trt_logger, build_bytes, input_name, min_hw, opt_hw, max_hw,
+        request_fp16_flag=want_fp16 and fp16_via_flag, workspace_gb=workspace_gb,
     )
+    used_fp16 = flag_was_set or graph_cast_fp16
+
     if serialized is None and want_fp16:
         print("[trt] FP16 build produced no engine; retrying in FP32")
-        serialized, used_fp16 = _try_build(
+        serialized, _ = _try_build(
             trt, trt_logger, onnx_bytes, input_name, min_hw, opt_hw, max_hw,
-            fp16=False, workspace_gb=workspace_gb,
+            request_fp16_flag=False, workspace_gb=workspace_gb,
         )
+        used_fp16 = False
+        cast_method = None
     if serialized is None:
         raise TrtBuildError(f"TensorRT failed to build an engine from {onnx_path}")
 
     engine_path.write_bytes(serialized)
     return {
         "precision": "fp16" if used_fp16 else "fp32",
+        "fp16_method": ("builder_flag" if flag_was_set else cast_method) if used_fp16 else None,
+        "fp16_extra_fp32_ops": list(extra_fp32_ops or []) if graph_cast_fp16 else None,
+        "fp16_node_block_substrings": list(node_block_substrings or []) if graph_cast_fp16 else None,
         "tensorrt_version": trt.__version__,
         "input_name": input_name,
         "profile": {"min": list(min_hw), "opt": list(opt_hw), "max": list(max_hw)},

@@ -11,8 +11,12 @@ through the legacy TorchScript exporter, so the wrapper is thin — feed a
 input-pixel xyxy — and the service does no resize/normalize.
 
 Unlike RetinaNet, the RPN + RoI heads make this graph's NMS/top-k data-dependent
-in more than one place, which is exactly why there is no TensorRT path for this
-arch yet (see ``trt_export/arch``) — the ONNX Runtime path here is unaffected.
+in more than one place (proposal NMS feeding RoIAlign, then per-class NMS landing
+inside ONNX ``If`` subgraphs). TensorRT can parse this graph but not *build* it —
+Myelin rejects data-dependent shapes outside the top-level scope — so there is no
+passthrough TRT path. ``trt_export/arch/fasterrcnn.py`` instead re-exports a
+raw-output graph (fixed top-K RPN proposals + per-class boxes) and appends
+``EfficientNMS_TRT``. This ONNX Runtime export is unaffected by any of that.
 """
 
 from __future__ import annotations

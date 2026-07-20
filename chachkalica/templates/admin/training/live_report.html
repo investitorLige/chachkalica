@@ -74,7 +74,7 @@
 <h2 class="lr-section-title">Hardest validation images</h2>
 <div id="pv-metric">
   Ranking metric: <code>{{ metric|default:"—" }}</code>{% if metric_description %} — {{ metric_description }}{% endif %}
-  (ranked at IoU ≥ {{ iou_threshold|default:"—" }}, score ≥ {{ score_threshold|default:"—" }}; up to {{ max_display_predictions|default:"20" }} highest-confidence predictions saved per image; use the confidence slider to filter visible predictions).
+  (ranked at IoU ≥ {{ iou_threshold|default:"—" }}, score ≥ {{ score_threshold|default:"—" }}{% if operating_nms_threshold %}, class-aware NMS {{ operating_nms_threshold }}{% endif %}; up to {{ max_display_predictions|default:"20" }} highest-confidence predictions saved per image; use the confidence slider to filter visible predictions).
   <div id="pv-breakdown"></div>
 </div>
 
@@ -309,9 +309,16 @@
 
   function vBreakdown() {
     if (!vCurrent || vCurrent.difficulty == null) { breakdownEl.textContent = ""; return; }
-    breakdownEl.textContent = "This image · difficulty " + vCurrent.difficulty
-      + " = " + vCurrent.missed + " missed + " + vCurrent.false_positives + " false positive(s) + "
-      + vCurrent.wrong_class + " wrong class + " + vCurrent.loc_error + " localization slack";
+    if (vCurrent.f1 != null) {
+      breakdownEl.textContent = "This image · difficulty " + vCurrent.difficulty
+        + " = 1 - F1 " + vCurrent.f1 + " + 0.25 × localization penalty "
+        + vCurrent.localization_penalty + " · " + vCurrent.missed + " missed, "
+        + vCurrent.false_positives + " false positive(s), " + vCurrent.wrong_class + " wrong class";
+    } else {
+      breakdownEl.textContent = "This image · difficulty " + vCurrent.difficulty
+        + " = " + vCurrent.missed + " missed + " + vCurrent.false_positives + " false positive(s) + "
+        + vCurrent.wrong_class + " wrong class + " + vCurrent.loc_error + " localization slack";
+    }
   }
 
   function vLoad(i) {
@@ -319,19 +326,24 @@
     vIndex = i;
     idxInput.value = i + 1;
     vCurrent = null;
+    vCtx.clearRect(0, 0, vCanvas.width, vCanvas.height);
     vError.textContent = "";
     vStatus.textContent = "Loading image " + (i + 1) + " / " + vCount + "…";
-    vImg.src = IMAGE_URL + "?" + vQuery + "&index=" + i;
     fetch(DATA_URL + "?" + vQuery + "&index=" + i)
       .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
       .then(function (res) {
         if (vIndex !== i) return;
         if (!res.ok) { vError.textContent = res.j.error || "failed to load"; vStatus.textContent = ""; return; }
         vCurrent = res.j;
-        var np = (vCurrent.predictions || []).length, ng = (vCurrent.ground_truth || []).length;
-        vStatus.textContent = (vCurrent.image || "") + " — " + np + " prediction(s), " + ng + " ground-truth box(es)";
+        vImg.src = IMAGE_URL + "?" + vQuery + "&image_token=" + encodeURIComponent(vCurrent.image_token);
+        var saved = (vCurrent.predictions || []).length;
+        var np = vCurrent.num_predictions == null ? saved : vCurrent.num_predictions;
+        var ng = (vCurrent.ground_truth || []).length;
+        vStatus.textContent = (vCurrent.image || "") + " — " + np + " prediction(s)"
+          + (saved < np ? " (" + saved + " highest-confidence saved)" : "")
+          + ", " + ng + " ground-truth box(es)";
         vBreakdown();
-        vDraw();
+        // The image load event draws boxes only after this exact signed image arrives.
       })
       .catch(function (e) { if (vIndex === i) { vError.textContent = String(e); vStatus.textContent = ""; } });
   }

@@ -44,6 +44,16 @@ class LoadConfigTest(unittest.TestCase):
         self.assertEqual(config.infer_batch_size, 4)
         self.assertTrue(config.model_checkpoint.is_absolute())
 
+    def test_fixed_pixel_tile_size_is_parsed(self):
+        body = {**BASE, "tiling": {"tile_size_px": 640, "overlap": 0.1}}
+        config = load_pipeline_config(write_config(body))
+        self.assertEqual(config.tiling.tile_size_px, 640)
+
+    def test_nonpositive_fixed_pixel_tile_size_is_rejected(self):
+        body = {**BASE, "tiling": {"tile_size_px": 0}}
+        with self.assertRaises(ValueError):
+            load_pipeline_config(write_config(body))
+
     def test_paths_resolve_relative_to_config_file(self):
         config = load_pipeline_config(write_config(BASE))
         # images "imgs" resolves against the temp config's own directory.
