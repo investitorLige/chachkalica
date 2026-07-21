@@ -45,9 +45,10 @@ def to_friendy(
         size and re-normalizing cancels out).
 
     ``clip_boxes`` clamps boxes to ``[0, orig_w] x [0, orig_h]`` after the inverse,
-    to match archs whose torch path clips (YOLOX). Left False for archs that don't
-    (RT-DETR/RF-DETR); a no-op for archs already in-bounds (RetinaNet). Only
-    meaningful for ``input_pixels``.
+    to match archs whose torch path clips (YOLOX; RF-DETR under its letterbox
+    canvas, since padded-margin predictions can land outside the original
+    image). Left False for archs that don't (RT-DETR); a no-op for archs
+    already in-bounds (RetinaNet). Only meaningful for ``input_pixels``.
     """
     boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
     scores = np.asarray(scores, dtype=np.float32).reshape(-1)

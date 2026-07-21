@@ -12,3 +12,12 @@ tensorrt
 # Graph surgery to append the EfficientNMS_TRT plugin node for archs whose baked
 # NMS (retinanet, yolox) TensorRT can't compile directly.
 onnx_graphsurgeon
+# On TensorRT >= 11 (strongly-typed networks, no BuilderFlag.FP16) a real FP16
+# engine needs the ONNX graph cast to fp16 first. trt_export/fp16_cast.py uses
+# onnxruntime's float16 converter (already an onnx_export dep) and falls back to
+# onnxconverter_common if present; without either it honestly builds FP32.
+onnxruntime
+# GPU utilization/memory sampling for inferlica/benchmark (NVIDIA's officially
+# maintained wheel; provides the `pynvml` import). GPU-only, hence here and not
+# in the base requirements.txt.
+nvidia-ml-py

@@ -5,9 +5,9 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from ..formats import xyxy_prediction_to_friendy, xyxy_to_xywhn
+    from ..formats import clip_xyxy, xyxy_prediction_to_friendy, xyxy_to_xywhn
 except ImportError:
-    from formats import xyxy_prediction_to_friendy, xyxy_to_xywhn
+    from formats import clip_xyxy, xyxy_prediction_to_friendy, xyxy_to_xywhn
 
 
 # RF-DETR (Roboflow) detection variants that ship in the Apache-2.0 `rfdetr` package.
@@ -78,8 +78,8 @@ class RFDETRAdapter:
             self.model.train(was_training)
 
     def _loss_forward(self, images, targets):
-        batch = self._prepare_batch(images)
-        labels = self._prepare_labels(targets, images)
+        batch, scales = self._prepare_batch(images)
+        labels = self._prepare_labels(targets, scales)
         outputs = self.model(batch, labels)
         loss_dict = self.criterion(outputs, labels)
         weight_dict = self.criterion.weight_dict
@@ -94,25 +94,34 @@ class RFDETRAdapter:
     def predict(self, images, score_threshold: Optional[float] = None):
         self.model.eval()
         threshold = self.score_threshold if score_threshold is None else score_threshold
-        batch = self._prepare_batch(images)
+        batch, scales = self._prepare_batch(images)
         outputs = self.model(batch)
-        # PostProcess scales normalized boxes back to each image's original pixel size.
+        # rfdetr's PostProcess.forward does `boxes = boxes * scale_fct` with no
+        # offset — it assumes the normalized box maps directly onto target_sizes.
+        # Every image shares the same letterboxed canvas, so pass the canvas size
+        # for all of them; this yields canvas-pixel boxes, which we then invert
+        # per image below (mirrors onnx_infer/postprocess.py's input_pixels
+        # inverse, keeping the torch and exported/TRT paths in parity).
         target_sizes = torch.tensor(
-            [[image.shape[-2], image.shape[-1]] for image in images],
+            [[self.resolution, self.resolution]] * len(images),
             dtype=torch.long,
             device=batch.device,
         )
         results = self.postprocess(outputs, target_sizes)
         predictions = []
-        for result, image in zip(results, images):
+        for result, image, scale in zip(results, images, scales):
             # RF-DETR's head has num_classes + 1 slots; the extra last slot is the
             # no-object/background class. Real classes are 0..num_classes-1, so drop
             # any background prediction along with sub-threshold ones.
             keep = (result["scores"] >= threshold) & (result["labels"] < self.num_classes)
-            boxes = result["boxes"][keep]
+            boxes = result["boxes"][keep] / scale
             scores = result["scores"][keep]
             labels = result["labels"][keep]
             image_height, image_width = image.shape[-2:]
+            # Padded-margin predictions can fall outside the original image —
+            # clip to bounds (RF-DETR's onnx_export/arch/rfdetr.py sets
+            # clip_boxes=True to match this on the exported path).
+            boxes = clip_xyxy(boxes, image_width=image_width, image_height=image_height)
             predictions.append(
                 xyxy_prediction_to_friendy(
                     boxes,
@@ -124,38 +133,57 @@ class RFDETRAdapter:
             )
         return predictions
 
-    def _prepare_batch(self, images: List[torch.Tensor]) -> torch.Tensor:
+    def _prepare_batch(self, images: List[torch.Tensor]) -> tuple:
+        """Letterbox each image onto the model's square canvas.
+
+        Aspect-preserving resize (longest side -> ``resolution``) followed by a
+        bottom-right zero pad to the full square, matching
+        ``onnx_infer/preprocess.py``'s ``"letterbox"`` resize_mode step-for-step
+        (resize, then normalize, then pad) so train/eval and the exported
+        ONNX/TRT graph see identical preprocessing. Returns the batched tensor
+        plus each image's scale factor, needed to map boxes between the canvas
+        and original pixel space (offset is always 0 — padding is bottom-right).
+        """
         device = next(self.model.parameters()).device
         image_mean = torch.tensor(self.image_mean, device=device).view(3, 1, 1)
         image_std = torch.tensor(self.image_std, device=device).view(3, 1, 1)
 
         prepared = []
+        scales = []
         for image in images:
-            # RF-DETR runs at a fixed square resolution. A square resize changes the
-            # aspect ratio, but the targets are stored as normalized cxcywh relative to
-            # each axis, so they stay correct without any box adjustment.
+            image = image.to(device).float()
+            h, w = image.shape[-2:]
+            scale = self.resolution / max(h, w)
+            new_h = max(1, round(h * scale))
+            new_w = max(1, round(w * scale))
             resized = F.interpolate(
-                image.to(device).float().unsqueeze(0),
-                size=(self.resolution, self.resolution),
+                image.unsqueeze(0),
+                size=(new_h, new_w),
                 mode="bilinear",
                 align_corners=False,
             ).squeeze(0)
-            prepared.append((resized - image_mean) / image_std)
-        return torch.stack(prepared)
+            normalized = (resized - image_mean) / image_std
+            canvas = normalized.new_zeros((3, self.resolution, self.resolution))
+            canvas[:, :new_h, :new_w] = normalized
+            prepared.append(canvas)
+            scales.append(scale)
+        return torch.stack(prepared), scales
 
-    def _prepare_labels(self, targets, images) -> List[Dict[str, torch.Tensor]]:
+    def _prepare_labels(self, targets, scales) -> List[Dict[str, torch.Tensor]]:
         device = next(self.model.parameters()).device
         labels = []
-        for target, image in zip(targets, images):
-            image_height, image_width = image.shape[-2:]
-            boxes = target["boxes"].to(device).float()
+        for target, scale in zip(targets, scales):
+            # Map original-pixel boxes into canvas-pixel space (offset 0, since
+            # padding is bottom-right), then normalize by the canvas size — not
+            # the original image size, since the canvas includes padding.
+            boxes = target["boxes"].to(device).float() * scale
             labels.append(
                 {
                     "labels": target["labels"].to(device).long(),
                     "boxes": xyxy_to_xywhn(
                         boxes,
-                        image_width=image_width,
-                        image_height=image_height,
+                        image_width=self.resolution,
+                        image_height=self.resolution,
                     ),
                 }
             )

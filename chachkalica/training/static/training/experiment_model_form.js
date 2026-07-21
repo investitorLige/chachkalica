@@ -23,6 +23,33 @@
         formRow.style.display = visible ? "" : "none";
     }
 
+    // Annotate a weights <option>'s label with the resolution its checkpoint was
+    // pretrained at, so operators can pick a matching training resolution. A fixed
+    // option carries data-train-res; the variant-resolved "default" option carries
+    // data-train-res-map ({variant: res}) resolved against the row's variant. The
+    // pristine label is cached in data-base-label so re-annotating (on variant
+    // change) never stacks suffixes. Informational only — nothing auto-sets the
+    // training resolution.
+    function annotateTrainRes(opt, variant) {
+        var base = opt.getAttribute("data-base-label");
+        if (base === null) {
+            base = opt.textContent;
+            opt.setAttribute("data-base-label", base);
+        }
+        var res = opt.getAttribute("data-train-res");
+        if (!res) {
+            var mapAttr = opt.getAttribute("data-train-res-map");
+            if (mapAttr) {
+                try {
+                    res = JSON.parse(mapAttr)[variant];
+                } catch (err) {
+                    res = null;
+                }
+            }
+        }
+        opt.textContent = res ? base + " · trained @" + res : base;
+    }
+
     // Filter the weights <select>'s options by the row's selected variant, then
     // reset the selection if the current choice was hidden.
     function syncWeightsOptions(row, arch) {
@@ -49,6 +76,7 @@
             if (!show && opt.value === current) {
                 currentHidden = true;
             }
+            annotateTrainRes(opt, variant);
         });
         if (currentHidden) {
             // Fall back to the first still-visible option (None / default).

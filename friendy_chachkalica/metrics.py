@@ -251,10 +251,10 @@ def evaluate_detection(
     }
 
 
-HARD_IMAGE_METRIC = "detection_error_count"
+HARD_IMAGE_METRIC = "per_image_f1_localization_error"
 HARD_IMAGE_METRIC_DESCRIPTION = (
-    "difficulty = missed_GT + false_positives + wrong_class_matches "
-    "+ Σ(1 - IoU over correctly-classified matches); higher = worse"
+    "difficulty = (1 - per-image class-aware F1) + 0.25 × mean normalized "
+    "localization error; absolute detection errors break ties; higher = worse"
 )
 
 
@@ -280,6 +280,13 @@ def select_hard_images(
     breakdown, and prediction/ground-truth boxes. Displayed predictions are capped by
     confidence so low-threshold artifacts stay readable in the browser.
     """
+    if len(predictions) != len(targets) or len(targets) != len(image_infos):
+        raise ValueError(
+            "hard-image inputs must have equal lengths: "
+            f"predictions={len(predictions)} targets={len(targets)} "
+            f"image_infos={len(image_infos)}"
+        )
+
     prepared_targets = [_prepare_target(target) for target in targets]
     prepared_predictions = [
         _prepare_prediction(prediction, target, float(score_threshold))
@@ -312,12 +319,59 @@ def select_hard_images(
 
     scored = []
     for index, (prediction, target) in enumerate(zip(prepared_predictions, prepared_targets)):
-        match = match_image(prediction, target, float(iou_threshold))
-        wrong_class = sum(1 for pair in match['matches'] if not pair['class_correct'])
-        loc_error = sum(1.0 - pair['iou'] for pair in match['matches'] if pair['class_correct'])
-        missed = len(match['misses'])
-        false_positives = len(match['false_positives'])
-        difficulty = missed + false_positives + wrong_class + loc_error
+        match = _match_image_class_aware(prediction, target, float(iou_threshold))
+        correct_matches = match['matches']
+        loc_error = sum(1.0 - pair['iou'] for pair in correct_matches)
+
+        # Diagnose wrong-class detections only among the class-aware FP/FN residuals.
+        # This keeps the component breakdown exclusive while F1 still sees a
+        # confusion as one FP plus one FN, exactly like class-wise evaluation.
+        residual_prediction = {
+            'boxes': prediction['boxes'][match['false_positives']],
+            'scores': prediction['scores'][match['false_positives']],
+            'labels': prediction['labels'][match['false_positives']],
+        }
+        residual_target = {
+            'boxes': target['boxes'][match['misses']],
+            'labels': target['labels'][match['misses']],
+        }
+        residual_match = match_image(
+            residual_prediction,
+            residual_target,
+            float(iou_threshold),
+        )
+        wrong_class = sum(
+            1 for pair in residual_match['matches'] if not pair['class_correct']
+        )
+        missed = len(match['misses']) - wrong_class
+        false_positives = len(match['false_positives']) - wrong_class
+
+        # Building per-image P/R/F1 from class-aware counts aligns the ranking
+        # with operating metrics while removing the crowded-image bias of raw sums.
+        true_positives = len(correct_matches)
+        effective_false_positives = len(match['false_positives'])
+        effective_false_negatives = len(match['misses'])
+        precision_denominator = true_positives + effective_false_positives
+        recall_denominator = true_positives + effective_false_negatives
+        precision = (
+            true_positives / precision_denominator
+            if precision_denominator
+            else (1.0 if recall_denominator == 0 else 0.0)
+        )
+        recall = true_positives / recall_denominator if recall_denominator else 1.0
+        f1 = _f1(precision, recall)
+
+        # Correct matches can have IoU in [threshold, 1]. Normalize their mean
+        # slack onto [0, 1], then keep it secondary to classification/detection
+        # failures so a merely loose box does not outrank a complete miss.
+        max_localization_slack = max(1.0 - float(iou_threshold), 1e-12)
+        localization_penalty = (
+            min(1.0, (loc_error / len(correct_matches)) / max_localization_slack)
+            if correct_matches
+            else 0.0
+        )
+        difficulty = (1.0 - f1) + 0.25 * localization_penalty
+        total_errors = effective_false_positives + effective_false_negatives
 
         info = image_infos[index] if index < len(image_infos) and isinstance(image_infos[index], dict) else {}
         image_path = info.get('image_path')
@@ -326,10 +380,15 @@ def select_hard_images(
             'image_path': str(image_path) if image_path else None,
             'image_name': Path(str(image_path)).name if image_path else f'image_{index}',
             'difficulty': round(float(difficulty), 4),
+            'precision': round(float(precision), 4),
+            'recall': round(float(recall), 4),
+            'f1': round(float(f1), 4),
             'missed': missed,
             'false_positives': false_positives,
             'wrong_class': wrong_class,
             'loc_error': round(float(loc_error), 4),
+            'localization_penalty': round(float(localization_penalty), 4),
+            'total_errors': int(total_errors),
             'num_predictions': int(prediction['labels'].numel()),
             'num_ground_truth': int(target['labels'].numel()),
             'predictions': _boxes_for_display(
@@ -342,7 +401,15 @@ def select_hard_images(
             'ground_truth': _boxes_for_display(target, width, height, name_lookup, with_score=False),
         })
 
-    scored.sort(key=lambda entry: entry['difficulty'], reverse=True)
+    scored.sort(
+        key=lambda entry: (
+            entry['difficulty'],
+            entry['total_errors'],
+            entry['missed'],
+            entry['false_positives'],
+        ),
+        reverse=True,
+    )
     return scored[:int(top_k)]
 
 
@@ -504,6 +571,46 @@ def _normalize_class_map(class_map: Optional[Dict[int, str]]) -> Optional[Dict[i
     if class_map is None:
         return None
     return {int(class_id): str(name) for class_id, name in class_map.items()}
+
+
+def remap_raw_predictions_to_eval_classes(
+    predictions: torch.Tensor,
+    prediction_classes: Dict[int, str],
+    eval_classes: Dict[int, str],
+) -> torch.Tensor:
+    """Remap one image's raw ``(N, 6)`` predictions onto the eval class space.
+
+    Rows are ``[x_center, y_center, width, height, confidence, class_id]`` (the
+    Friendy prediction format — see ``formats.py``), with ``class_id`` in *this
+    model's own* space (``prediction_classes``). Returns a same-shape tensor
+    restricted to rows whose class name exists in ``eval_classes``, with column
+    5 rewritten to the matching eval class id.
+
+    This is the raw-tensor analog of :func:`_remap_prediction` (which operates
+    on the prepared ``{boxes, scores, labels}`` dict used by ``evaluate_detection``
+    internally): combining N models' predictions into one eval requires
+    remapping each model's tensor *before* concatenating them, since two models
+    can use different class-id orderings for the same names.
+    """
+    if predictions.numel() == 0:
+        return predictions.new_zeros((0, 6))
+
+    id_to_name = _normalize_class_map(prediction_classes) or {}
+    eval_name_to_id = {str(name): int(class_id) for class_id, name in eval_classes.items()}
+
+    kept_rows = []
+    for row in predictions:
+        name = id_to_name.get(int(row[5].item()))
+        mapped_id = eval_name_to_id.get(name)
+        if mapped_id is None:
+            continue
+        new_row = row.clone()
+        new_row[5] = mapped_id
+        kept_rows.append(new_row)
+
+    if not kept_rows:
+        return predictions.new_zeros((0, 6))
+    return torch.stack(kept_rows)
 
 
 def _remap_prediction(prediction, id_to_name, eval_name_to_id):
@@ -773,6 +880,51 @@ def _micro_stats(
         'recall': float(recall),
         'f1': _f1(float(precision), float(recall)),
         'f1_confidence': score_cut,
+    }
+
+
+def _match_image_class_aware(prediction, target, iou_threshold: float) -> Dict[str, Any]:
+    """Greedy score-ordered matching that only allows equal-class pairs."""
+    pred_boxes = prediction['boxes']
+    pred_scores = prediction['scores']
+    pred_labels = prediction['labels']
+    gt_boxes = target['boxes']
+    gt_labels = target['labels']
+    num_pred = int(pred_labels.numel())
+    num_gt = int(gt_labels.numel())
+
+    gt_claimed = [False] * num_gt
+    pred_matched = [False] * num_pred
+    matches = []
+    if num_pred and num_gt:
+        ious = box_iou(pred_boxes, gt_boxes)
+        for pred_index in torch.argsort(pred_scores, descending=True, stable=True).tolist():
+            available = [
+                gt_index
+                for gt_index in range(num_gt)
+                if not gt_claimed[gt_index]
+                and int(gt_labels[gt_index]) == int(pred_labels[pred_index])
+            ]
+            if not available:
+                continue
+            overlaps = ious[pred_index]
+            best_gt = max(available, key=lambda gt_index: float(overlaps[gt_index]))
+            iou = float(overlaps[best_gt])
+            if iou < iou_threshold:
+                continue
+            gt_claimed[best_gt] = True
+            pred_matched[pred_index] = True
+            matches.append({
+                'pred_index': pred_index,
+                'gt_index': best_gt,
+                'iou': iou,
+                'class_correct': True,
+            })
+
+    return {
+        'matches': matches,
+        'false_positives': [index for index in range(num_pred) if not pred_matched[index]],
+        'misses': [index for index in range(num_gt) if not gt_claimed[index]],
     }
 
 

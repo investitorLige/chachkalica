@@ -23,6 +23,7 @@ Endpoints:
     GET  /pipelines/{id}      -> {pipeline_id, status, returncode, started_at, finished_at, log_tail}
     POST /predict_image       -> {boxes, classes}          (synchronous 1-image inference; warm model)
     POST /export_onnx         -> {onnx_path, meta_path}    (synchronous ONNX export of one checkpoint)
+    POST /promote_labels      -> {labels_written, ...}     (synchronous: write a run's predictions as source labels)
 
 Operational logging (what the service itself does — launches, stops, rejections,
 errors) is written under ``<repo_root>/logs/``, split three ways: ``train/`` (one
@@ -32,6 +33,7 @@ from each subprocess's own stdout, which the trainer keeps writing to
 ``output_dir/service.log``.
 """
 
+import json
 import logging
 import os
 import signal
@@ -40,7 +42,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import yaml
 from fastapi import FastAPI, HTTPException
@@ -175,6 +177,32 @@ class ExportTrtRequest(BaseModel):
     checkpoint_path: str
     engine_path: str
     precision: str = "fp16"
+    # Optional static input size (H, W). When set, the engine is built at a fixed
+    # profile min==opt==max==(H,W). Required to get FP16 on Faster R-CNN, whose graph
+    # only compiles FP16 at a static size (a dynamic profile falls back to FP32).
+    input_hw: Optional[List[int]] = None
+
+
+class PromoteLabelsRequest(BaseModel):
+    """Write a finished run's predictions into a dataset's source ``labels/``.
+
+    ``predictions_path`` is the run's ``*_predictions.pt``. Exactly one of
+    ``checkpoint_path`` (the model that produced it — its train classes drive
+    the name-based remap onto ``dataset_classes``) or ``prediction_classes`` (a
+    combined multi-model run, whose predictions are already indexed in
+    ``dataset_classes``' own space, so the remap is an identity lookup and no
+    checkpoint needs loading) should be set. Existing ``labels_dir/*.txt`` are
+    moved to ``backup_dir`` before the new labels are written.
+    """
+
+    predictions_path: str
+    checkpoint_path: Optional[str] = None
+    prediction_classes: Optional[list[str]] = None
+    images_dir: str
+    dataset_classes: list[str]
+    labels_dir: str
+    backup_dir: str
+    score_threshold: float = 0.25
 
 
 class PredictImageRequest(BaseModel):
@@ -640,12 +668,26 @@ def export_trt(req: ExportTrtRequest):
     if req.precision not in ("fp16", "fp32"):
         raise HTTPException(status_code=400, detail=f"precision must be fp16 or fp32, got {req.precision!r}")
 
+    static_hw = None
+    if req.input_hw is not None:
+        if len(req.input_hw) != 2 or any(int(v) <= 0 for v in req.input_hw):
+            raise HTTPException(
+                status_code=400,
+                detail=f"input_hw must be two positive ints [H, W], got {req.input_hw!r}")
+        static_hw = (int(req.input_hw[0]), int(req.input_hw[1]))
+
     with _trt_build_lock:
         try:
             from trt_export.cli import build_engine
 
+            # A static profile (min==opt==max) is what lets Faster R-CNN compile FP16;
+            # when input_hw is omitted the profile is derived from the meta (dynamic).
+            hw_kwargs = (
+                {"min_hw": static_hw, "opt_hw": static_hw, "max_hw": static_hw}
+                if static_hw is not None else {}
+            )
             engine_path = build_engine(
-                req.checkpoint_path, req.engine_path, precision=req.precision
+                req.checkpoint_path, req.engine_path, precision=req.precision, **hw_kwargs
             )
         except HTTPException:
             raise
@@ -665,12 +707,76 @@ def export_trt(req: ExportTrtRequest):
     engine_path = Path(engine_path)
     meta_path = engine_path.with_suffix(".meta.json")
     provenance_path = Path(str(engine_path) + ".json")
-    log.info("built engine %s -> %s", checkpoint, engine_path)
+    # Report the precision the engine ACTUALLY built at — an fp16 request can fall back
+    # to fp32 (e.g. Faster R-CNN with a dynamic profile), and the caller should see that.
+    built_precision = req.precision
+    try:
+        built_precision = json.loads(provenance_path.read_text()).get("precision", req.precision)
+    except Exception:  # noqa: BLE001 - provenance is best-effort for the message
+        pass
+    log.info("built engine %s -> %s (%s)", checkpoint, engine_path, built_precision)
     return {
         "engine_path": str(engine_path),
         "meta_path": str(meta_path),
         "provenance_path": str(provenance_path),
+        "precision": built_precision,
     }
+
+
+@app.post("/promote_labels")
+def promote_labels(req: PromoteLabelsRequest):
+    """Promote a run's predictions into a dataset's source ``labels/`` folder.
+
+    Reads the run's ``*_predictions.pt`` (needs torch — hence trainer-side),
+    remaps prediction classes onto ``dataset_classes`` by name, keeps boxes at or
+    above ``score_threshold``, backs up any existing labels into ``backup_dir``,
+    then writes one YOLO ``.txt`` per image. CPU-only file work — safe while the
+    GPU is training — but serialized behind ``_export_lock`` since it torch.loads
+    a checkpoint. Returns the write summary from :func:`promote_labels.promote_labels`.
+    """
+    log = _service_log()
+    predictions_path = Path(req.predictions_path)
+    if not predictions_path.exists():
+        log.error("promote rejected: predictions not found: %s", predictions_path)
+        raise HTTPException(status_code=400, detail=f"predictions not found: {predictions_path}")
+    if req.prediction_classes is None:
+        if not req.checkpoint_path:
+            log.error("promote rejected: neither checkpoint_path nor prediction_classes given")
+            raise HTTPException(
+                status_code=400, detail="either checkpoint_path or prediction_classes is required"
+            )
+        checkpoint = Path(req.checkpoint_path)
+        if not checkpoint.exists():
+            log.error("promote rejected: checkpoint not found: %s", checkpoint)
+            raise HTTPException(status_code=400, detail=f"checkpoint not found: {checkpoint}")
+
+    with _export_lock:
+        try:
+            from promote_labels import promote_labels as _promote
+
+            summary = _promote(
+                predictions_path=req.predictions_path,
+                checkpoint_path=req.checkpoint_path,
+                images_dir=req.images_dir,
+                dataset_classes=req.dataset_classes,
+                labels_dir=req.labels_dir,
+                backup_dir=req.backup_dir,
+                score_threshold=req.score_threshold,
+                prediction_classes=req.prediction_classes,
+            )
+        except HTTPException:
+            raise
+        except (ValueError, FileNotFoundError) as exc:
+            log.warning("promote rejected: %s", exc)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:  # noqa: BLE001 - surface promote failures to the caller
+            log.exception("promote failed: %s", exc)
+            raise HTTPException(status_code=500, detail=f"promote failed: {exc}")
+
+    log.info("promoted %s -> %s (%s labels, %s boxes, %s backed up)",
+             predictions_path, summary["labels_dir"], summary["labels_written"],
+             summary["boxes_written"], summary["backed_up"])
+    return summary
 
 
 if __name__ == "__main__":

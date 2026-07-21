@@ -27,31 +27,54 @@ _TILING = TilingSpec(tile_width_pct=50.0, tile_height_pct=50.0, overlap=0.0)
 
 
 class TileBatchTests(unittest.TestCase):
+    def test_fixed_pixel_tiles_pad_small_frame_without_resizing(self):
+        img = torch.ones(3, 40, 60)
+        tiling = TilingSpec(tile_size_px=64, overlap=0.0)
+        images, targets = tile_batch(
+            [img],
+            [_target([[10, 10, 30, 30]], [1], size=40)],
+            tiling,
+        )
+
+        self.assertEqual(len(images), 1)
+        self.assertEqual(tuple(images[0].shape), (3, 64, 64))
+        self.assertTrue(torch.equal(images[0][:, :40, :60], img))
+        self.assertEqual(float(images[0][:, 40:, :].sum()), 0.0)
+        self.assertEqual(float(images[0][:, :, 60:].sum()), 0.0)
+        self.assertTrue(
+            torch.equal(targets[0]["boxes"], torch.tensor([[10.0, 10.0, 30.0, 30.0]]))
+        )
+        self.assertTrue(torch.equal(targets[0]["orig_size"], torch.tensor([64, 64])))
+
     def test_box_confined_to_one_tile(self):
         img = torch.zeros(3, 100, 100)
-        # A box fully inside the top-left tile, and an empty frame that yields nothing.
+        # A box is positive only in the top-left tile; true background tiles remain.
         images, targets = tile_batch(
             [img, img],
             [_target([[10, 10, 40, 40]], [1]), _target([], [])],
             _TILING,
         )
-        # Only the top-left tile has ground truth; every other tile (and the whole
-        # empty frame) is all-background and dropped.
-        self.assertEqual(len(images), 1)
-        self.assertEqual(images[0].shape, (3, 50, 50))
+        # Four tiles per frame: one positive plus seven retained background samples.
+        self.assertEqual(len(images), 8)
+        self.assertTrue(all(image.shape == (3, 50, 50) for image in images))
         self.assertTrue(
             torch.equal(targets[0]["boxes"], torch.tensor([[10.0, 10.0, 40.0, 40.0]]))
         )
         self.assertTrue(torch.equal(targets[0]["labels"], torch.tensor([1])))
-        self.assertTrue(torch.equal(targets[0]["orig_size"], torch.tensor([50, 50])))
+        self.assertEqual(sum(int(target["labels"].numel()) for target in targets), 1)
+        self.assertTrue(
+            all(torch.equal(target["orig_size"], torch.tensor([50, 50])) for target in targets)
+        )
 
     def test_box_translated_into_bottom_right_tile(self):
         img = torch.zeros(3, 100, 100)
         images, targets = tile_batch([img], [_target([[60, 60, 90, 90]], [2])], _TILING)
-        self.assertEqual(len(images), 1)
+        self.assertEqual(len(images), 4)
+        positives = [target for target in targets if target["labels"].numel()]
+        self.assertEqual(len(positives), 1)
         # Bottom-right tile starts at (50, 50): [60,60,90,90] -> [10,10,40,40].
         self.assertTrue(
-            torch.equal(targets[0]["boxes"], torch.tensor([[10.0, 10.0, 40.0, 40.0]]))
+            torch.equal(positives[0]["boxes"], torch.tensor([[10.0, 10.0, 40.0, 40.0]]))
         )
 
     def test_seam_spanning_box_clipped_into_every_tile(self):
@@ -68,8 +91,10 @@ class TileBatchTests(unittest.TestCase):
         # Box mostly in the top-left tile with only a 1px sliver crossing into the
         # top-right tile -> that sliver is below the 10% visibility floor.
         images, targets = tile_batch([img], [_target([[10, 10, 51, 40]], [0])], _TILING)
-        # Top-left keeps it; top-right's sliver (1px wide of a 41px box) is dropped.
-        self.assertEqual(len(images), 1)
+        # Top-left keeps it; top-right's sliver is ignored rather than mislabeled
+        # background, while the two genuinely empty bottom tiles are retained.
+        self.assertEqual(len(images), 3)
+        self.assertEqual(sum(int(target["labels"].numel()) for target in targets), 1)
 
 
 class ParsePipelineTests(unittest.TestCase):
@@ -78,11 +103,15 @@ class ParsePipelineTests(unittest.TestCase):
 
     def test_batch_detect(self):
         spec = _parse_pipeline(
-            {"name": "batch_detect", "tiling": {"tile_width_pct": 50, "overlap": 0.2}},
+            {
+                "name": "batch_detect",
+                "tiling": {"tile_size_px": 640, "tile_width_pct": 50, "overlap": 0.2},
+            },
             Path("/tmp"),
         )
         self.assertIsInstance(spec, PipelineSpec)
         self.assertEqual(spec.name, "batch_detect")
+        self.assertEqual(spec.tiling.tile_size_px, 640)
         self.assertEqual(spec.tiling.tile_width_pct, 50.0)
         self.assertEqual(spec.tiling.overlap, 0.2)
         self.assertIsNone(spec.detector_checkpoint)
@@ -90,6 +119,13 @@ class ParsePipelineTests(unittest.TestCase):
     def test_rejects_unknown_name(self):
         with self.assertRaises(ValueError):
             _parse_pipeline({"name": "nope"}, Path("/tmp"))
+
+    def test_rejects_nonpositive_fixed_tile_size(self):
+        with self.assertRaises(ValueError):
+            _parse_pipeline(
+                {"name": "batch_detect", "tiling": {"tile_size_px": 0}},
+                Path("/tmp"),
+            )
 
 
 class _StubAdapter:

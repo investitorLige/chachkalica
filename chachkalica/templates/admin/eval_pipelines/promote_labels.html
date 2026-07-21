@@ -1,0 +1,36 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Write each selected run's predictions into its dataset's
+   <strong>source labels/</strong> folder, making the model's output the
+   dataset's source-of-truth labels. Any existing source labels are moved to a
+   <code>backup_labels/</code> folder first; predictions whose class is not in the
+   dataset's <code>classes.txt</code> are dropped.</p>
+
+<ul>
+  {% for target in targets %}
+    <li>{{ target.label }} <em>→ {{ target.dataset }}/labels/</em></li>
+  {% endfor %}
+</ul>
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="apply" value="1">
+
+  <p>
+    <label for="score_threshold">Confidence threshold:</label>
+    <input type="number" name="score_threshold" id="score_threshold"
+           step="0.01" min="0" max="1" value="{{ default_threshold }}" required>
+    <span class="help">Only predictions with confidence ≥ this value become labels.</span>
+  </p>
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Promote to source labels">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+{% endblock %}

@@ -11,6 +11,7 @@ chachak request YAML and enqueues a job that drives the trainer service's
 fields describe *which* pipeline and its detector/tiling knobs.
 """
 
+from django.core.validators import MinValueValidator
 from django.db import models
 
 from fleet.models import Annotator, Dataset
@@ -39,6 +40,7 @@ class PipelineEvalRun(models.Model):
     SOURCE = ExperimentDataset.SOURCE
     ANNOTATOR = ExperimentDataset.ANNOTATOR
     EXPLICIT = ExperimentDataset.EXPLICIT
+    NONE = ExperimentDataset.NONE
 
     # Pipeline vocabulary lives in ``training.pipelines`` so the Experiment and
     # this model share one definition (kept in sync with chachak.config).
@@ -53,6 +55,9 @@ class PipelineEvalRun(models.Model):
     trained_model = models.ForeignKey(
         TrainedModel, on_delete=models.CASCADE, related_name="pipeline_eval_runs"
     )
+    # Extra models combined with `trained_model` into one merged evaluation —
+    # see TrainedModelAdmin.evaluate. Empty for an ordinary single-model eval.
+    combined_models = models.ManyToManyField(TrainedModel, blank=True, related_name="+")
     dataset = models.ForeignKey(Dataset, on_delete=models.PROTECT, related_name="+")
     label_source = models.CharField(
         max_length=16,
@@ -78,6 +83,15 @@ class PipelineEvalRun(models.Model):
     detector_checkpoint = models.CharField(
         max_length=1024, blank=True,
         help_text="Person-detector checkpoint; required for people_detect_first / batch_people.",
+    )
+    detector_expand_ratio = models.FloatField(
+        default=0.10,
+        validators=[MinValueValidator(0.0)],
+        verbose_name="Person-box expand ratio",
+        help_text="Grow each detected person box by this fraction before cropping "
+                  "(0.10 = +10% on width and height, 5% per side; 0 crops the box "
+                  "exactly). Match the value the model was trained with. Only used by "
+                  "people_detect_first / batch_people.",
     )
     tile_width_pct = models.FloatField(
         null=True, blank=True,
@@ -109,9 +123,20 @@ class PipelineEvalRun(models.Model):
 
     def __str__(self) -> str:
         return (
-            f"Pipeline Eval #{self.pk} — {self.trained_model.name} "
+            f"Pipeline Eval #{self.pk} — {self._models_label()} "
             f"[{self.pipeline}] on {self.dataset.name}"
         )
+
+    def _models_label(self) -> str:
+        names = [self.trained_model.name, *(m.name for m in self.combined_models.all())]
+        return " + ".join(names)
+
+    @property
+    def is_combined(self) -> bool:
+        return self.pk is not None and self.combined_models.exists()
+
+    def all_models(self) -> list:
+        return [self.trained_model, *self.combined_models.all()]
 
     def metric(self, key: str):
         return self.metrics.get(key) if isinstance(self.metrics, dict) else None
@@ -131,6 +156,64 @@ class BaseEval(EvalRun):
         proxy = True
         verbose_name = "Base Eval"
         verbose_name_plural = "Base Eval"
+
+
+# Pipeline value stamped on base (raw-model) evals in the combined view, so a
+# plain EvalRun sits in "All pipeline evals" beside the chachak-pipeline runs.
+BASE_PIPELINE = "base"
+
+
+class CombinedEval(models.Model):
+    """Read-only union of :class:`PipelineEvalRun` + :class:`training.EvalRun`.
+
+    Backs the single "All pipeline evals" list so base (raw-model) evals and
+    chachak-pipeline evals sit in one changelist and can be Analyzed/compared
+    together. It maps a Postgres view (``eval_pipelines_combined_eval``, created
+    in the migration) that ``UNION ALL``s the two tables into one shape; base
+    rows report ``pipeline='base'``. ``managed=False`` — Django never creates or
+    writes this table, and the admin exposes it read-only.
+
+    ``id`` is a text key (``"pe-<pk>"`` / ``"be-<pk>"``) so the two integer pk
+    spaces never collide; ``kind`` + ``orig_id`` let actions route a selected row
+    back to its real :class:`PipelineEvalRun` / :class:`EvalRun`.
+    """
+
+    PIPELINE = "pipeline"
+    BASE = "base"
+
+    id = models.CharField(primary_key=True, max_length=32)
+    orig_id = models.IntegerField()
+    kind = models.CharField(max_length=16)
+    trained_model = models.ForeignKey(
+        TrainedModel, on_delete=models.DO_NOTHING, db_constraint=False, related_name="+"
+    )
+    dataset = models.ForeignKey(
+        Dataset, on_delete=models.DO_NOTHING, db_constraint=False, related_name="+"
+    )
+    pipeline = models.CharField(max_length=32)
+    status = models.CharField(max_length=16)
+    metrics = models.JSONField(null=True, blank=True)
+    score_threshold = models.FloatField(null=True)
+    output_dir = models.CharField(max_length=1024, blank=True)
+    request_yaml_path = models.CharField(max_length=1024, blank=True)
+    created_at = models.DateTimeField()
+    finished_at = models.DateTimeField(null=True)
+
+    class Meta:
+        managed = False
+        db_table = "eval_pipelines_combined_eval"
+        ordering = ["-created_at"]
+        verbose_name = "All pipeline eval"
+        verbose_name_plural = "All pipeline evals"
+
+    def __str__(self) -> str:
+        return (
+            f"{'Pipeline Eval' if self.kind == self.PIPELINE else 'Eval'} #{self.orig_id} — "
+            f"{self.trained_model.name} [{self.pipeline}] on {self.dataset.name}"
+        )
+
+    def metric(self, key: str):
+        return self.metrics.get(key) if isinstance(self.metrics, dict) else None
 
 
 def _pipeline_manager(pipeline_value: str) -> models.Manager:

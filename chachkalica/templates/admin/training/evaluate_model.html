@@ -1,11 +1,25 @@
 {% extends "admin/base_site.html" %}
 
 {% block content %}
+{% if is_combined %}
+<p>Evaluate <strong>{{ models|length }} models combined</strong> against a dataset:</p>
+<ul>
+  {% for m in models %}
+    <li><strong>{{ m.name }}</strong> ({{ m.arch }}) — <code>{{ m.checkpoint_path }}</code></li>
+  {% endfor %}
+</ul>
+<p class="help">Each model's predictions are remapped onto the dataset's class space and
+merged per image, then scored as a single result — one eval row for all
+{{ models|length }} models. Leave <em>Pipeline</em> blank for a plain evaluation, or choose
+one to run every model through the same <strong>chachak pipeline</strong> — only that
+pipeline's fields are shown.</p>
+{% else %}
 <p>Evaluate model <strong>{{ model.name }}</strong> ({{ model.arch }}) against a dataset.</p>
 <p class="help">The model's checkpoint and training class space come from
 <code>{{ model.checkpoint_path }}</code>. Leave <em>Pipeline</em> blank for a plain
 evaluation, or choose one to run the model through a <strong>chachak pipeline</strong> —
 only that pipeline's fields are shown.</p>
+{% endif %}
 
 <form action="" method="post">
   {% csrf_token %}
@@ -57,6 +71,15 @@ only that pipeline's fields are shown.</p>
     <p class="help">Path to the person-detector checkpoint. Required for
     <code>people_detect_first</code> and <code>batch_people</code> (and any chain that
     includes them); the pipeline crops around detected people before running the model.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ detector_pipelines }} {{ chain_pipelines }}">
+    <label for="detector_expand_ratio">Person-box expand ratio:</label>
+    <input type="number" step="0.01" min="0" name="detector_expand_ratio" id="detector_expand_ratio"
+           value="{{ pipeline_defaults.detector_expand_ratio|default:'0.10' }}">
+    <p class="help">Grow each detected person box by this fraction before cropping
+    (<code>0.10</code> = +10% width and height, 5% per side; <code>0</code> crops the box
+    exactly). Set this to the value the model was trained with.</p>
   </div>
 
   <div class="form-row" data-pipelines="{{ chain_pipelines }}">

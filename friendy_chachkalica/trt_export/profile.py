@@ -14,6 +14,22 @@ Per ``resize_mode``:
   open-ended. We pick a sensible default range and let the caller override it —
   an inference image larger than ``max`` needs an engine rebuilt with a bigger
   ``max_hw``.
+
+RetinaNet gets a narrower default range than YOLOX (see ``_RETINANET_*`` below):
+its raw-boxes+EfficientNMS TRT graph (``trt_export/arch/retinanet.py``) hits a
+TensorRT engine-sizing bug at the generic wide range — ``IExecutionContext``
+creation asks for ~30GB+ and OOMs, even at pure FP32 with no dynamic shapes
+actually exercised at runtime. Empirically bisected (see the PR/commit adding
+this comment for the full data): ranges with ``min>=256`` and ``max<=960`` build
+and load cleanly every time; ``min=64`` combined with ``max>=800`` reliably
+fails; and the boundary in between is NOT a clean function of either the
+absolute bounds or their ratio (e.g. ``min=128,max=1024`` built fine while the
+"narrower" ``min=160,max=1024`` OOM'd) — this looks like a genuine TensorRT
+internal memory-planner quirk for this graph's multi-level FPN anchor
+concatenation, not something we can fix from the ONNX/builder side. So rather
+than chase the exact boundary, RetinaNet's default sits solidly inside the
+region verified safe with real margin. YOLOX's raw+EfficientNMS graph does not
+have this problem at the generic wide range and keeps it unchanged.
 """
 
 from __future__ import annotations
@@ -26,6 +42,12 @@ HW = Tuple[int, int]
 _DEFAULT_MIN_SIDE = 64
 _DEFAULT_OPT_SIDE = 640
 _DEFAULT_MAX_SIDE = 1024
+
+# RetinaNet-specific override -- see the module docstring for why this is
+# narrower than the generic default above.
+_RETINANET_MIN_SIDE = 256
+_RETINANET_OPT_SIDE = 640
+_RETINANET_MAX_SIDE = 896
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -51,7 +73,7 @@ def profile_from_meta(
     multiple = int(spec.get("multiple") or 0)
     step = multiple if multiple > 1 else 1
 
-    if resize_mode == "square":
+    if resize_mode in ("square", "letterbox"):
         size = int(spec["size"])
         static: HW = (size, size)
         return (min_hw or static, opt_hw or static, max_hw or static)
@@ -62,6 +84,13 @@ def profile_from_meta(
         default_min: HW = (low, low)
         default_opt: HW = (top, top)
         default_max: HW = (top, top)
+    elif meta.get("arch") == "retinanet":  # narrower default -- see module docstring
+        low = _round_up(_RETINANET_MIN_SIDE, step)
+        mid = _round_up(_RETINANET_OPT_SIDE, step)
+        high = _round_up(_RETINANET_MAX_SIDE, step)
+        default_min = (low, low)
+        default_opt = (mid, mid)
+        default_max = (high, high)
     else:  # "none" — open-ended; use overridable defaults.
         low = _round_up(_DEFAULT_MIN_SIDE, step)
         mid = _round_up(_DEFAULT_OPT_SIDE, step)

@@ -9,3 +9,10 @@ pyyaml>=6.0
 gunicorn>=22.0
 python-dotenv>=1.0
 whitenoise>=6.6
+# Video download (Videos admin tab). Needs ffmpeg on PATH for mp4 merge/convert;
+# yt-dlp-ejs + a JS runtime (node, installed in the image) unlock >360p YouTube.
+yt-dlp>=2024.8
+yt-dlp-ejs
+# Frame extraction ("Extract frames…" action on Videos). Headless build avoids
+# pulling in libGL, which this server image has no use for.
+opencv-python-headless>=4.9

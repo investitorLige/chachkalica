@@ -23,6 +23,7 @@ from training.models import (
     ExperimentModel,
     TrainingSettings,
     default_iou_thresholds,
+    DEFAULT_PERSON_DETECTOR_CHECKPOINT,
 )
 
 
@@ -50,6 +51,8 @@ def resolve_label_dir(dataset, label_source: str, annotator=None, explicit_path:
         if not (explicit_path or "").strip():
             raise ValueError(f"{dataset.name}: explicit label path selected but empty.")
         return _resolve(explicit_path.strip())
+    if label_source == ExperimentDataset.NONE:
+        return None
     raise ValueError(f"Unknown label source {label_source!r}")
 
 
@@ -147,12 +150,23 @@ def pipeline_block(experiment: Experiment) -> dict | None:
         name == pipelines.CHAIN
         and any(c in pipelines.DETECTOR_PIPELINES for c in (experiment.chain or []))
     )
-    if experiment.detector_checkpoint:
-        data["detector"] = {"checkpoint": experiment.detector_checkpoint}
-    elif needs_detector:
-        raise ValueError(f"pipeline '{name}' requires a detector checkpoint.")
+    # Existing experiments may have saved an explicit blank before the bundled
+    # person engine became the default. Use it for detector-required pipelines,
+    # while leaving ordinary tiling pipelines detector-free.
+    checkpoint = experiment.detector_checkpoint or (
+        DEFAULT_PERSON_DETECTOR_CHECKPOINT if needs_detector else ""
+    )
+    if checkpoint:
+        # Experiment paths are relative to the Django project root, while the
+        # generated YAML lives under ``configs_root``.
+        detector: dict = {"checkpoint": str(_resolve(checkpoint))}
+        if experiment.detector_expand_ratio is not None:
+            detector["expand_ratio"] = experiment.detector_expand_ratio
+        data["detector"] = detector
 
     tiling: dict = {}
+    if experiment.tile_size_px:
+        tiling["tile_size_px"] = experiment.tile_size_px
     if experiment.tile_width_pct:
         tiling["tile_width_pct"] = experiment.tile_width_pct
     if experiment.tile_height_pct:
@@ -270,23 +284,38 @@ def eval_request_paths(eval_run, ts: TrainingSettings | None = None):
     return _resolve(ts.configs_root) / f"{stem}.yaml", _resolve(ts.runs_root) / stem
 
 
+def combined_checkpoints(run) -> list[str]:
+    """Checkpoint paths for a combined eval's *extra* models (beyond the primary).
+
+    Empty for an ordinary single-model run. Raises ``ValueError`` if any
+    combined model lacks a checkpoint, mirroring the primary model's own check.
+    """
+    paths = []
+    for m in run.combined_models.all():
+        if not m.checkpoint_path:
+            raise ValueError(f"{m.name}: no checkpoint path to evaluate.")
+        paths.append(m.checkpoint_path)
+    return paths
+
+
 def build_eval_request(eval_run, output_dir: Path | str, ts: TrainingSettings | None = None) -> dict:
     """Assemble the eval request consumed by friendy_chachkalica's eval_checkpoint.py.
 
     ``classes`` is the *eval dataset's* class space (the target labels); the
     model's own train-class space is read from the checkpoint by the trainer.
+    When ``eval_run`` combines 2+ models, ``extra_checkpoints`` carries the
+    others' checkpoint paths and the trainer merges all models' predictions
+    into one result (see ``eval_checkpoint.eval_combined_checkpoints``).
     """
     ts = ts or TrainingSettings.load()
     tm = eval_run.trained_model
     ds = eval_run.dataset
     if not tm.checkpoint_path:
         raise ValueError(f"{tm.name}: no checkpoint path to evaluate.")
-    return {
+    data = {
         "name": f"eval-{eval_run.pk}",
         "checkpoint_path": tm.checkpoint_path,
         "images": str(images_dir(ds)),
-        "labels": str(resolve_label_dir(
-            ds, eval_run.label_source, eval_run.annotator, eval_run.explicit_labels_path)),
         "classes": dataset_classes(ds),
         "output_dir": str(output_dir),
         "map_score_threshold": eval_run.map_score_threshold,
@@ -294,6 +323,15 @@ def build_eval_request(eval_run, output_dir: Path | str, ts: TrainingSettings | 
         "iou_thresholds": default_iou_thresholds(),
         "device": ts.default_device,
     }
+    labels = resolve_label_dir(
+        ds, eval_run.label_source, eval_run.annotator, eval_run.explicit_labels_path)
+    if labels is not None:
+        data["labels"] = str(labels)
+
+    extra_checkpoints = combined_checkpoints(eval_run)
+    if extra_checkpoints:
+        data["extra_checkpoints"] = extra_checkpoints
+    return data
 
 
 def write_eval_request(eval_run, ts: TrainingSettings | None = None) -> tuple[Path, str]:
@@ -324,7 +362,9 @@ def build_pipeline_request(pe, output_dir: Path | str, ts: TrainingSettings | No
     non-default detector/tiling knobs are emitted so chachak's own defaults apply
     when the operator left a field blank. Raises ``ValueError`` when a
     detector-requiring pipeline has no detector checkpoint (mirrors
-    ``chachak/config.py``'s own validation, but caught before we enqueue).
+    ``chachak/config.py``'s own validation, but caught before we enqueue). When
+    ``pe`` combines 2+ models, ``extra_checkpoints`` carries the others' paths
+    and chachak merges every model's predictions into one result.
     """
     ts = ts or TrainingSettings.load()
     tm = pe.trained_model
@@ -339,8 +379,6 @@ def build_pipeline_request(pe, output_dir: Path | str, ts: TrainingSettings | No
         "pipeline": pe.pipeline,
         "model_checkpoint": tm.checkpoint_path,
         "images": str(images_dir(ds)),
-        "labels": str(resolve_label_dir(
-            ds, pe.label_source, pe.annotator, pe.explicit_labels_path)),
         "classes": dataset_classes(ds),
         "output_dir": str(output_dir),
         "map_score_threshold": pe.map_score_threshold,
@@ -348,6 +386,10 @@ def build_pipeline_request(pe, output_dir: Path | str, ts: TrainingSettings | No
         "iou_thresholds": default_iou_thresholds(),
         "device": ts.default_device,
     }
+
+    labels = resolve_label_dir(ds, pe.label_source, pe.annotator, pe.explicit_labels_path)
+    if labels is not None:
+        data["labels"] = str(labels)
 
     if pe.pipeline == PipelineEvalRun.CHAIN and pe.chain:
         data["chain"] = list(pe.chain)
@@ -357,7 +399,10 @@ def build_pipeline_request(pe, output_dir: Path | str, ts: TrainingSettings | No
         and any(c in PipelineEvalRun.DETECTOR_PIPELINES for c in (pe.chain or []))
     )
     if pe.detector_checkpoint:
-        data["detector"] = {"checkpoint": pe.detector_checkpoint}
+        detector: dict = {"checkpoint": pe.detector_checkpoint}
+        if pe.detector_expand_ratio is not None:
+            detector["expand_ratio"] = pe.detector_expand_ratio
+        data["detector"] = detector
     elif needs_detector:
         raise ValueError(
             f"pipeline '{pe.pipeline}' requires a detector checkpoint.")
@@ -371,6 +416,10 @@ def build_pipeline_request(pe, output_dir: Path | str, ts: TrainingSettings | No
         tiling["overlap"] = pe.overlap
     if tiling:
         data["tiling"] = tiling
+
+    extra_checkpoints = combined_checkpoints(pe)
+    if extra_checkpoints:
+        data["extra_checkpoints"] = extra_checkpoints
 
     return data
 
@@ -387,6 +436,62 @@ def write_pipeline_request(pe, ts: TrainingSettings | None = None) -> tuple[Path
     pe.output_dir = str(output_dir)
     pe.save(update_fields=["request_yaml_path", "output_dir"])
     return request_path, text
+
+
+# The predictions file each eval kind leaves in its output_dir (a torch pickle of
+# per-image {image_path, predictions} records) — the source for "promote to labels".
+PREDICTIONS_FILE = {"pipeline": "predictions.pt", "base": "eval_predictions.pt"}
+
+# Backups of a dataset's prior source labels land here (one subdir per promoting
+# run) so a promote never silently destroys hand-checked labels.
+BACKUP_LABELS_SUBDIR = "backup_labels"
+
+
+def build_promote_payload(eval_obj, kind: str, score_threshold: float) -> dict:
+    """Assemble the trainer ``/promote_labels`` payload for one eval run.
+
+    ``kind`` is ``"pipeline"`` (a :class:`PipelineEvalRun`) or ``"base"`` (an
+    :class:`EvalRun`); it selects the predictions filename the run wrote. The
+    predictions are promoted into the dataset's *source* ``labels/`` folder
+    regardless of which ``label_source`` the eval scored against — promoting is
+    always about becoming the source of truth. Raises ``ValueError`` when the run
+    has no output dir or checkpoint yet.
+
+    A combined run (2+ models) has no single owning checkpoint — but its saved
+    predictions are already indexed in the *eval dataset's* class space (every
+    model was remapped into it before merging, see ``eval_combined_checkpoints``
+    / ``chachak/run.py``), so promotion there is an identity name-remap: we send
+    ``prediction_classes`` instead of ``checkpoint_path`` and the trainer skips
+    loading a checkpoint (see ``promote_labels.promote_labels``).
+    """
+    tm = eval_obj.trained_model
+    ds = eval_obj.dataset
+    if not eval_obj.output_dir:
+        raise ValueError(f"{eval_obj}: no output dir — run the eval before promoting.")
+
+    is_combined = getattr(eval_obj, "is_combined", False)
+    if not is_combined and not tm.checkpoint_path:
+        raise ValueError(f"{tm.name}: no checkpoint path.")
+    try:
+        predictions_file = PREDICTIONS_FILE[kind]
+    except KeyError:
+        raise ValueError(f"Unknown eval kind {kind!r}") from None
+
+    dataset_root = source_root() / ds.name
+    classes = dataset_classes(ds)
+    payload = {
+        "predictions_path": str(Path(eval_obj.output_dir) / predictions_file),
+        "images_dir": str(images_dir(ds)),
+        "dataset_classes": classes,
+        "labels_dir": str(datasets_svc.labels_source_dir(ds)),
+        "backup_dir": str(dataset_root / BACKUP_LABELS_SUBDIR / Path(eval_obj.output_dir).name),
+        "score_threshold": float(score_threshold),
+    }
+    if is_combined:
+        payload["prediction_classes"] = classes
+    else:
+        payload["checkpoint_path"] = tm.checkpoint_path
+    return payload
 
 
 def build_preview_request(

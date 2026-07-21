@@ -2,11 +2,12 @@
 
 Layout under the target root:
 
-    <dataset>/<username>/<image_filename>.txt   # one per annotated image
+    <dataset>/<username>/<image_stem>.txt       # one per annotated image
     <dataset>/<username>.coco.json              # assembled by `fleet.py sync`
 
-The per-image `.txt` is named after the full image filename (extension kept,
-e.g. `img01.jpg.txt`) so the COCO `file_name` can be recovered exactly.
+The per-image `.txt` uses the image stem (e.g. `img01.txt` for
+`img01.jpg`). This is the conventional YOLO layout and prevents duplicate
+labels for one image under two different filename conventions.
 
 Writes are atomic (temp file + os.replace) and serialized per path, so the
 threaded webhook server never exposes a half-written file or races itself on
@@ -30,7 +31,17 @@ def labels_dir(target_root: Path, dataset: str, username: str) -> Path:
     return Path(target_root) / dataset / username
 
 
+def label_filename(image_filename: str) -> str:
+    """Return the canonical YOLO label filename for an image filename."""
+    return f"{Path(image_filename).stem}.txt"
+
+
 def label_path(target_root: Path, dataset: str, username: str, image_filename: str) -> Path:
+    return labels_dir(target_root, dataset, username) / label_filename(image_filename)
+
+
+def legacy_label_path(target_root: Path, dataset: str, username: str, image_filename: str) -> Path:
+    """Return the old extension-preserving path, for cleanup only."""
     return labels_dir(target_root, dataset, username) / f"{image_filename}.txt"
 
 

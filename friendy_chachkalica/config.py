@@ -9,7 +9,7 @@ import yaml
 class DatasetConfig:
     name: str
     images: Path
-    labels: Path
+    labels: Optional[Path]
     classes: Dict[int, str]
     role: str
     weight: float = 1.0
@@ -81,6 +81,7 @@ class EvaluationConfig:
 @dataclass(frozen=True)
 class TilingSpec:
     # Blank knobs are None so chachak's own defaults apply downstream.
+    tile_size_px: Optional[int] = None
     tile_width_pct: Optional[float] = None
     tile_height_pct: Optional[float] = None
     overlap: Optional[float] = None
@@ -98,6 +99,10 @@ class PipelineSpec:
 
     name: str
     detector_checkpoint: Optional[Path] = None
+    # Fraction to grow each detected person box before cropping (0.10 = +10% on
+    # each of width and height, i.e. 5% per side), clipped to the frame. None
+    # falls back to chachak's default (0.0 = crop the detector box exactly).
+    detector_expand_ratio: Optional[float] = None
     tiling: TilingSpec = field(default_factory=TilingSpec)
     chain: List[str] = field(default_factory=list)
     merge_nms_iou: Optional[float] = None
@@ -603,6 +608,11 @@ def _parse_pipeline(value: Any, base_dir: Path) -> Optional[PipelineSpec]:
     detector_checkpoint = detector_raw.get("checkpoint")
     if detector_checkpoint is not None:
         detector_checkpoint = _resolve_path(detector_checkpoint, base_dir)
+    detector_expand_ratio = detector_raw.get("expand_ratio")
+    if detector_expand_ratio is not None:
+        detector_expand_ratio = float(detector_expand_ratio)
+        if detector_expand_ratio < 0:
+            raise ValueError("pipeline.detector.expand_ratio must be >= 0")
 
     tiling_raw = value.get("tiling") or {}
     if not isinstance(tiling_raw, dict):
@@ -613,7 +623,14 @@ def _parse_pipeline(value: Any, base_dir: Path) -> Optional[PipelineSpec]:
             return None
         return float(raw)
 
+    tile_size_px = tiling_raw.get("tile_size_px")
+    if tile_size_px is not None:
+        tile_size_px = int(tile_size_px)
+        if tile_size_px <= 0:
+            raise ValueError("pipeline.tiling.tile_size_px must be greater than 0")
+
     tiling = TilingSpec(
+        tile_size_px=tile_size_px,
         tile_width_pct=_opt_float(tiling_raw.get("tile_width_pct"), "tile_width_pct"),
         tile_height_pct=_opt_float(tiling_raw.get("tile_height_pct"), "tile_height_pct"),
         overlap=_opt_float(tiling_raw.get("overlap"), "overlap"),
@@ -631,6 +648,7 @@ def _parse_pipeline(value: Any, base_dir: Path) -> Optional[PipelineSpec]:
     return PipelineSpec(
         name=name,
         detector_checkpoint=detector_checkpoint,
+        detector_expand_ratio=detector_expand_ratio,
         tiling=tiling,
         chain=chain,
         merge_nms_iou=merge_nms_iou,

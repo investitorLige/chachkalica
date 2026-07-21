@@ -34,7 +34,10 @@ from friendy_chachkalica.data import (  # noqa: E402
     build_eval_dataloader,
     detection_collate_fn,
 )
-from friendy_chachkalica.metrics import evaluate_detection  # noqa: E402
+from friendy_chachkalica.metrics import (  # noqa: E402
+    evaluate_detection,
+    remap_raw_predictions_to_eval_classes,
+)
 from friendy_chachkalica.device import resolve_device  # noqa: E402
 from friendy_chachkalica.config import (  # noqa: E402
     DatasetConfig,
@@ -56,6 +59,7 @@ __all__ = [
     "build_eval_dataloader",
     "detection_collate_fn",
     "evaluate_detection",
+    "remap_raw_predictions_to_eval_classes",
     "resolve_device",
     "DatasetConfig",
     "EvaluationConfig",

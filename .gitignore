@@ -5,3 +5,8 @@
 logs/
 
 person_model_test/
+
+# inferlica/benchmark's default output dir (cached .onnx/.engine artifacts + CSVs).
+bench_out/
+
+models/

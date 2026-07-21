@@ -10,6 +10,10 @@ Resizing uses an ``align_corners=False`` half-pixel bilinear that matches
 parity with the training adapters. Archs where exact resize parity is critical
 may instead bake the resize into the graph (``resize_mode: none``) — this module
 supports both.
+
+``meta.layout == "bgr"`` reverses the channel axis before any scaling/resize —
+for checkpoints trained outside this repo's own RGB convention (e.g. a raw
+Megvii YOLOX checkpoint, whose native preprocessing is BGR/letterbox/[0,255]).
 """
 
 from __future__ import annotations
@@ -45,6 +49,9 @@ def preprocess(image_chw: np.ndarray, meta: ModelMeta) -> tuple[np.ndarray, Tran
     spec = meta.input
     img = np.ascontiguousarray(image_chw, dtype=np.float32)
 
+    if meta.layout == "bgr":
+        img = np.ascontiguousarray(img[::-1, :, :])
+
     if spec.input_scale == "byte":
         img = img * 255.0
 
@@ -64,6 +71,15 @@ def preprocess(image_chw: np.ndarray, meta: ModelMeta) -> tuple[np.ndarray, Tran
         resized = _resize_chw(img, new_h, new_w) if scale != 1.0 else img
         scale_x = new_w / orig_w
         scale_y = new_h / orig_h
+    elif spec.resize_mode == "letterbox":
+        # Aspect-preserving: scale (up or down) so the longest side hits
+        # spec.size exactly, then pad bottom-right to (size, size) below.
+        scale = spec.size / max(orig_h, orig_w)
+        new_h = max(1, round(orig_h * scale))
+        new_w = max(1, round(orig_w * scale))
+        resized = _resize_chw(img, new_h, new_w)
+        scale_x = new_w / orig_w
+        scale_y = new_h / orig_h
     else:  # pragma: no cover - validated in ModelMeta
         raise ValueError(f"unsupported resize_mode {spec.resize_mode!r}")
 
@@ -81,6 +97,16 @@ def preprocess(image_chw: np.ndarray, meta: ModelMeta) -> tuple[np.ndarray, Tran
         target_w = _ceil_to_multiple(rw, spec.multiple)
         if target_h != rh or target_w != rw:
             padded = np.full((3, target_h, target_w), spec.pad_value, dtype=np.float32)
+            padded[:, :rh, :rw] = resized
+            resized = padded
+
+    # 3b. letterbox pads to an exact (size, size) canvas, bottom-right — a
+    # separate mechanism from the multiple-of-N pad above (rfdetr's export
+    # sets multiple=0, so the two never overlap on the same call).
+    if spec.resize_mode == "letterbox":
+        _, rh, rw = resized.shape
+        if rh != spec.size or rw != spec.size:
+            padded = np.full((3, spec.size, spec.size), spec.pad_value, dtype=np.float32)
             padded[:, :rh, :rw] = resized
             resized = padded
 

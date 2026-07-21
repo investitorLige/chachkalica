@@ -80,7 +80,7 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
             "help": "Default confidence cutoff used at prediction time.",
         },
         {
-            "key": "nms_threshold", "label": "Val-metrics NMS threshold", "kind": "float",
+            "key": "nms_threshold", "label": "val_metrics_nms_iou_threshold", "kind": "float",
             "help": "IoU for deduplicating this model's boxes in val/test "
                     "precision/recall/F1 only — inference stays NMS-free and mAP is "
                     "unaffected. Blank = the experiment's operating NMS threshold.",
@@ -101,7 +101,7 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
             "default": 0.5, "help": "Default confidence cutoff used at prediction time.",
         },
         {
-            "key": "nms_threshold", "label": "Val-metrics NMS threshold", "kind": "float",
+            "key": "nms_threshold", "label": "val_metrics_nms_iou_threshold", "kind": "float",
             "help": "IoU for deduplicating this model's boxes in val/test "
                     "precision/recall/F1 only — inference stays NMS-free and mAP is "
                     "unaffected. Blank = the experiment's operating NMS threshold.",
@@ -171,7 +171,7 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
                     "default (0.0).",
         },
         {
-            "key": "rpn_nms_thresh", "label": "RPN NMS threshold", "kind": "float",
+            "key": "rpn_nms_thresh", "label": "rpn_nms_iou_threshold", "kind": "float",
             "help": "IoU threshold for suppressing overlapping proposals. Blank = "
                     "torchvision default (0.7).",
         },
@@ -187,7 +187,7 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
                     "Blank = torchvision default (0.05).",
         },
         {
-            "key": "box_nms_thresh", "label": "Box NMS threshold", "kind": "float",
+            "key": "box_nms_thresh", "label": "box_nms_iou_threshold", "kind": "float",
             "help": "IoU threshold for the final class-aware NMS. Blank = torchvision "
                     "default (0.5).",
         },
@@ -208,7 +208,7 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
             "default": 0.3, "help": "Default confidence cutoff used at prediction time.",
         },
         {
-            "key": "nms_threshold", "label": "NMS threshold", "kind": "float",
+            "key": "nms_threshold", "label": "nms_iou_threshold", "kind": "float",
             "default": 0.45, "help": "IoU threshold for non-maximum suppression.",
         },
         {
@@ -314,20 +314,52 @@ WEIGHTS_CATALOG: dict[str, list[dict]] = {
             "value": "rf-detr-base-o365.pth",
             "label": "Objects365 (base) — broader pretrain",
             "variant": "base",
+            "train_res": "560",  # base's native square resolution
         },
     ],
     "rtdetr": [
         # Size == checkpoint for RT-DETR, so these double as the size selector.
         # RT-DETRv2 beats v1 at every size (largest gain on r18/r34); all Apache-2.0.
-        {"value": "PekingU/rtdetr_r18vd", "label": "r18vd — v1 (smallest)"},
-        {"value": "PekingU/rtdetr_r34vd", "label": "r34vd — v1"},
-        {"value": "PekingU/rtdetr_r50vd", "label": "r50vd — v1 (original default)"},
-        {"value": "PekingU/rtdetr_r101vd", "label": "r101vd — v1 (largest)"},
-        {"value": "PekingU/rtdetr_v2_r18vd", "label": "r18vd — v2 (+1.6 AP over v1)"},
-        {"value": "PekingU/rtdetr_v2_r34vd", "label": "r34vd — v2 (+1.0 AP over v1)"},
-        {"value": "PekingU/rtdetr_v2_r50vd", "label": "r50vd — v2"},
-        {"value": "PekingU/rtdetr_v2_r101vd", "label": "r101vd — v2"},
+        # Every RT-DETR(v1/v2) COCO checkpoint is trained at a square 640.
+        {"value": "PekingU/rtdetr_r18vd", "label": "r18vd — v1 (smallest)", "train_res": "640"},
+        {"value": "PekingU/rtdetr_r34vd", "label": "r34vd — v1", "train_res": "640"},
+        {"value": "PekingU/rtdetr_r50vd", "label": "r50vd — v1 (original default)", "train_res": "640"},
+        {"value": "PekingU/rtdetr_r101vd", "label": "r101vd — v1 (largest)", "train_res": "640"},
+        {"value": "PekingU/rtdetr_v2_r18vd", "label": "r18vd — v2 (+1.6 AP over v1)", "train_res": "640"},
+        {"value": "PekingU/rtdetr_v2_r34vd", "label": "r34vd — v2 (+1.0 AP over v1)", "train_res": "640"},
+        {"value": "PekingU/rtdetr_v2_r50vd", "label": "r50vd — v2", "train_res": "640"},
+        {"value": "PekingU/rtdetr_v2_r101vd", "label": "r101vd — v2", "train_res": "640"},
     ],
+}
+
+# Input resolution each arch's variant-resolved "COCO pretrained (default)" option
+# was trained at, surfaced next to the weights dropdown so an operator can choose a
+# matching training resolution. It is *guidance, not a constraint* — detectors
+# fine-tune fine off-resolution — so the UI only annotates the option and never
+# auto-sets the training resolution.
+#
+# A dict value is a {variant: res} map the form/JS resolves against the row's
+# selected variant (the default's resolution genuinely depends on the variant); a
+# bare string is a single value used for every variant. RT-DETR is absent: it has
+# no "default" option (its size IS its checkpoint — see WEIGHTS_CATALOG above).
+_TORCHVISION_MULTISCALE = "800 shorter side (≤1333)"
+WEIGHTS_DEFAULT_TRAIN_RES: dict[str, object] = {
+    # YOLOX test/train size: 416 for nano/tiny, 640 for s/m/l/x.
+    "yolox": {
+        "yolox-nano": "416", "yolox-tiny": "416",
+        "yolox-s": "640", "yolox-m": "640", "yolox-l": "640", "yolox-x": "640",
+    },
+    # RF-DETR's default is each variant's native square resolution.
+    "rfdetr": {variant: str(res) for variant, res in RFDETR_NATIVE_RESOLUTIONS.items()},
+    # torchvision COCO recipes: 800 shorter-side multi-scale, except the dedicated
+    # low-res mobilenet_v3_large_320 variant (320 shorter side, ≤640).
+    "retinanet": _TORCHVISION_MULTISCALE,
+    "fasterrcnn": {
+        "resnet50_fpn": _TORCHVISION_MULTISCALE,
+        "resnet50_fpn_v2": _TORCHVISION_MULTISCALE,
+        "mobilenet_v3_large_fpn": _TORCHVISION_MULTISCALE,
+        "mobilenet_v3_large_320_fpn": "320 shorter side (≤640)",
+    },
 }
 
 
@@ -369,6 +401,30 @@ def weights_variant_map(arch: str) -> dict[str, str]:
         for entry in WEIGHTS_CATALOG.get(arch, [])
         if entry.get("variant")
     }
+
+
+def weights_res_map(arch: str) -> dict[str, str]:
+    """{option value: pretrain resolution} for fixed-resolution catalog options.
+
+    Fixed here means the checkpoint's training resolution doesn't depend on a
+    variant selection (unlike the variant-resolved "default" option, whose
+    resolution comes from :data:`WEIGHTS_DEFAULT_TRAIN_RES`). Used to tag <option>s
+    with ``data-train-res`` so the JS can annotate the label.
+    """
+    return {
+        entry["value"]: entry["train_res"]
+        for entry in WEIGHTS_CATALOG.get(arch, [])
+        if entry.get("train_res")
+    }
+
+
+def weights_default_res(arch: str):
+    """Pretrain resolution of the arch's "COCO pretrained (default)" option.
+
+    Returns a ``{variant: res}`` dict when it depends on the variant, a bare
+    string when uniform, or ``None`` when the arch has no default option (RT-DETR).
+    """
+    return WEIGHTS_DEFAULT_TRAIN_RES.get(arch)
 
 
 # ---------------------------------------------------------------------------
@@ -428,5 +484,6 @@ def bytetrack_yolox_options() -> list[dict]:
                 "value": path,
                 "label": f"ByteTrack person — CrowdHuman+MOT17 ({size})",
                 "variant": variant,
+                "train_res": "800×1440",  # ByteTrack MOT input size (HxW)
             })
     return out

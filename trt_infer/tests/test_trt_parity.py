@@ -4,13 +4,19 @@ The gate for every architecture. Exports the adapter to ONNX (reusing the ONNX
 exporters), compiles it to a TensorRT engine (``trt_export``), then asserts the
 :class:`TrtAdapter` reproduces the torch adapter's confident detections.
 
-All four archs build and run:
+All registered archs build and run:
 
 * **rtdetr, rfdetr** — compile straight from the standard ONNX (fixed-size DETR
   top-k).
 * **retinanet, yolox** — their standard ONNX bakes data-dependent NMS that TRT
   can't compile, so ``trt_export`` re-exports a raw-output graph and appends the
   ``EfficientNMS_TRT`` plugin; the runtime auto-detects the plugin outputs.
+* **fasterrcnn** — two-stage; ``trt_export`` re-exports a raw-output graph with a
+  *fixed top-K* RPN (no proposal NMS, so RoIAlign sees a static count) and
+  per-class boxes, then appends ``EfficientNMS_TRT``. Because the fixed-K RPN
+  makes the engine an approximation of the torch model (and this fixture is
+  random-init, so all scores tie), its test gates on the engine building, loading,
+  and emitting structurally valid detections — not bit-exact box parity.
 
 We compare the **confident top-K** detections: every DETR-family top-k (and the
 EfficientNMS candidate sort) has a low-confidence tail whose near-ties break
@@ -41,6 +47,7 @@ if not torch.cuda.is_available():
     pytest.skip("TensorRT parity needs a CUDA GPU", allow_module_level=True)
 
 from friendy_chachkalica.registry import build_model  # noqa: E402
+from friendy_chachkalica.onnx_export.arch.fasterrcnn import export_fasterrcnn  # noqa: E402
 from friendy_chachkalica.onnx_export.arch.retinanet import export_retinanet  # noqa: E402
 from friendy_chachkalica.onnx_export.arch.yolox import export_yolox  # noqa: E402
 from friendy_chachkalica.onnx_export.arch.rtdetr import export_rtdetr  # noqa: E402
@@ -203,3 +210,46 @@ def test_rfdetr_parity(rfdetr_engine):
     torch_pred = adapter.predict([image], score_threshold=0.0)[0].detach().cpu().numpy()
     trt_pred = trt_adapter.predict([image], score_threshold=0.0)[0].detach().cpu().numpy()
     _assert_topk_parity(torch_pred, trt_pred, k=10, atol=5e-3)
+
+
+# --------------------------------------------------------------------------- Faster R-CNN
+
+
+def test_fasterrcnn_engine(tmp_path):
+    """Build + run gate for the two-stage EfficientNMS export.
+
+    The engine approximates the torch model (fixed top-K RPN replaces the variable
+    proposal NMS — see trt_export/arch/fasterrcnn.py), and on this random-init
+    fixture every class score ties, so per-box parity is meaningless. We instead
+    assert the engine builds, loads, and emits structurally valid detections
+    (finite, in-range boxes; known class ids; scores above the fused threshold).
+    """
+    torch.manual_seed(0)
+    # The 320 mobilenet variant is the lightest to build/export/compile.
+    adapter = build_model("fasterrcnn", num_classes=3, variant="mobilenet_v3_large_320_fpn")
+    # Suppress background (class 0) so the random-init detector emits foreground
+    # boxes above threshold; otherwise there is nothing to check.
+    cls_score = adapter.model.roi_heads.box_predictor.cls_score
+    with torch.no_grad():
+        torch.nn.init.constant_(cls_score.bias, 0.0)
+        cls_score.bias[0] = -4.0
+    adapter.eval()
+
+    onnx_path = _export(adapter, export_fasterrcnn, tmp_path)
+    # EfficientNMS arch: prep re-exports from the adapter, so pass it through.
+    engine = _build(onnx_path, tmp_path, adapter=adapter, static_hw=(320, 320))
+
+    trt_adapter, info = load_trt_adapter(engine, "cuda")
+    assert info["num_classes"] == 3
+    torch.manual_seed(1)
+    image = torch.rand(3, 320, 320)
+    trt_pred = trt_adapter.predict([image], score_threshold=0.05)[0].detach().cpu().numpy()
+
+    assert trt_pred.ndim == 2 and trt_pred.shape[1] == 6
+    assert trt_pred.shape[0] >= 1, "engine produced no detections"
+    assert np.isfinite(trt_pred).all()
+    xywh, conf, cls = trt_pred[:, :4], trt_pred[:, 4], trt_pred[:, 5]
+    assert (conf >= 0.05 - 1e-4).all() and (conf <= 1.0 + 1e-4).all()
+    assert set(np.unique(cls.astype(int))).issubset({0, 1, 2})
+    assert (xywh[:, 2] > 0).all() and (xywh[:, 3] > 0).all()          # positive w/h
+    assert (xywh[:, :2] >= -0.05).all() and (xywh[:, :2] <= 1.05).all()  # centers in-frame

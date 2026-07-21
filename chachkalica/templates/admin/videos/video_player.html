@@ -1,0 +1,28 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<style>
+  #vp-stage { max-width: 960px; }
+  #vp-stage video { width: 100%; height: auto; border-radius: 6px; background: #000; }
+  #vp-meta { margin: 8px 0; color: #666; }
+  #vp-error { color: #ba2121; margin: 8px 0; }
+</style>
+
+<div id="vp-stage">
+  {% if exists %}
+    <video controls autoplay preload="metadata" playsinline>
+      <source src="{{ stream_url }}" type="video/mp4">
+      Your browser cannot play this video.
+    </video>
+    <p id="vp-meta"><strong>{{ video.name }}</strong>
+      {% if video.filename %}· {{ video.filename }}{% endif %}
+      {% if video.source_url %}· <a href="{{ video.source_url }}" target="_blank" rel="noopener">source</a>{% endif %}
+    </p>
+  {% else %}
+    <p id="vp-error">No file on disk for <strong>{{ video.name }}</strong>
+      (status: {{ video.status }}).{% if video.last_error %} {{ video.last_error }}{% endif %}</p>
+  {% endif %}
+</div>
+
+<p style="margin-top:12px"><a href="../" class="button cancel-link">Back to videos</a></p>
+{% endblock %}

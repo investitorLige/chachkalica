@@ -12,6 +12,7 @@ from pathlib import Path
 import requests
 
 from fleet.models import Annotator, Dataset, FleetSettings, Project, project_title
+from fleet.reconcile import writer
 from fleet.services import lsapi
 from fleet.services.paths import annotator_base_url, source_root, target_root
 
@@ -71,7 +72,13 @@ def promote_annotator_labels(dataset: Dataset, annotator: Annotator, fs: FleetSe
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     for txt in txts:
-        shutil.move(str(txt), str(dest_dir / txt.name))
+        # Normalize legacy ``image.jpg.txt`` exports to ``image.txt`` so they
+        # overwrite the source label for that image instead of creating a duplicate.
+        dest = dest_dir / writer.label_filename(txt.stem)
+        shutil.move(str(txt), str(dest))
+        legacy_dest = dest_dir / txt.name
+        if legacy_dest != dest:
+            legacy_dest.unlink(missing_ok=True)
 
     # Source labels now exist — refresh the flag so the admin/training path sees them.
     detect_labels(dataset)

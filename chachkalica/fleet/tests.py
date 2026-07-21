@@ -597,8 +597,8 @@ class PromoteAnnotatorLabelsTests(TestCase):
 
         labels_dir = self.src / "ds" / "labels"
         self.assertEqual(result["moved"], 2)
-        self.assertTrue((labels_dir / "a.jpg.txt").exists())
-        self.assertTrue((labels_dir / "b.jpg.txt").exists())
+        self.assertTrue((labels_dir / "a.txt").exists())
+        self.assertTrue((labels_dir / "b.txt").exists())
         # Moved, not copied — the annotator folder is emptied of txts.
         self.assertEqual(list(ann_dir.glob("*.txt")), [])
         dataset.refresh_from_db()
@@ -607,7 +607,7 @@ class PromoteAnnotatorLabelsTests(TestCase):
     def test_overwrites_existing_source_label_of_same_name(self):
         dataset = _make_dataset(
             self.src, "ds", "# tools: bbox\n", ["person"], ["a.jpg"],
-            labels={"a.jpg.txt": "OLD\n"},
+            labels={"a.txt": "OLD\n"},
         )
         ann = Annotator.objects.create(username="ann1")
         ann_dir = self._annotator_dir("ds", "ann1")
@@ -616,8 +616,23 @@ class PromoteAnnotatorLabelsTests(TestCase):
         datasets_svc.promote_annotator_labels(dataset, ann)
 
         self.assertEqual(
-            (self.src / "ds" / "labels" / "a.jpg.txt").read_text(encoding="utf-8"), "NEW\n"
+            (self.src / "ds" / "labels" / "a.txt").read_text(encoding="utf-8"), "NEW\n"
         )
+
+    def test_legacy_extension_preserving_export_overwrites_stem_source_label(self):
+        dataset = _make_dataset(
+            self.src, "ds", "# tools: bbox\n", ["person"], ["a.jpg"],
+            labels={"a.txt": "OLD\n"},
+        )
+        ann = Annotator.objects.create(username="ann1")
+        ann_dir = self._annotator_dir("ds", "ann1")
+        (ann_dir / "a.jpg.txt").write_text("NEW\n", encoding="utf-8")
+
+        datasets_svc.promote_annotator_labels(dataset, ann)
+
+        labels_dir = self.src / "ds" / "labels"
+        self.assertEqual((labels_dir / "a.txt").read_text(encoding="utf-8"), "NEW\n")
+        self.assertFalse((labels_dir / "a.jpg.txt").exists())
 
     def test_missing_annotator_output_raises(self):
         dataset = _make_dataset(self.src, "ds", "# tools: bbox\n", ["person"], ["a.jpg"])

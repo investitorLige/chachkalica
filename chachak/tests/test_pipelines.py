@@ -18,6 +18,7 @@ if str(_CHACHAK_DIR) not in sys.path:
 import torch  # noqa: E402
 
 from config import DetectorConfig, PipelineConfig, TilingConfig  # noqa: E402
+from infer import infer_in_chunks  # noqa: E402
 from pipeline import (  # noqa: E402
     BatchDetectPipeline,
     BatchPeoplePipeline,
@@ -41,6 +42,30 @@ class StubModel:
 class EmptyModel:
     def predict(self, images, score_threshold=None):
         return [torch.zeros((0, 6)) for _ in images]
+
+
+class ShortBatchModel:
+    def predict(self, images, score_threshold=None):
+        return [torch.zeros((0, 6)) for _ in images[:-1]]
+
+
+class TileAwareStubModel:
+    """Emits one centered box per tile, class_id cycling 0, 1, 2... in call order.
+
+    Lets a test assert that a tile's class survives remap + merge intact,
+    instead of every tile emitting the same hardcoded class.
+    """
+
+    def __init__(self, box_wh=(0.5, 0.5, 0.3, 0.3, 0.9)):
+        self.box_wh = box_wh
+        self._next_class = 0
+
+    def predict(self, images, score_threshold=None):
+        preds = []
+        for _ in images:
+            preds.append(torch.tensor([[*self.box_wh, float(self._next_class)]]))
+            self._next_class += 1
+        return preds
 
 
 class StubDetector:
@@ -101,6 +126,16 @@ def assert_valid_preds(testcase, outputs, n_frames):
             testcase.assertLessEqual(float(boxes.max()), 1.0 + 1e-4)
 
 
+class InferInChunksTest(unittest.TestCase):
+    def test_rejects_adapter_output_count_mismatch(self):
+        with self.assertRaisesRegex(RuntimeError, "prediction count mismatch"):
+            infer_in_chunks(
+                ShortBatchModel(),
+                [torch.rand(3, 10, 10), torch.rand(3, 10, 10)],
+                chunk_size=2,
+            )
+
+
 class ProcessBatchTest(unittest.TestCase):
     def test_batch_detect_tiles_and_produces_boxes(self):
         images, targets = sample_frames()
@@ -116,6 +151,30 @@ class ProcessBatchTest(unittest.TestCase):
         out = pipe.process_batch(images, targets)
         assert_valid_preds(self, out, len(images))
         self.assertTrue(all(p.shape[0] == 0 for p in out))
+
+    def test_batch_detect_preserves_labels_per_tile(self):
+        # 50%-wide, full-height, no-overlap tiling on a 100x100 frame yields
+        # exactly two side-by-side tiles: [0, 50) and [50, 100).
+        image = torch.rand(3, 100, 100)
+        target = {
+            "image_path": "a.jpg",
+            "label_path": "a.txt",
+            "orig_size": torch.tensor([100, 100]),
+            "boxes": torch.tensor([[0.0, 0.0, 100.0, 100.0]]),
+            "labels": torch.tensor([0]),
+        }
+        config = make_config(
+            "batch_detect",
+            tiling=TilingConfig(tile_width_pct=50, tile_height_pct=100, overlap=0.0, nms_iou=0.5),
+        )
+        pipe = BatchDetectPipeline(TileAwareStubModel(), DEVICE, config)
+        out = pipe.process_batch([image], [target])[0]
+
+        self.assertEqual(out.shape[0], 2)
+        # Sort by x-center so the left tile's box is compared first.
+        sorted_out = out[out[:, 0].argsort()]
+        self.assertEqual(sorted_out[0, 5].item(), 0.0)  # left tile -> class 0
+        self.assertEqual(sorted_out[1, 5].item(), 1.0)  # right tile -> class 1
 
     def test_people_detect_first_crops_and_infers(self):
         images, targets = sample_frames()

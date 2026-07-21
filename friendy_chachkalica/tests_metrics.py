@@ -1,8 +1,64 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
-from friendy_chachkalica.metrics import evaluate_detection, _matrix_from_confusion_data
+from friendy_chachkalica.metrics import (
+    _matrix_from_confusion_data,
+    evaluate_detection,
+    remap_raw_predictions_to_eval_classes,
+    select_hard_images,
+)
+from friendy_chachkalica.train import _write_hard_images
+
+
+class RemapRawPredictionsToEvalClassesTests(unittest.TestCase):
+    """The raw-(N,6)-tensor remap combined multi-model eval uses to merge
+    each model's predictions into one eval class space before concatenating."""
+
+    def test_remaps_by_name_and_drops_unmatched(self):
+        # Model trains class id 0 as "person", 1 as "dog"; eval space only
+        # knows "car" (0) and "person" (1) — "dog" has no match and is dropped.
+        predictions = torch.tensor([
+            [0.5, 0.5, 0.1, 0.1, 0.9, 0.0],
+            [0.2, 0.2, 0.1, 0.1, 0.8, 1.0],
+        ])
+        out = remap_raw_predictions_to_eval_classes(
+            predictions, {0: "person", 1: "dog"}, {0: "car", 1: "person"}
+        )
+        self.assertEqual(out.shape, (1, 6))
+        self.assertEqual(int(out[0, 5]), 1)
+        self.assertAlmostEqual(float(out[0, 4]), 0.9)
+
+    def test_two_models_with_colliding_raw_ids_land_on_distinct_eval_ids(self):
+        # Both models use raw id 0 for their one class, but different names —
+        # this is exactly the case combining relies on to merge safely.
+        cat_model = torch.tensor([[0.5, 0.5, 0.4, 0.4, 0.9, 0.0]])
+        dog_model = torch.tensor([[0.5, 0.5, 0.4, 0.4, 0.8, 0.0]])
+        eval_classes = {0: "cat", 1: "dog"}
+        remapped_cat = remap_raw_predictions_to_eval_classes(
+            cat_model, {0: "cat"}, eval_classes
+        )
+        remapped_dog = remap_raw_predictions_to_eval_classes(
+            dog_model, {0: "dog"}, eval_classes
+        )
+        merged = torch.cat([remapped_cat, remapped_dog], dim=0)
+        self.assertEqual(sorted(int(row[5]) for row in merged), [0, 1])
+
+    def test_empty_predictions_stay_empty(self):
+        out = remap_raw_predictions_to_eval_classes(
+            torch.empty((0, 6)), {0: "person"}, {0: "person"}
+        )
+        self.assertEqual(out.shape, (0, 6))
+
+    def test_no_matches_returns_empty(self):
+        predictions = torch.tensor([[0.5, 0.5, 0.1, 0.1, 0.9, 0.0]])
+        out = remap_raw_predictions_to_eval_classes(
+            predictions, {0: "dog"}, {0: "cat"}
+        )
+        self.assertEqual(out.shape, (0, 6))
 
 
 class EvaluateDetectionConfusionMatrixTests(unittest.TestCase):
@@ -160,6 +216,126 @@ class EvaluateDetectionOperatingNMSTests(unittest.TestCase):
         self.assertEqual(metrics["num_predictions"], 2)
         self.assertEqual(metrics["precision"], 1.0)
         self.assertEqual(metrics["recall"], 1.0)
+
+
+class SelectHardImagesTests(unittest.TestCase):
+    @staticmethod
+    def _target(count=1):
+        return {
+            "orig_size": torch.tensor([100, 100]),
+            "boxes": torch.tensor([[40.0, 40.0, 60.0, 60.0]] * count),
+            "labels": torch.zeros((count,), dtype=torch.long),
+        }
+
+    @staticmethod
+    def _perfect_predictions(count=1):
+        return torch.tensor(
+            [[0.5, 0.5, 0.2, 0.2, 0.9, 0.0]] * count,
+            dtype=torch.float32,
+        ).reshape(-1, 6)
+
+    def test_operating_threshold_excludes_low_confidence_noise(self):
+        prediction = torch.cat([
+            self._perfect_predictions(),
+            torch.tensor([[0.1, 0.1, 0.1, 0.1, 0.1, 0.0]]),
+        ])
+        images = select_hard_images(
+            [prediction],
+            [self._target()],
+            [{"image_path": "/data/a.jpg"}],
+            score_threshold=0.25,
+        )
+
+        self.assertEqual(images[0]["num_predictions"], 1)
+        self.assertEqual(images[0]["f1"], 1.0)
+        self.assertEqual(images[0]["difficulty"], 0.0)
+
+    def test_normalized_score_surfaces_complete_single_object_failure(self):
+        predictions = [
+            self._perfect_predictions(5),
+            torch.empty((0, 6)),
+        ]
+        targets = [self._target(10), self._target(1)]
+        infos = [
+            {"image_path": "/data/crowded.jpg"},
+            {"image_path": "/data/single.jpg"},
+        ]
+
+        images = select_hard_images(predictions, targets, infos, score_threshold=0.25)
+
+        self.assertEqual(images[0]["image_name"], "single.jpg")
+        self.assertEqual(images[0]["f1"], 0.0)
+        self.assertGreater(images[0]["difficulty"], images[1]["difficulty"])
+
+    def test_wrong_class_counts_as_effective_fp_and_fn(self):
+        prediction = self._perfect_predictions()
+        prediction[:, 5] = 1
+        image = select_hard_images(
+            [prediction],
+            [self._target()],
+            [{"image_path": "/data/wrong.jpg"}],
+            score_threshold=0.25,
+        )[0]
+
+        self.assertEqual(image["wrong_class"], 1)
+        self.assertEqual(image["total_errors"], 2)
+        self.assertEqual(image["f1"], 0.0)
+
+    def test_wrong_class_box_does_not_steal_lower_scored_correct_match(self):
+        prediction = torch.cat([
+            self._perfect_predictions(),
+            self._perfect_predictions(),
+        ])
+        prediction[0, 5] = 1
+        prediction[1, 4] = 0.8
+        image = select_hard_images(
+            [prediction],
+            [self._target()],
+            [{"image_path": "/data/confusion.jpg"}],
+            score_threshold=0.25,
+        )[0]
+
+        self.assertEqual(image["wrong_class"], 0)
+        self.assertEqual(image["false_positives"], 1)
+        self.assertEqual(image["missed"], 0)
+        self.assertEqual(image["f1"], 0.6667)
+
+    def test_rejects_mismatched_batch_lengths(self):
+        with self.assertRaisesRegex(ValueError, "equal lengths"):
+            select_hard_images(
+                [self._perfect_predictions()],
+                [self._target()],
+                [],
+            )
+
+    def test_artifact_uses_operating_nms_and_atomic_json(self):
+        duplicate_predictions = torch.cat([
+            self._perfect_predictions(),
+            self._perfect_predictions(),
+        ])
+        duplicate_predictions[1, 2:4] *= 1.05
+        duplicate_predictions[1, 4] = 0.8
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            predictions_path = Path(temporary_dir) / "val_predictions.pt"
+            _write_hard_images(
+                predictions_path,
+                [duplicate_predictions],
+                [self._target()],
+                [{"image_path": "/data/a.jpg"}],
+                config=None,
+                prediction_classes={0: "object"},
+                target_classes={0: "object"},
+                eval_classes={0: "object"},
+                operating_nms_threshold=0.5,
+            )
+            payload = json.loads(
+                (Path(temporary_dir) / "val_hard_images.json").read_text()
+            )
+
+        self.assertEqual(payload["score_threshold"], 0.25)
+        self.assertEqual(payload["operating_nms_threshold"], 0.5)
+        self.assertEqual(payload["images"][0]["num_predictions"], 1)
 
 
 if __name__ == "__main__":

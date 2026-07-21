@@ -25,6 +25,11 @@ def target_root(fleet_settings: FleetSettings | None = None) -> Path:
     return _resolve(fs.target_dir)
 
 
+def videos_root(fleet_settings: FleetSettings | None = None) -> Path:
+    fs = fleet_settings or FleetSettings.load()
+    return _resolve(fs.videos_dir)
+
+
 def annotator_base_url(annotator) -> str:
     """Base URL to reach an annotator's Label Studio from server-side code.
 

@@ -37,11 +37,13 @@ RUN pip install --no-cache-dir \
 # so a CPU-only or non-TRT build can drop this line without touching the rest.
 RUN pip install --no-cache-dir -r /app/friendy_chachkalica/requirements-trt.txt
 
-# Both packages, preserving the repo-root layout. friendy_chachkalica runs flat
+# Runtime packages, preserving the repo-root layout. friendy_chachkalica runs flat
 # (its modules import each other bare, with cwd on sys.path — WORKDIR below);
 # chachak imports `friendy_chachkalica.*` with /app on sys.path.
 COPY friendy_chachkalica/ /app/friendy_chachkalica/
 COPY chachak/ /app/chachak/
+COPY onnx_infer/ /app/onnx_infer/
+COPY trt_infer/ /app/trt_infer/
 
 # Listen on the port Django targets (TrainingSettings.service_base_url). The
 # value is overridable at runtime via the FC_PORT env var; EXPOSE is only docs.
