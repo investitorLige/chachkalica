@@ -25,6 +25,9 @@ from training import pipelines
 DEFAULT_IOU_THRESHOLDS = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
 
 
+DEFAULT_PERSON_DETECTOR_CHECKPOINT = "models/people/best_ckpt.engine"
+
+
 def default_iou_thresholds() -> list[float]:
     return list(DEFAULT_IOU_THRESHOLDS)
 
@@ -184,12 +187,14 @@ class Experiment(models.Model):
                   "detected people). Blank = plain full-frame training and eval.",
     )
     detector_checkpoint = models.CharField(
-        max_length=1024, blank=True,
-        help_text="Person-detector checkpoint; required for people_detect_first / "
+        max_length=1024, blank=True, default=DEFAULT_PERSON_DETECTOR_CHECKPOINT,
+        help_text="Person-detector checkpoint (.pt, .onnx, or .engine); required for people_detect_first / "
                   "batch_people (and any chain that includes them). Runs at train, "
                   "val, and test: it selects the person crops the model is trained "
                   "and evaluated on. Objects outside every detected person crop are "
-                  "not seen during training.",
+                  "not seen during training. TensorRT person engines automatically resize "
+                  "oversized frames while preserving aspect ratio; the default engine has a "
+                  "1280-pixel maximum side.",
     )
     detector_expand_ratio = models.FloatField(
         default=0.10,

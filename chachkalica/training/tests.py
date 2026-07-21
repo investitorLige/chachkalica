@@ -150,16 +150,32 @@ class ConfigGenTests(TestCase):
         self.assertEqual(data["pipeline"]["merge_nms_iou"], 0.5)
         self.assertNotIn("detector", data["pipeline"])
 
-    def test_detector_pipeline_requires_checkpoint(self):
+    def test_detector_pipeline_uses_default_checkpoint_when_blank(self):
         self.exp.pipeline = "people_detect_first"
+        self.exp.detector_checkpoint = ""
         self.exp.save()
-        with self.assertRaises(ValueError):
-            config_gen.build_experiment_dict(self.exp, "/out/exp1")
+        data = config_gen.build_experiment_dict(self.exp, "/out/exp1")
+        self.assertEqual(
+            data["pipeline"]["detector"]["checkpoint"],
+            str(config_gen._resolve("models/people/best_ckpt.engine")),
+        )
 
         self.exp.detector_checkpoint = "/ckpts/person.pt"
         self.exp.save()
         data = config_gen.build_experiment_dict(self.exp, "/out/exp1")
-        self.assertEqual(data["pipeline"]["detector"], {"checkpoint": "/ckpts/person.pt"})
+        # expand_ratio rides along with the detector block (default 0.10).
+        self.assertEqual(
+            data["pipeline"]["detector"],
+            {"checkpoint": "/ckpts/person.pt", "expand_ratio": 0.10},
+        )
+
+    def test_custom_detector_expand_ratio_emitted(self):
+        self.exp.pipeline = "batch_people"
+        self.exp.detector_checkpoint = "/ckpts/person.pt"
+        self.exp.detector_expand_ratio = 0.25
+        self.exp.save()
+        data = config_gen.build_experiment_dict(self.exp, "/out/exp1")
+        self.assertEqual(data["pipeline"]["detector"]["expand_ratio"], 0.25)
 
     def test_at_most_one_val(self):
         _make_dataset_on_disk(self.source, "ds2", ["helmet"])

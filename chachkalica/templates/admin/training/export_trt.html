@@ -44,6 +44,18 @@ trainer's exact GPU + TensorRT version (not portable to other hardware).</p>
     </select>
   </div>
 
+  <div class="form-row">
+    <label for="input_size">Input size (static):</label>
+    <input type="text" name="input_size" id="input_size" size="16"
+           placeholder="e.g. 640 or 640x640">
+    <p class="help">Optional. Leave blank for the default dynamic profile (variable input
+    size). Enter a single number (square) or <code>HxW</code> to pin a <strong>static</strong>
+    input size (min = opt = max). <strong>Faster R-CNN needs this to build FP16</strong> — its
+    graph only compiles FP16 at a fixed size; with a dynamic profile the FP16 build fails and
+    silently falls back to FP32. RT-DETR and the others build FP16 fine without it. The
+    resulting engine accepts only this exact size (images are resized to it).</p>
+  </div>
+
   <div class="submit-row">
     <input type="submit" class="default" value="Export to TensorRT">
     <a href="../" class="button cancel-link">Cancel</a>

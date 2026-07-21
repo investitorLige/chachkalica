@@ -7,9 +7,10 @@ normalized to each input image (a full frame or a tile).
 """
 
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 try:
     from .infer import infer_in_chunks, load_checkpoint_adapter
@@ -31,11 +32,21 @@ class Detector:
         self.person_class_id = int(person_class_id)
         self.score_threshold = float(score_threshold)
         self.batch_size = int(batch_size)
+        self.max_input_hw = _adapter_max_input_hw(adapter)
+        if self.max_input_hw is not None:
+            print(
+                "[detector] TensorRT input profile max="
+                f"{self.max_input_hw[0]}x{self.max_input_hw[1]}; "
+                "oversized frames will be aspect-preserving resized before "
+                "person detection"
+            )
 
     def predict(self, images: List[torch.Tensor]) -> List[torch.Tensor]:
         """Return per-image person predictions ``(N, 6)`` (normalized per input)."""
         raw = infer_in_chunks(
-            self.adapter, images, self.batch_size, self.score_threshold
+            self.adapter,
+            [_fit_to_input_profile(image, self.max_input_hw) for image in images],
+            self.batch_size, self.score_threshold
         )
         filtered = []
         for preds in raw:
@@ -48,6 +59,35 @@ class Detector:
             filtered.append(preds[mask])
         return filtered
 
+
+
+def _adapter_max_input_hw(adapter) -> Optional[Tuple[int, int]]:
+    model = getattr(adapter, "_model", None)
+    engine, input_name = getattr(model, "engine", None), getattr(model, "input_name", None)
+    if engine is None or input_name is None:
+        return None
+    try:
+        max_shape = tuple(int(value) for value in engine.get_tensor_profile_shape(input_name, 0)[-1])
+    except (AttributeError, TypeError, ValueError):
+        return None
+    max_h, max_w = max_shape[-2:]
+    return (max_h, max_w) if len(max_shape) == 4 and max_h > 0 and max_w > 0 else None
+
+
+def _fit_to_input_profile(image: torch.Tensor, max_input_hw: Optional[Tuple[int, int]]) -> torch.Tensor:
+    if max_input_hw is None:
+        return image
+    height, width = (int(image.shape[-2]), int(image.shape[-1]))
+    max_h, max_w = max_input_hw
+    scale = min(1.0, max_h / height, max_w / width)
+    if scale == 1.0:
+        return image
+    return F.interpolate(
+        image.unsqueeze(0),
+        size=(max(1, round(height * scale)), max(1, round(width * scale))),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
 
 def load_detector(
     checkpoint_path: Union[str, Path],

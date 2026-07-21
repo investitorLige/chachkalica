@@ -21,7 +21,7 @@ from django.utils.html import format_html
 from django.utils.http import urlencode
 
 from fleet import jobs
-from fleet.models import Annotator, Dataset, FleetSettings, Project
+from fleet.models import Annotator, Dataset, FleetSettings, GroundingSamRun, Project
 from fleet.services import analytics as analytics_svc
 from fleet.services import data_quality_solve
 from fleet.services import datasets as datasets_svc
@@ -241,6 +241,7 @@ class DatasetAdmin(admin.ModelAdmin):
         "sync_all_projects",
         "setup_sync_one_annotator",
         "promote_annotator_labels",
+        "generate_grounding_sam_labels",
         "merge_selected",
         "analyze_selected",
         "preview_labels",
@@ -354,6 +355,71 @@ class DatasetAdmin(admin.ModelAdmin):
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
         }
         return TemplateResponse(request, "admin/fleet/promote_annotator.html", context)
+
+    @admin.action(description="Generate labels with Grounding SAM…")
+    def generate_grounding_sam_labels(self, request, queryset):
+        """Auto-label a dataset's unlabeled images from classes.txt via Grounding SAM.
+
+        Runs off-request (the backend call is slow model inference) — one
+        GroundingSamRun row + RQ job per dataset, queued straight away. Progress
+        is tracked on the run (Fleet > Grounding SAM runs), not here. Images that
+        already have a source label file are left untouched; this only fills in
+        what's missing.
+        """
+        datasets = sorted(queryset, key=lambda d: d.name)
+        valid = []
+        invalid = []
+        for dataset in datasets:
+            try:
+                names, _tools = lsapi.parse_classes_file(source_root() / dataset.name / "classes.txt")
+            except (FileNotFoundError, RuntimeError) as exc:
+                invalid.append((dataset, str(exc)))
+                continue
+            valid.append((dataset, names))
+
+        if request.POST.get("apply"):
+            try:
+                confidence = float(request.POST.get("confidence", ""))
+            except ValueError:
+                confidence = -1
+            if not 0 < confidence <= 1:
+                self.message_user(
+                    request, "Confidence must be a number between 0 and 1.", level=messages.WARNING
+                )
+                return None
+            for dataset, _names in valid:
+                run = GroundingSamRun.objects.create(dataset=dataset, confidence=confidence)
+                _queue().enqueue(jobs.generate_grounding_sam_labels, run.id)
+            if valid:
+                self.message_user(
+                    request,
+                    f"{len(valid)} dataset(s) queued for Grounding SAM labeling — "
+                    "track progress under Fleet > Grounding SAM runs.",
+                )
+            for dataset, reason in invalid:
+                self.message_user(request, f"{dataset.name}: {reason}", level=messages.ERROR)
+            return None
+
+        if not valid:
+            self.message_user(
+                request, "None of the selected datasets have a readable classes.txt.",
+                level=messages.WARNING,
+            )
+            return None
+
+        for dataset in datasets:
+            dataset.has_labels_now = datasets_svc.detect_labels(dataset, persist=False)
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Generate labels with Grounding SAM",
+            "valid": valid,
+            "invalid": invalid,
+            "action": "generate_grounding_sam_labels",
+            "selected": [str(d.pk) for d in datasets],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+        }
+        return TemplateResponse(request, "admin/fleet/generate_grounding_sam.html", context)
 
     @admin.action(description="Merge selected datasets into a new dataset…")
     def merge_selected(self, request, queryset):
@@ -596,3 +662,40 @@ class ProjectAdmin(admin.ModelAdmin):
             project.last_run_at = timezone.now()
             project.save(update_fields=["last_status", "last_run_at"])
         self.message_user(request, f"{queryset.count()} sync job(s) queued — refresh to see progress.")
+
+
+@admin.register(GroundingSamRun)
+class GroundingSamRunAdmin(admin.ModelAdmin):
+    """Progress tracker for Grounding SAM auto-labeling jobs.
+
+    Purely a monitoring view — runs are created from the Dataset admin's
+    "Generate labels with Grounding SAM…" action, never here. Refresh the list
+    to watch ``images_processed`` move along as the worker gets through a
+    dataset's batches.
+    """
+
+    list_display = [
+        "dataset", "status_badge", "progress", "images_labeled",
+        "detections_written", "confidence", "created_at", "finished_at",
+    ]
+    list_filter = ["status", "dataset"]
+    ordering = ["-created_at"]
+    fields = [
+        "dataset", "confidence", "status_badge", "progress", "images_labeled",
+        "detections_written", "error", "created_at", "started_at", "finished_at",
+    ]
+    readonly_fields = fields
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    @admin.display(description="status", ordering="status")
+    def status_badge(self, obj):
+        return _status_badge(obj.status)
+
+    @admin.display(description="progress")
+    def progress(self, obj):
+        return f"{obj.images_processed}/{obj.images_total}"

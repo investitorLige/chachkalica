@@ -192,20 +192,27 @@ TRT_BUILD_TIMEOUT = 1800
 
 def export_trt(
     checkpoint_path, engine_path, precision: str = "fp16",
+    input_hw: tuple[int, int] | None = None,
     ts: TrainingSettings | None = None,
 ) -> dict:
     """Build a TensorRT engine from one ``.pt`` via the trainer service.
 
-    Returns ``{"engine_path", "meta_path", "provenance_path"}``. Synchronous: the
-    service ensures the ONNX exists, compiles the engine on the GPU in its own env,
-    and returns once the files are on the shared filesystem. Unlike ``export_onnx``,
-    this uses the GPU and contends with active training.
+    Returns ``{"engine_path", "meta_path", "provenance_path", "precision"}`` — the
+    ``precision`` is what the engine ACTUALLY built at (an fp16 request can fall back to
+    fp32). Synchronous: the service ensures the ONNX exists, compiles the engine on the
+    GPU in its own env, and returns once the files are on the shared filesystem. Unlike
+    ``export_onnx``, this uses the GPU and contends with active training.
+
+    ``input_hw`` (H, W), when given, pins a STATIC engine profile (min==opt==max) — the
+    way to get FP16 on Faster R-CNN, whose graph only compiles FP16 at a fixed size.
     """
     payload = {
         "checkpoint_path": str(checkpoint_path),
         "engine_path": str(engine_path),
         "precision": str(precision),
     }
+    if input_hw is not None:
+        payload["input_hw"] = [int(input_hw[0]), int(input_hw[1])]
     resp = requests.post(
         f"{base_url(ts)}/export_trt", json=payload, timeout=TRT_BUILD_TIMEOUT)
     if resp.status_code >= 400:

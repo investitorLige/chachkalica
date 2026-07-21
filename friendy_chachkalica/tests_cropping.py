@@ -1,8 +1,10 @@
 import types
 import unittest
+from pathlib import Path
 
 import torch
 
+from friendy_chachkalica.config import _parse_pipeline
 from friendy_chachkalica.cropping import crop_batch
 
 from chachak.pipeline import BatchPeoplePipeline, PeopleDetectFirstPipeline
@@ -190,6 +192,35 @@ class BatchPeopleRegionsTests(unittest.TestCase):
         # Bottom-right tile starts at (50, 50) and the person fills it.
         self.assertEqual((x0, y0), (50, 50))
         self.assertEqual((w, h), (50, 50))
+
+
+class ParseExpandRatioTests(unittest.TestCase):
+    def test_expand_ratio_parsed_from_detector_block(self):
+        spec = _parse_pipeline(
+            {
+                "name": "people_detect_first",
+                "detector": {"checkpoint": "/ckpts/person.pt", "expand_ratio": 0.1},
+            },
+            Path("/tmp"),
+        )
+        self.assertAlmostEqual(spec.detector_expand_ratio, 0.1)
+
+    def test_expand_ratio_defaults_to_none_when_absent(self):
+        spec = _parse_pipeline(
+            {"name": "people_detect_first", "detector": {"checkpoint": "/ckpts/person.pt"}},
+            Path("/tmp"),
+        )
+        self.assertIsNone(spec.detector_expand_ratio)
+
+    def test_negative_expand_ratio_rejected(self):
+        with self.assertRaises(ValueError):
+            _parse_pipeline(
+                {
+                    "name": "people_detect_first",
+                    "detector": {"checkpoint": "/ckpts/person.pt", "expand_ratio": -0.1},
+                },
+                Path("/tmp"),
+            )
 
 
 if __name__ == "__main__":

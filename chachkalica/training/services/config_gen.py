@@ -23,6 +23,7 @@ from training.models import (
     ExperimentModel,
     TrainingSettings,
     default_iou_thresholds,
+    DEFAULT_PERSON_DETECTOR_CHECKPOINT,
 )
 
 
@@ -149,13 +150,19 @@ def pipeline_block(experiment: Experiment) -> dict | None:
         name == pipelines.CHAIN
         and any(c in pipelines.DETECTOR_PIPELINES for c in (experiment.chain or []))
     )
-    if experiment.detector_checkpoint:
-        detector: dict = {"checkpoint": experiment.detector_checkpoint}
+    # Existing experiments may have saved an explicit blank before the bundled
+    # person engine became the default. Use it for detector-required pipelines,
+    # while leaving ordinary tiling pipelines detector-free.
+    checkpoint = experiment.detector_checkpoint or (
+        DEFAULT_PERSON_DETECTOR_CHECKPOINT if needs_detector else ""
+    )
+    if checkpoint:
+        # Experiment paths are relative to the Django project root, while the
+        # generated YAML lives under ``configs_root``.
+        detector: dict = {"checkpoint": str(_resolve(checkpoint))}
         if experiment.detector_expand_ratio is not None:
             detector["expand_ratio"] = experiment.detector_expand_ratio
         data["detector"] = detector
-    elif needs_detector:
-        raise ValueError(f"pipeline '{name}' requires a detector checkpoint.")
 
     tiling: dict = {}
     if experiment.tile_size_px:

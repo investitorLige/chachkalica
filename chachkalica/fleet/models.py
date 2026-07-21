@@ -42,6 +42,10 @@ class FleetSettings(models.Model):
         max_length=512, default="data/target",
         help_text="Shared target mount where per-image txts + COCO are written.",
     )
+    videos_dir = models.CharField(
+        max_length=512, default="data/videos",
+        help_text="Directory holding raw video files (imported or downloaded).",
+    )
     webhook_url = models.CharField(
         max_length=512, default="http://host.docker.internal:9000",
         help_text="Base URL each container POSTs annotation events to (the /hook receiver).",
@@ -201,3 +205,40 @@ class Project(models.Model):
         if not self.title and self.dataset_id and self.annotator_id:
             self.title = project_title(self.dataset.name, self.annotator.username)
         super().save(*args, **kwargs)
+
+
+class GroundingSamRun(models.Model):
+    """One "Generate labels with Grounding SAM" job against one dataset.
+
+    Unlike Annotator/Project (a handful of status columns on a domain row),
+    this exists purely to track an in-flight job's progress — the worker
+    updates ``images_processed``/``images_labeled``/``detections_written`` as
+    it works through the dataset's batches, so the admin list can be refreshed
+    to watch a run move along instead of only learning queued/ok/error.
+    """
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    OK = "ok"
+    ERROR = "error"
+    STATUS_CHOICES = [(QUEUED, "queued"), (RUNNING, "running"), (OK, "ok"), (ERROR, "error")]
+
+    dataset = models.ForeignKey(Dataset, on_delete=models.CASCADE, related_name="grounding_sam_runs")
+    confidence = models.FloatField()
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=QUEUED)
+    error = models.TextField(blank=True)
+
+    images_total = models.PositiveIntegerField(default=0)
+    images_processed = models.PositiveIntegerField(default=0)
+    images_labeled = models.PositiveIntegerField(default=0)
+    detections_written = models.PositiveIntegerField(default=0)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.dataset.name} — {self.status}"

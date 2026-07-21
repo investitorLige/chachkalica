@@ -1,0 +1,51 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Use each dataset's <code>classes.txt</code> as text prompts for Grounding SAM and
+   write the detected boxes into its <strong>source labels/</strong> folder. Images
+   that already have a label file are left untouched — only unlabeled images are
+   filled in.</p>
+
+{% if valid %}
+<ul>
+  {% for dataset, names in valid %}
+    <li>
+      <strong>{{ dataset.name }}</strong> —
+      {% if dataset.has_labels_now %}already has some labels (unlabeled images only will be filled in){% else %}no labels yet{% endif %}
+      <br>Classes: {{ names|join:", " }}
+    </li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+{% if invalid %}
+  <p class="errornote">
+    Cannot process (no readable classes.txt), skipped:
+    {% for dataset, reason in invalid %}{{ dataset.name }} ({{ reason }}){% if not forloop.last %}, {% endif %}{% endfor %}
+  </p>
+{% endif %}
+
+{% if valid %}
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="apply" value="1">
+
+  <p>
+    <label for="confidence">Confidence threshold:</label>
+    <input type="number" name="confidence" id="confidence"
+           value="0.3" min="0" max="1" step="0.05" required>
+  </p>
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Generate labels">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+{% else %}
+  <p><a href="../" class="button cancel-link">Back</a></p>
+{% endif %}
+{% endblock %}

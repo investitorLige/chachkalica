@@ -1,5 +1,14 @@
 """Per-arch FP16 diagnostic: which archs build + keep parity at fp16, and where.
 
+⚠️ RANDOM-INIT CAVEAT: the fixtures below are UNTRAINED. Trust the ``build`` column and
+overflow findings, but NOT the ``L1`` column as a verdict on fp16 *accuracy* for the
+selection-heavy archs (rtdetr, fasterrcnn). Untrained weights make all scores ~tied, so
+top-K / NMS selection flips under any fp16 perturbation and the L1 blows up (rtdetr ~1.9,
+fasterrcnn ~0.84) — a fixture artifact, not a real defect. On trained weights fp16 parity
+is at the gate (rtdetr ~1e-4, fasterrcnn 0.012-0.035). Gate fp16 on a TRAINED checkpoint
+with ``trained_fp16_gate.py`` before flooring an arch to fp32. See [[trt-fp16-per-arch]].
+
+
 Companion to ``trt_infer/tests/test_trt_parity.py`` — reuses the same per-arch
 fixture setup (seeds / bias inits that yield confident detections) but, instead of
 asserting fp32 parity, builds each arch at **both** fp32 and fp16 and prints one

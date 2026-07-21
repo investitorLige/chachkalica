@@ -1,0 +1,26 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Delete the following eval(s), including their <strong>output directory</strong> and
+   generated <strong>request YAML</strong> on disk. This cannot be undone.</p>
+
+<ul>
+  {% for target in targets %}
+    <li>{{ target.label }} <em>({{ target.dataset }})</em></li>
+  {% endfor %}
+</ul>
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="apply" value="1">
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Yes, delete">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+{% endblock %}

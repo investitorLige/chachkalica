@@ -87,11 +87,23 @@ class PipelineRequestTests(PipelineEvalSetup):
             tile_width_pct=25, tile_height_pct=40, overlap=0.25,
         )
         req = config_gen.build_pipeline_request(pe, "/out/pipeline-3")
-        self.assertEqual(req["detector"], {"checkpoint": "/models/person.pt"})
+        # expand_ratio rides along with the detector block (default 0.10).
+        self.assertEqual(
+            req["detector"], {"checkpoint": "/models/person.pt", "expand_ratio": 0.10}
+        )
         self.assertEqual(
             req["tiling"],
             {"tile_width_pct": 25, "tile_height_pct": 40, "overlap": 0.25},
         )
+
+    def test_custom_expand_ratio_emitted(self):
+        pe = self._make(
+            pipeline=PipelineEvalRun.PEOPLE_DETECT_FIRST,
+            detector_checkpoint="/models/person.pt",
+            detector_expand_ratio=0.2,
+        )
+        req = config_gen.build_pipeline_request(pe, "/out/pipeline-5")
+        self.assertEqual(req["detector"]["expand_ratio"], 0.2)
 
     def test_chain_pipeline_carries_children(self):
         pe = self._make(

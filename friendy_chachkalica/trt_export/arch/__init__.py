@@ -43,43 +43,54 @@ def get_trt_prep(arch: str):
 # --------------------------------------------------------------------------- FP16 policy
 #
 # On strongly-typed TRT (>= 11) fp16 comes from casting the ONNX graph, applying
-# ONE op-block-list to every arch (see ``fp16_cast.py``). That blanket list is too
-# coarse for some archs. Measured top-K L1 of a plain-fp16 engine vs its own fp32
-# build (``fp16_diag.py``): yolox 9e-4 and retinanet 5e-3 are clean; but rtdetr
-# blows up to ~1.9 (its anchor mask uses ``torch.finfo.max`` ≈ 3.4e38, which
-# overflows fp16's 65504 ceiling and, once clamped, wrecks the box decode),
-# fasterrcnn to ~0.74, and rfdetr drifts to ~2.5e-2.
+# ONE op-block-list to every arch (see ``fp16_cast.py``). ``fp16_diag.py`` builds each
+# arch from a RANDOM-INIT fixture and once reported huge fp16 parity L1 for the
+# selection-heavy archs (rtdetr ~1.9, fasterrcnn ~0.84). Those were a MEASUREMENT
+# ARTIFACT, not a real fp16 defect: with untrained weights every score is ~tied, so the
+# top-K / NMS selection is a coin-flip that any fp16 perturbation flips. On a TRAINED
+# checkpoint (well-separated scores → stable selection) fp16 parity collapses to the
+# gate — measured via ``trained_fp16_gate.py``: fasterrcnn 0.012-0.035, rtdetr ~1e-4.
+# So do NOT trust fp16_diag's random-init L1 to floor an arch; gate on trained weights.
+# (yolox 9e-4 / retinanet 5e-3 / rfdetr 2.5e-2 were fine even random-init.)
 #
-# ARCH_FP16_OP_BLOCK keeps each arch's fp16-fragile op *types* in fp32 while the
-# bulk (backbone/encoder) still runs fp16. UNTRUSTED_FP16 is the safety floor:
-# archs still known-bad at fp16 build as fp32 when precision is left to auto, so a
-# default build never silently ships a broken engine. An arch graduates out of the
-# floor once its keep-list gets it under the parity gate.
+# ARCH_FP16_OP_BLOCK can still keep an arch's fp16-fragile op *types* in fp32 while the
+# bulk runs fp16. It is empty for every arch — no arch needs a keep-list once judged on
+# trained weights. UNTRUSTED_FP16 (below) is now empty too; see its note.
 ARCH_FP16_OP_BLOCK = {
-    # Populated from the fp16_diag --sweep results (minimal set that gets each arch
-    # under the parity gate). Empty = still on the fp32 floor below, sweep pending.
-    #   rtdetr:     anchor Where(finfo.max) + reference-point / box-coord decode.
-    #   fasterrcnn: two-stage box-delta decode + RPN selection math.
-    #   rfdetr:     coordinate sigmoid / ms-deform-attn sampling drift (light).
+    # Empty: no arch needs an fp32 op keep-list once fp16 is judged on trained weights
+    # (the random-init L1s that motivated these were selection-tie artifacts, above).
     "rtdetr": [],
     "fasterrcnn": [],
     "rfdetr": [],
 }
 
 # arch -> node-name SUBSTRINGS whose nodes stay fp32 (region-level keep-list, robust
-# to node re-indexing; op-type blocking is too coarse and the float16 converter
-# breaks the graph for many types — see fp16_diag sweep results). Populated from the
-# fp16_overflow_probe / node-sweep results.
-#   fasterrcnn: box_roi_pool RoIAlign coord scaling overflows fp16 (~8.9e4).
-#   rtdetr:     encoder-score + decoder head are precision-fragile (top-k selection).
+# to node re-indexing). Empty for every arch: kept as a mechanism, but no arch needs it.
+# (fasterrcnn's box_roi_pool RoIAlign coord Mul does overflow fp16 ~8.9e4, but that value
+# only picks an integer FPN level via sqrt→log2→floor, so the overflow is numerically
+# harmless — confirmed it does not affect parity.)
 ARCH_FP16_NODE_BLOCK = {
     "fasterrcnn": [],
     "rtdetr": [],
 }
 
-# Archs whose plain-fp16 output isn't trusted yet; an auto-precision build floors
-# them to fp32. Empty this per arch once its keep-list recovers fp16 parity.
-UNTRUSTED_FP16 = {"rtdetr", "fasterrcnn"}
+# Archs an auto-precision build floors to fp32 because their plain-fp16 output isn't
+# trusted. Now EMPTY: rtdetr and fasterrcnn were floored on fp16_diag's random-init L1
+# (1.9 / 0.84), which turned out to be a selection-tie artifact — on trained weights
+# their fp16 parity is at the gate (rtdetr ~1e-4, fasterrcnn 0.012-0.035, verified via
+# ``trained_fp16_gate.py``). ``precision="auto"`` now requests fp16 for every arch. If a
+# future arch is genuinely fp16-fragile on TRAINED weights (prove it with the gate, not
+# random-init diag), add it back here.
+#
+# CAVEAT — fasterrcnn fp16 needs a STATIC profile. Its EfficientNMS graph's transform
+# region computes output shapes from the input H/W; with a DYNAMIC profile (min!=max, the
+# ``resize_mode:none`` default from profile.py, 64/640/1024) the fp16 build finds no
+# tactic for those shape ops and build_engine falls back to fp32 (a log, not an error).
+# fp16 builds cleanly at any FULLY-STATIC profile (min==opt==max, e.g. 320²/640² — both
+# verified). So to actually ship fasterrcnn fp16, pin the size (min_hw==opt_hw==max_hw).
+# rtdetr is unaffected (its longest_side profile builds fp16 as-is). TODO: consider a
+# static/narrow fasterrcnn default in profile.py so auto-fp16 materializes unpinned.
+UNTRUSTED_FP16: set[str] = set()
 
 
 def get_fp16_op_block(arch: str):

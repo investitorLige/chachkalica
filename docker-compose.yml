@@ -43,6 +43,8 @@ x-app: &app
     # overrides the TrainingSettings.service_base_url DB default (localhost:8200)
     # without an admin edit.
     TRAINING_SERVICE_URL: http://trainer:8200
+    # Reach the Grounding SAM ML backend the same way.
+    SAM_BACKEND_URL: http://sam-backend:9090
   volumes:
     - ./chachkalica/data:/app/data
     - /var/run/docker.sock:/var/run/docker.sock
@@ -117,11 +119,50 @@ services:
       # SHARED FILESYSTEM note above. source/ stays writable for label promotion.
       - ./chachkalica/data:/app/data
       - ./chachkalica/data/source:/app/data/source
+      - ./models:/app/models:ro
     restart: unless-stopped
 
     # ───────────────────────────────── GPU ─────────────────────────────────
     # Requires the NVIDIA Container Toolkit on the host. Exposes the GPU(s);
     # without it, device 'auto' falls back to CPU.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  sam-backend:
+    # Grounding-DINO + SAM ML backend, folded in from its standalone
+    # ml_backends/sam/docker-compose.yml so it shares the same data mount as
+    # web/worker/trainer instead of an unrelated host path.
+    build:
+      context: ./chachkalica
+      dockerfile: ml_backends/sam/Dockerfile
+    environment:
+      SAM_CHECKPOINT: ${SAM_CHECKPOINT:-/app/models/sam_vit_b_01ec64.pth}
+      SAM_MODEL_TYPE: ${SAM_MODEL_TYPE:-vit_b}
+      SAM_DEVICE: ${SAM_DEVICE:-cuda}
+      SAM_MIN_AVAILABLE_RAM_GB: ${SAM_MIN_AVAILABLE_RAM_GB:-6}
+      # Same tree as web/worker/trainer (see SHARED FILESYSTEM note above), so
+      # a dataset image's meta.local_path can be a plain path relative to it.
+      SAM_DATA_ROOT: /app/data
+      SAM_OUTPUT: polygon
+      MODEL_DIR: /tmp/label-studio-ml
+      AUTO_UPDATE: ""
+    ports:
+      - "${SAM_HOST_PORT:-9090}:9090"
+    volumes:
+      - ./chachkalica/data:/app/data
+      # Not read-only: entrypoint.sh downloads the checkpoint here on first
+      # boot if it's missing. Same repo-root models/ dir the trainer mounts.
+      - ./models:/app/models
+    restart: unless-stopped
+    # ───────────────────────────────── GPU ─────────────────────────────────
+    # Shares the box's GPU with `trainer` — fine unless both run heavy work at
+    # the same time. Falls back to CPU automatically if no GPU is present
+    # (sam_ml_backend.py checks torch.cuda.is_available()).
     deploy:
       resources:
         reservations:

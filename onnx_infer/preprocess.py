@@ -10,6 +10,10 @@ Resizing uses an ``align_corners=False`` half-pixel bilinear that matches
 parity with the training adapters. Archs where exact resize parity is critical
 may instead bake the resize into the graph (``resize_mode: none``) — this module
 supports both.
+
+``meta.layout == "bgr"`` reverses the channel axis before any scaling/resize —
+for checkpoints trained outside this repo's own RGB convention (e.g. a raw
+Megvii YOLOX checkpoint, whose native preprocessing is BGR/letterbox/[0,255]).
 """
 
 from __future__ import annotations
@@ -44,6 +48,9 @@ def preprocess(image_chw: np.ndarray, meta: ModelMeta) -> tuple[np.ndarray, Tran
     orig_h, orig_w = int(image_chw.shape[1]), int(image_chw.shape[2])
     spec = meta.input
     img = np.ascontiguousarray(image_chw, dtype=np.float32)
+
+    if meta.layout == "bgr":
+        img = np.ascontiguousarray(img[::-1, :, :])
 
     if spec.input_scale == "byte":
         img = img * 255.0

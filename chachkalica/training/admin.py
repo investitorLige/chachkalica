@@ -830,12 +830,17 @@ class TrainedModelAdmin(admin.ModelAdmin):
                 return float(raw) if raw else None
 
             chain = [c.strip() for c in (request.POST.get("chain") or "").split(",") if c.strip()]
+            # Non-null field: fall back to the model default when the form omits it
+            # (a legitimate 0.0 must survive, so test for None explicitly).
+            expand_ratio = _float("detector_expand_ratio")
+            if expand_ratio is None:
+                expand_ratio = PipelineEvalRun._meta.get_field("detector_expand_ratio").get_default()
             pe = PipelineEvalRun.objects.create(
                 trained_model=model, dataset=dataset, label_source=label_source,
                 annotator=annotator, explicit_labels_path=explicit,
                 pipeline=pipeline,
                 detector_checkpoint=(request.POST.get("detector_checkpoint") or "").strip(),
-                detector_expand_ratio=_float("detector_expand_ratio"),
+                detector_expand_ratio=expand_ratio,
                 tile_width_pct=_float("tile_width_pct"),
                 tile_height_pct=_float("tile_height_pct"),
                 overlap=_float("overlap"),
@@ -896,6 +901,7 @@ class TrainedModelAdmin(admin.ModelAdmin):
         return {
             "pipeline": experiment.pipeline,
             "detector_checkpoint": experiment.detector_checkpoint,
+            "detector_expand_ratio": experiment.detector_expand_ratio,
             "tile_width_pct": experiment.tile_width_pct,
             "tile_height_pct": experiment.tile_height_pct,
             "overlap": experiment.overlap,
@@ -1084,22 +1090,54 @@ class TrainedModelAdmin(admin.ModelAdmin):
             precision = (request.POST.get("precision") or "fp16").strip()
             if precision not in ("fp16", "fp32"):
                 precision = "fp16"
+            # Optional static input size ("640" or "640x640"): pins a fixed engine
+            # profile (min==opt==max), which is how Faster R-CNN gets FP16.
+            input_size = (request.POST.get("input_size") or "").strip()
+            input_hw = None
+            if input_size:
+                parts = input_size.lower().replace("×", "x").split("x")
+                try:
+                    dims = [int(p) for p in parts]
+                    if len(dims) == 1:
+                        input_hw = (dims[0], dims[0])
+                    elif len(dims) == 2:
+                        input_hw = (dims[0], dims[1])
+                    else:
+                        raise ValueError
+                    if any(d <= 0 for d in input_hw):
+                        raise ValueError
+                except ValueError:
+                    self.message_user(
+                        request,
+                        f"Invalid input size {input_size!r}; use a number (e.g. 640) or HxW "
+                        f"(e.g. 640x640).", level=messages.WARNING)
+                    return None
             out_dir = config_gen._resolve(output_dir)
             stem = self._onnx_stem(model.name)
             exported = 0
             for label, checkpoint in checkpoints:
                 engine_path = out_dir / f"{stem}-{label}.engine"
                 try:
-                    result = runner.export_trt(checkpoint, engine_path, precision=precision)
+                    result = runner.export_trt(
+                        checkpoint, engine_path, precision=precision, input_hw=input_hw)
                 except Exception as exc:  # noqa: BLE001 - surface service/network errors
                     self.message_user(
                         request, f"{label} ({checkpoint}): {exc}", level=messages.ERROR)
                     continue
                 exported += 1
+                built = result.get("precision", precision)
                 self.message_user(
                     request,
                     f"Built {label} → {result.get('engine_path')} "
-                    f"(+ {Path(result.get('meta_path', '')).name}).")
+                    f"(+ {Path(result.get('meta_path', '')).name}) [{built}].")
+                # Loud warning when an fp16 request silently downgraded — for
+                # Faster R-CNN this means the input size wasn't pinned.
+                if precision == "fp16" and built != "fp16":
+                    self.message_user(
+                        request,
+                        f"{label}: requested FP16 but built {built.upper()} (the FP16 build "
+                        f"produced no engine). For Faster R-CNN, set a static Input size to "
+                        f"get FP16.", level=messages.WARNING)
             if exported:
                 self.message_user(
                     request, f"Built {exported} engine(s) for {model.name} ({precision}).")

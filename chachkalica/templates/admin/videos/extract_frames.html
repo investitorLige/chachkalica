@@ -1,0 +1,94 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Extract frames from <strong>{{ video.name }}</strong> into a new dataset.</p>
+<p class="help">Frames are sampled every N frames and saved as
+<code>&lt;dataset&gt;/images/&lt;video&gt;_frame_&lt;NNN&gt;&lt;ext&gt;</code>; the class names
+below are written verbatim to <code>&lt;dataset&gt;/classes.txt</code>. The new dataset shows
+up in the Dataset tab as soon as extraction finishes — no separate import step.</p>
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="apply" value="1">
+
+  <div class="form-row">
+    <label for="dataset_name">Dataset name:</label>
+    <input type="text" name="dataset_name" id="dataset_name" size="40"
+           value="{{ suggested_name }}" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" required>
+    <p class="help">Directory created under the source root; letters, digits, <code>.</code>,
+    <code>_</code>, <code>-</code> only.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="every_n_frames">Every N frames:</label>
+    <input type="number" name="every_n_frames" id="every_n_frames" min="1" value="30" required>
+    <p class="help">Save one frame out of every N.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="max_frames_per_video">Max frames:</label>
+    <input type="number" name="max_frames_per_video" id="max_frames_per_video" min="1">
+    <p class="help">Optional cap on the number of frames saved.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="image_ext">Image format:</label>
+    <select name="image_ext" id="image_ext">
+      <option value=".jpg" selected>.jpg</option>
+      <option value=".png">.png</option>
+    </select>
+  </div>
+
+  <div class="form-row">
+    <label for="classes">Classes:</label>
+    <textarea name="classes" id="classes" rows="6" cols="40"
+              placeholder="one class per line" required></textarea>
+    <p class="help">One class name per line — written to <code>classes.txt</code> for
+    labeling this dataset later.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="only_with_people">
+      <input type="checkbox" name="only_with_people" id="only_with_people" value="1">
+      Only keep frames with people
+    </label>
+    <p class="help">Runs each extracted frame through the people-detector model and drops
+    frames with no person detected.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="remove_similar_frames">
+      <input type="checkbox" name="remove_similar_frames" id="remove_similar_frames" value="1">
+      Remove similar frames
+    </label>
+  </div>
+
+  <div class="form-row" id="similarity_threshold_row" style="display:none">
+    <label for="similarity_threshold">Similarity threshold:</label>
+    <input type="number" name="similarity_threshold" id="similarity_threshold"
+           min="0" max="64" value="5">
+    <p class="help">Perceptual-hash Hamming distance (0-64) at or below which a frame is
+    dropped as a near-duplicate of the previously kept frame. Lower = stricter (fewer
+    frames removed).</p>
+  </div>
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Extract frames">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+
+<script>
+(function () {
+  var toggle = document.getElementById("remove_similar_frames");
+  var row = document.getElementById("similarity_threshold_row");
+  function sync() { row.style.display = toggle.checked ? "" : "none"; }
+  toggle.addEventListener("change", sync);
+  sync();
+})();
+</script>
+{% endblock %}

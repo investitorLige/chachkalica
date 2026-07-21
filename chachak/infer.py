@@ -37,6 +37,14 @@ def load_checkpoint_adapter(checkpoint_path: Union[str, Path], device) -> tuple:
     """
     checkpoint_path = Path(checkpoint_path)
 
+    # TensorRT engines are complete inference artifacts rather than torch
+    # checkpoints. Their loader reads the matching ``<name>.meta.json``.
+    if checkpoint_path.suffix.lower() == ".engine":
+        print(f"[chachak] Using TensorRT engine: {checkpoint_path}")
+        from trt_infer import load_trt_adapter
+
+        return load_trt_adapter(checkpoint_path, device)
+
     # Prefer an architecture-free ONNX artifact exported next to the checkpoint
     # (``best.onnx`` + ``best.meta.json``). It runs via onnxruntime without
     # rebuilding the model, so none of the training-arch packages are needed.

@@ -959,13 +959,6 @@ def evaluate_map(
     finally:
         adapter.train(was_training)
 
-    if not compute_metrics:
-        return {
-            "prediction_only": True,
-            "evaluated_at": started_at.isoformat(timespec="seconds"),
-            "eval_seconds": round(time.perf_counter() - start_perf, 3),
-        }
-
     metrics = evaluate_detection(
         all_predictions,
         all_targets,

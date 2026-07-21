@@ -73,6 +73,15 @@ only that pipeline's fields are shown.</p>
     includes them); the pipeline crops around detected people before running the model.</p>
   </div>
 
+  <div class="form-row" data-pipelines="{{ detector_pipelines }} {{ chain_pipelines }}">
+    <label for="detector_expand_ratio">Person-box expand ratio:</label>
+    <input type="number" step="0.01" min="0" name="detector_expand_ratio" id="detector_expand_ratio"
+           value="{{ pipeline_defaults.detector_expand_ratio|default:'0.10' }}">
+    <p class="help">Grow each detected person box by this fraction before cropping
+    (<code>0.10</code> = +10% width and height, 5% per side; <code>0</code> crops the box
+    exactly). Set this to the value the model was trained with.</p>
+  </div>
+
   <div class="form-row" data-pipelines="{{ chain_pipelines }}">
     <label for="chain">Chain:</label>
     <input type="text" name="chain" id="chain" size="60"

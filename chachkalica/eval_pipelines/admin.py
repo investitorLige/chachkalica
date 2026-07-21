@@ -227,7 +227,8 @@ class PipelineEvalRunAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmi
     actions = ["analyze_selected", "launch_selected", "reconcile_selected", "promote_labels"]
     readonly_fields = [
         "trained_model", "dataset", "label_source", "annotator", "explicit_labels_path",
-        "pipeline", "detector_checkpoint", "tile_width_pct", "tile_height_pct", "overlap", "chain",
+        "pipeline", "detector_checkpoint", "detector_expand_ratio",
+        "tile_width_pct", "tile_height_pct", "overlap", "chain",
         "score_threshold",
         "status", "request_yaml_path", "output_dir", "metrics", "last_error",
         "started_at", "finished_at", "created_at",
@@ -276,7 +277,8 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
                     "map50", "map50_95", "eval_time", "created_at"]
     list_display_links = None
     list_filter = ["status", "pipeline", "trained_model"]
-    actions = ["analyze_selected", "launch_selected", "reconcile_selected", "promote_labels"]
+    actions = ["analyze_selected", "launch_selected", "reconcile_selected", "promote_labels",
+               "delete_selected_evals"]
 
     def has_add_permission(self, request):
         return False
@@ -320,6 +322,35 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
             outcome = (reconcile.reconcile_eval(eval_obj) if kind == "base"
                        else reconcile.reconcile_pipeline(eval_obj))
             self.message_user(request, f"{kind} eval #{eval_obj.pk}: {outcome}")
+
+    @admin.action(description="Delete selected eval(s) and their generated files…")
+    def delete_selected_evals(self, request, queryset):
+        """Delete the real base/pipeline eval(s) behind selected combined rows.
+
+        This view is otherwise read-only (see :meth:`has_delete_permission`), so
+        it's the one place that needs its own delete action. Deleting the real
+        row fires the post_delete cleanup signal (``training.signals`` for base
+        evals, ``eval_pipelines.signals`` for pipeline evals), which removes the
+        run's output dir and generated request YAML from disk.
+        """
+        targets = [self._promote_target(obj) for obj in queryset]
+
+        if request.POST.get("apply"):
+            for eval_obj, kind in targets:
+                label = f"{kind} eval #{eval_obj.pk}"
+                eval_obj.delete()
+                self.message_user(request, f"Deleted {label} and its generated files.")
+            return None
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Delete selected eval(s)",
+            "targets": [{"label": str(o), "dataset": o.dataset.name} for o, _ in targets],
+            "action": "delete_selected_evals",
+            "selected": [str(o.pk) for o in queryset],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+        }
+        return TemplateResponse(request, "admin/eval_pipelines/delete_evals.html", context)
 
 
 # One admin list per pipeline type, all sharing the behaviour above. Each proxy's

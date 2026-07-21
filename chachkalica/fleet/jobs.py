@@ -10,8 +10,9 @@ Admin actions and management commands enqueue these via ``django_rq``.
 
 from django.utils import timezone
 
-from fleet.models import Annotator, Dataset, Project
+from fleet.models import Annotator, Dataset, GroundingSamRun, Project
 from fleet.services import datasets as datasets_svc
+from fleet.services import grounding_sam as grounding_sam_svc
 from fleet.services import merge as merge_svc
 from fleet.services import provisioning, sync as sync_svc
 
@@ -90,6 +91,33 @@ def setup_and_sync_project(dataset_id: int, annotator_id: int) -> dict:
     if project and project.ls_project_id is not None:
         return sync_project(project.id)
     return setup_result
+
+
+def generate_grounding_sam_labels(run_id: int) -> dict:
+    """Auto-label a dataset's unlabeled images via the Grounding SAM backend.
+
+    The run row is updated (queued -> running -> ok/error) around the call;
+    progress counters (images_processed/images_labeled/detections_written)
+    are updated by the service itself as it works through each batch.
+    """
+    run = GroundingSamRun.objects.get(pk=run_id)
+    run.status = GroundingSamRun.RUNNING
+    run.started_at = timezone.now()
+    run.save(update_fields=["status", "started_at"])
+    try:
+        result = grounding_sam_svc.generate_labels_for_dataset(
+            run.dataset, confidence=run.confidence, run=run
+        )
+    except Exception as exc:
+        run.status = GroundingSamRun.ERROR
+        run.error = str(exc)
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "error", "finished_at"])
+        raise
+    run.status = GroundingSamRun.OK
+    run.finished_at = timezone.now()
+    run.save(update_fields=["status", "finished_at"])
+    return result
 
 
 def merge_datasets(dataset_ids: list[int], new_name: str) -> dict:

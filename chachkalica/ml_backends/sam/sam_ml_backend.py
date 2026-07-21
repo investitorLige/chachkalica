@@ -99,7 +99,11 @@ class SAMBackend(LabelStudioMLBase):
         grounding_sam_prompt = params.get("grounding_sam")
         if grounding_sam_prompt:
             print("SAMBackend dispatch=grounding_sam", flush=True)
-            return self.predict_grounding_sam(tasks, prompt=grounding_sam_prompt)
+            return self.predict_grounding_sam(
+                tasks,
+                prompt=grounding_sam_prompt,
+                confidence=params.get("grounding_sam_confidence"),
+            )
 
         print("SAMBackend dispatch=empty", flush=True)
         return [empty_prediction(self.model_version)]
@@ -156,15 +160,16 @@ class SAMBackend(LabelStudioMLBase):
             "model_version": self.model_version,
         }]
 
-    def predict_grounding_sam(self, tasks, *, prompt: str):
+    def predict_grounding_sam(self, tasks, *, prompt: str, confidence: float | None = None):
         class_names = parse_grounding_sam_prompt(prompt)
         if not class_names:
             print("SAMBackend grounding_sam empty_prompt", flush=True)
             return [empty_prediction(self.grounding_sam_model_version) for _ in tasks]
 
+        conf = confidence if confidence is not None else self.grounding_sam_confidence
         print(
             "SAMBackend grounding_sam start "
-            f"tasks={len(tasks)} classes={class_names} confidence={self.grounding_sam_confidence}",
+            f"tasks={len(tasks)} classes={class_names} confidence={conf}",
             flush=True,
         )
         model = self._ensure_grounding_sam_model()
@@ -187,6 +192,7 @@ class SAMBackend(LabelStudioMLBase):
                     image_width=image_width,
                     image_height=image_height,
                     class_name=class_name,
+                    confidence=conf,
                 )
                 results.extend(class_results)
                 scores.extend(class_scores)
@@ -232,6 +238,7 @@ class SAMBackend(LabelStudioMLBase):
         image_width: int,
         image_height: int,
         class_name: str,
+        confidence: float,
     ) -> tuple[list[dict], list[float]]:
         from PIL import Image
 
@@ -242,7 +249,7 @@ class SAMBackend(LabelStudioMLBase):
             model=model,
             image_pil=image_pil,
             text_prompt=f"{class_name}.",
-            confidence=self.grounding_sam_confidence,
+            confidence=confidence,
         )
         _, mask_scores, masks = extract_prediction_parts(prediction)
         if not masks:
@@ -252,7 +259,7 @@ class SAMBackend(LabelStudioMLBase):
         scores = []
         for index, mask in enumerate(masks):
             score = scalar_value(mask_scores[index]) if index < len(mask_scores) else None
-            if score is not None and score < self.grounding_sam_confidence:
+            if score is not None and score < confidence:
                 continue
             result_score = score if score is not None else 1.0
             results.extend(mask_to_result(
