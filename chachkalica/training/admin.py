@@ -171,6 +171,7 @@ class ExperimentAdmin(admin.ModelAdmin):
             "Training / Eval pipeline",
             {
                 "fields": ["pipeline", "detector_checkpoint", "detector_expand_ratio",
+                           "detector_min_box_size",
                            "tile_size_px", "tile_width_pct", "tile_height_pct", "overlap",
                            "merge_nms_iou"],
                 "description": "Optionally run train, val, and test through a chachak "

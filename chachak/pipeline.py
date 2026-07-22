@@ -130,9 +130,14 @@ class Pipeline:
         the frame. Shared by inference (:meth:`_crop_infer_remap`) and by
         training-time cropping (``friendy_chachkalica.cropping.crop_batch``) so
         the model sees the exact same crops in both regimes. Zero-area crops are
-        skipped; a frame with no person detections yields an empty list.
+        skipped, as are crops narrower or shorter than ``detector.min_box_size``
+        (the same floor already applied to merged detections at inference, so a
+        person box too small to be a valid detection is equally too small to
+        become a training crop); a frame with no person detections yields an
+        empty list.
         """
         config = self.config
+        min_box_size = config.detector.min_box_size
         person_boxes = self._person_boxes(images)
         regions: List[List[tuple]] = []
         for image, boxes in zip(images, person_boxes):
@@ -142,6 +147,8 @@ class Pipeline:
                 expanded = expand_box(box, config.detector.expand_ratio, frame_w, frame_h)
                 crop, offset, (crop_w, crop_h) = crop_image(image, expanded)
                 if crop_w < 1 or crop_h < 1:
+                    continue
+                if min_box_size > 0 and (crop_w < min_box_size or crop_h < min_box_size):
                     continue
                 frame_regions.append((crop, offset, (crop_w, crop_h)))
             regions.append(frame_regions)
