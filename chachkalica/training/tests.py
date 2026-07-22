@@ -17,6 +17,7 @@ from django.test import TestCase
 from fleet.models import Annotator, Dataset, FleetSettings
 from training import admin as training_admin
 from training import model_specs
+from training import pipelines
 from training.forms import ExperimentModelForm
 from training.models import (
     EvalRun,
@@ -105,6 +106,45 @@ class ConfigGenTests(TestCase):
         m.save()
         # An explicit path in params wins; the checkbox does not clobber it.
         self.assertEqual(config_gen.model_entry(m)["weights"], "/ckpts/custom.pth")
+
+    def test_people_detect_first_injects_rtdetr_num_queries_default(self):
+        self.exp.pipeline = pipelines.PEOPLE_DETECT_FIRST
+        self.exp.save()
+        m = ExperimentModel.objects.create(experiment=self.exp, arch=ExperimentModel.RTDETR)
+        entry = config_gen.model_entry(m, pipeline_name=self.exp.pipeline)
+        self.assertEqual(
+            entry["num_queries"], config_gen.PEOPLE_DETECT_FIRST_RTDETR_NUM_QUERIES_DEFAULT
+        )
+
+    def test_explicit_num_queries_overrides_people_detect_first_default(self):
+        self.exp.pipeline = pipelines.PEOPLE_DETECT_FIRST
+        self.exp.save()
+        m = ExperimentModel.objects.create(
+            experiment=self.exp, arch=ExperimentModel.RTDETR, params={"num_queries": 10},
+        )
+        self.assertEqual(config_gen.model_entry(m, pipeline_name=self.exp.pipeline)["num_queries"], 10)
+
+    def test_num_queries_not_injected_off_people_detect_first(self):
+        # Blank pipeline, and batch_people: rtdetr keeps its own (HF) default.
+        m = ExperimentModel.objects.create(experiment=self.exp, arch=ExperimentModel.RTDETR)
+        self.assertNotIn("num_queries", config_gen.model_entry(m, pipeline_name=self.exp.pipeline))
+
+        self.exp.pipeline = pipelines.BATCH_PEOPLE
+        self.exp.save()
+        self.assertNotIn("num_queries", config_gen.model_entry(m, pipeline_name=self.exp.pipeline))
+
+    def test_min_box_size_only_emitted_for_people_detect_first(self):
+        self.exp.pipeline = pipelines.PEOPLE_DETECT_FIRST
+        self.exp.save()
+        data = config_gen.build_experiment_dict(self.exp, "/out/exp1")
+        self.assertEqual(
+            data["pipeline"]["detector"]["min_box_size"], self.exp.detector_min_box_size
+        )
+
+        self.exp.pipeline = pipelines.BATCH_PEOPLE
+        self.exp.save()
+        data = config_gen.build_experiment_dict(self.exp, "/out/exp1")
+        self.assertNotIn("min_box_size", data["pipeline"]["detector"])
 
     def test_label_dir_source_vs_annotator(self):
         ed = self.exp.datasets.first()

@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import yaml
@@ -96,6 +96,26 @@ def _pipeline_needs_detector(spec: Any) -> bool:
     if spec.name == "chain":
         return any(c in {"people_detect_first", "batch_people"} for c in spec.chain)
     return False
+
+
+def _chunk_ranges(n: int, micro_bs: int, avoid_singleton: bool) -> List[Tuple[int, int]]:
+    """Split ``n`` samples into ``(start, end)`` micro-batches of size ``micro_bs``.
+
+    Person-crop pipelines run the frozen person detector per frame, so the
+    number of crops in an expanded batch is unpredictable and can leave a
+    trailing chunk of exactly 1 sample -- BatchNorm (e.g. YOLOX's backbone)
+    cannot train on a single sample and raises. When ``avoid_singleton`` is set,
+    that trailing singleton is merged into the previous chunk instead, or the
+    step is skipped entirely if the whole batch is just 1 sample. Tiling
+    pipelines produce a deterministic tile count and don't need this.
+    """
+    if n == 0 or (avoid_singleton and n == 1):
+        return []
+    bounds = [(start, min(start + micro_bs, n)) for start in range(0, n, micro_bs)]
+    if avoid_singleton and len(bounds) > 1 and bounds[-1][1] - bounds[-1][0] == 1:
+        (prev_start, _), (_, end) = bounds[-2], bounds[-1]
+        bounds[-2:] = [(prev_start, end)]
+    return bounds
 
 
 def _transform_train_batch(
@@ -816,6 +836,7 @@ def train_one_epoch(
     # batch_size micro-batches, each its own optimizer step, to keep per-step
     # memory in line with untransformed training.
     transform = config.pipeline is not None and config.pipeline.name in _TRAINABLE_PIPELINES
+    needs_detector = config.pipeline is not None and _pipeline_needs_detector(config.pipeline)
     micro_bs = max(1, config.training.batch_size)
 
     for images, targets in loader:
@@ -826,9 +847,9 @@ def train_one_epoch(
             if not images:
                 continue  # nothing to train on (all background / no detections)
 
-        for start in range(0, len(images), micro_bs):
-            chunk_images = images[start : start + micro_bs]
-            chunk_targets = targets[start : start + micro_bs]
+        for start, end in _chunk_ranges(len(images), micro_bs, avoid_singleton=needs_detector):
+            chunk_images = images[start:end]
+            chunk_targets = targets[start:end]
             optimizer.zero_grad(set_to_none=True)
 
             with _autocast_context(config, device, adapter):
@@ -882,6 +903,7 @@ def evaluate_loss(
     loss_totals: Dict[str, float] = {}
 
     transform = config.pipeline is not None and config.pipeline.name in _TRAINABLE_PIPELINES
+    needs_detector = config.pipeline is not None and _pipeline_needs_detector(config.pipeline)
     micro_bs = max(1, config.evaluation.batch_size or config.training.batch_size)
 
     for images, targets in loader:
@@ -892,9 +914,9 @@ def evaluate_loss(
             if not images:
                 continue
 
-        for start in range(0, len(images), micro_bs):
-            chunk_images = images[start : start + micro_bs]
-            chunk_targets = targets[start : start + micro_bs]
+        for start, end in _chunk_ranges(len(images), micro_bs, avoid_singleton=needs_detector):
+            chunk_images = images[start:end]
+            chunk_targets = targets[start:end]
             loss_step = getattr(adapter, "validation_step", adapter.training_step)
             with _autocast_context(config, device, adapter):
                 loss, loss_items = loss_step(chunk_images, chunk_targets)
