@@ -105,13 +105,32 @@ def augmentation_entry(exp_dataset: ExperimentDataset) -> dict:
     return augmentation
 
 
-def model_entry(exp_model: ExperimentModel) -> dict:
+# rtdetr's encoder does topk(num_queries) over its last feature map, which has
+# (padded_crop_size / 32)^2 tokens; HF's own default (300) assumes near-full-frame
+# inputs and reliably crashes ("selected index k out of range") on the small
+# person crops people_detect_first produces. 25 pairs with
+# Experiment.detector_min_box_size's default (224px, >= 49 tokens) with margin,
+# and comfortably covers the handful of PPE items expected on one person crop.
+# Only injected for people_detect_first (see model_entry) — other pipelines
+# don't hit this mismatch (batch_people's tiles are already sized generously;
+# full-frame training was never undersized to begin with).
+PEOPLE_DETECT_FIRST_RTDETR_NUM_QUERIES_DEFAULT = 25
+
+
+def model_entry(exp_model: ExperimentModel, pipeline_name: str | None = None) -> dict:
     """Build one YAML model entry; our name/num_classes win over params.
 
     The ``pretrained`` checkbox maps to ``weights: true`` — every adapter reads
     ``weights=True`` as "load the published COCO-pretrained weights" (retinanet,
     rtdetr, yolox, rfdetr, fasterrcnn). An explicit ``weights`` in ``params`` (e.g. a
     path or URL) is left untouched and wins over the checkbox.
+
+    ``pipeline_name`` is the owning experiment's pipeline, passed by
+    :func:`build_experiment_dict` (``None`` for standalone/test callers, which
+    skips the injection below). For an rtdetr model on people_detect_first, an
+    explicit ``params["num_queries"]`` always wins; otherwise
+    :data:`PEOPLE_DETECT_FIRST_RTDETR_NUM_QUERIES_DEFAULT` is injected so the
+    run doesn't crash on RT-DETR's un-cropped-frame default of 300.
     """
     params = dict(exp_model.params or {})
     entry = {
@@ -121,6 +140,12 @@ def model_entry(exp_model: ExperimentModel) -> dict:
     }
     if exp_model.pretrained and "weights" not in params:
         entry["weights"] = True
+    if (
+        exp_model.arch == ExperimentModel.RTDETR
+        and pipeline_name == pipelines.PEOPLE_DETECT_FIRST
+        and "num_queries" not in params
+    ):
+        entry["num_queries"] = PEOPLE_DETECT_FIRST_RTDETR_NUM_QUERIES_DEFAULT
     return entry
 
 
@@ -136,6 +161,12 @@ def pipeline_block(experiment: Experiment) -> dict | None:
     Emits only non-blank knobs so chachak's own defaults apply where the operator
     left a field empty. Raises ``ValueError`` when a detector-requiring pipeline
     has no detector checkpoint (mirrors ``build_pipeline_request``).
+
+    ``detector.min_box_size`` (from ``experiment.detector_min_box_size``) is only
+    emitted for people_detect_first, not batch_people — see
+    ``Experiment.detector_min_box_size``'s help text for why the floor exists and
+    why it's scoped this narrowly (paired with the ``num_queries`` default
+    :func:`model_entry` injects for rtdetr on the same pipeline).
     """
     name = experiment.pipeline
     if not name:
@@ -162,6 +193,13 @@ def pipeline_block(experiment: Experiment) -> dict | None:
         detector: dict = {"checkpoint": str(_resolve(checkpoint))}
         if experiment.detector_expand_ratio is not None:
             detector["expand_ratio"] = experiment.detector_expand_ratio
+        # min_box_size is only emitted for people_detect_first, not batch_people:
+        # batch_people's person crops come from fixed-size tiles, so they don't
+        # shrink to the degenerate sizes people_detect_first can produce (a person
+        # detected small/at the frame edge, with no tiling floor under it). See
+        # Experiment.detector_min_box_size's help text for why this floor exists.
+        if name == pipelines.PEOPLE_DETECT_FIRST and experiment.detector_min_box_size:
+            detector["min_box_size"] = experiment.detector_min_box_size
         data["detector"] = detector
 
     tiling: dict = {}
@@ -216,7 +254,7 @@ def build_experiment_dict(experiment: Experiment, output_dir: Path | str) -> dic
         "name": experiment.name,
         "output_dir": str(output_dir),
         "datasets": datasets,
-        "models": [model_entry(m) for m in models],
+        "models": [model_entry(m, pipeline_name=experiment.pipeline) for m in models],
         "training": {
             "epochs": experiment.epochs,
             "batch_size": experiment.batch_size,

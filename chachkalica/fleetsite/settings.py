@@ -60,6 +60,7 @@ INSTALLED_APPS = [
     "training",
     "eval_pipelines",
     "videos",
+    "cameras",
 ]
 
 MIDDLEWARE = [
