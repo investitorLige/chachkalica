@@ -11,6 +11,7 @@ weight values).
 
 from __future__ import annotations
 
+import gc
 import json
 import sys
 import time
@@ -25,16 +26,17 @@ if str(_REPO_ROOT) not in sys.path:
 import torch
 
 try:
-    from .gpu_monitor import GpuMonitor
+    from .gpu_monitor import GpuMonitor, read_current_mem_mb
     from .variants import ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec
 except ImportError:  # run as a flat script
-    from gpu_monitor import GpuMonitor  # type: ignore
+    from gpu_monitor import GpuMonitor, read_current_mem_mb  # type: ignore
     from variants import ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec  # type: ignore
 
 METRIC_ROW_ORDER = [
     "status",
     "status_reason",
     "nms_status",
+    "engine_precision",
     "eval_seconds",
     "inference_seconds",
     "fps",
@@ -43,11 +45,27 @@ METRIC_ROW_ORDER = [
     "gpu_util_pct_peak",
 ]
 
+# Archs whose default TensorRT profile is dynamic (a wide min/opt/max range) --
+# fasterrcnn (resize_mode "none") and rtdetr (resize_mode "longest_side") both
+# get a wide, non-degenerate min!=max profile from profile.py unless overridden,
+# which is the one combination TensorRT's fp16 cast can't compile (a Myelin
+# dynamic-shape/fp16 type mismatch). A static profile (min==opt==max) builds
+# fp16 clean. Since every benchmark cell only ever times ONE fixed image_size
+# anyway, pinning the engine profile to it is strictly more representative of
+# what's timed -- not just a fp16 workaround.
+#
+# rtdetr was added here after the sweep showed it falling back to fp32 on
+# EVERY variant despite trt_export/arch/__init__.py's UNTRUSTED_FP16 comment
+# claiming "rtdetr is unaffected (its longest_side profile builds fp16
+# as-is)" -- that comment is stale relative to observed behavior; verify here
+# whether pinning the profile actually fixes it.
+ARCHS_NEEDING_STATIC_FP16_PROFILE = {"fasterrcnn", "rtdetr"}
+
 
 def _build_rtdetr_variant(repo_id: str, num_classes: int):
     """Config-only fetch (small ``config.json``) + fresh random-init build.
 
-    Bypasses ``friendy_chachkalica.adapters.rtdetr.build_rtdetr``'s
+    Bypasses ``friendy_chachkalica.ml.adapters.rtdetr.build_rtdetr``'s
     ``weights=repo_id`` branch, which calls
     ``RTDetrForObjectDetection.from_pretrained(repo_id)`` and downloads the
     full pretrained weight tensors (100s of MB) -- unlike every other arch in
@@ -60,7 +78,7 @@ def _build_rtdetr_variant(repo_id: str, num_classes: int):
     """
     from transformers import RTDetrConfig, RTDetrForObjectDetection, RTDetrImageProcessor
 
-    from friendy_chachkalica.adapters.rtdetr import RTDETRAdapter
+    from friendy_chachkalica.ml.adapters.rtdetr import RTDETRAdapter
 
     id2label = {class_id: str(class_id) for class_id in range(num_classes)}
     label2id = {name: class_id for class_id, name in id2label.items()}
@@ -112,7 +130,7 @@ def export_onnx_artifact(
     if onnx_path.exists() and meta_path.exists() and not force_rebuild:
         return onnx_path
 
-    from friendy_chachkalica.onnx_export.registry import get_exporter
+    from friendy_chachkalica.ml.onnx_export.registry import get_exporter
 
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
     class_map = {i: str(i) for i in range(num_classes)}
@@ -131,6 +149,50 @@ def export_onnx_artifact(
     return onnx_path
 
 
+def _engine_cache_matches(
+    engine_path: Path, onnx_path: Path, precision: str, static_hw: Optional[tuple]
+) -> bool:
+    """True if a cached ``.engine`` was already built for this exact precision +
+    profile request, so it's safe to reuse without rebuilding.
+
+    ``export_engine_artifact`` used to treat "the file exists" as "the cache is
+    valid" -- but a ``bench_out/`` reused across runs with a different
+    ``--image-size``/``--precision`` would then silently keep serving an engine
+    built for the OLD request, mislabeling its ``engine_precision`` in the CSV
+    with no warning (this is exactly how one run's ``fasterrcnn/
+    mobilenet_v3_large_320_fpn`` cell reported a lone stale fp32 while its
+    sibling variants, rebuilt fresh, reported fp16). Compare against the
+    ``.engine.json`` provenance sidecar instead of just checking existence.
+    """
+    provenance_path = Path(str(engine_path) + ".json")
+    if not provenance_path.exists():
+        return False
+    try:
+        provenance = json.loads(provenance_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    if provenance.get("requested_precision") != precision:
+        return False
+
+    from friendy_chachkalica.ml.trt_export.profile import profile_from_meta
+
+    meta_path = onnx_path.with_suffix(".meta.json")
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    expected_min, expected_opt, expected_max = profile_from_meta(
+        meta, min_hw=static_hw, opt_hw=static_hw, max_hw=static_hw
+    )
+    recorded_profile = provenance.get("profile", {})
+    return (
+        list(recorded_profile.get("min", [])) == list(expected_min)
+        and list(recorded_profile.get("opt", [])) == list(expected_opt)
+        and list(recorded_profile.get("max", [])) == list(expected_max)
+    )
+
+
 def export_engine_artifact(
     arch: str,
     variant: VariantSpec,
@@ -139,16 +201,24 @@ def export_engine_artifact(
     output_dir: Path,
     precision: str,
     workspace_gb: float,
+    image_size: int,
     force_rebuild: bool,
 ) -> Optional[Path]:
     if arch in NO_TRT_ARCHS:
         return None
 
     engine_path = output_dir / arch / f"{variant.name}.engine"
-    if engine_path.exists() and not force_rebuild:
-        return engine_path
+    static_hw = (image_size, image_size) if arch in ARCHS_NEEDING_STATIC_FP16_PROFILE else None
 
-    from friendy_chachkalica.trt_export.cli import build_engine
+    if engine_path.exists() and not force_rebuild:
+        if _engine_cache_matches(engine_path, onnx_path, precision, static_hw):
+            return engine_path
+        print(
+            f"[benchmark] {arch}/{variant.name}: cached .engine was built for a "
+            "different precision/profile request -- rebuilding"
+        )
+
+    from friendy_chachkalica.ml.trt_export.cli import build_engine
 
     # adapter= is required since there's no .pt checkpoint file backing this
     # onnx_path; it's used internally only for retinanet/yolox's EfficientNMS
@@ -159,6 +229,9 @@ def export_engine_artifact(
         precision=precision,
         adapter=adapter,
         workspace_gb=workspace_gb,
+        min_hw=static_hw,
+        opt_hw=static_hw,
+        max_hw=static_hw,
     )
 
 
@@ -231,12 +304,23 @@ def benchmark_cell(
         "status": "error",
         "status_reason": None,
         "nms_status": NMS_STATUS[arch],
+        "engine_precision": None,
     }
 
     if fmt == "engine" and arch in NO_TRT_ARCHS:
         result["status"] = "skipped"
         result["status_reason"] = "no TRT export path for this arch (data-dependent NMS/RPN ops)"
         return result
+
+    # Force the previous cell's runnable (onnxruntime session / TRT execution
+    # context / torch model) out of memory before this cell allocates anything.
+    # Their CUDA memory isn't managed by torch's caching allocator, so it's only
+    # released once their Python wrapper is actually garbage collected -- plain
+    # refcounting should already do that once the prior benchmark_cell() call
+    # returned, but gc.collect() is cheap insurance against a reference cycle
+    # either library holds internally (this is what makes the baseline taken
+    # below meaningful; see gpu_monitor.py's module docstring).
+    gc.collect()
 
     try:
         pt_adapter = build_pt_adapter(arch, variant, num_classes)
@@ -251,9 +335,17 @@ def benchmark_cell(
         elif fmt == "engine":
             onnx_path = export_onnx_artifact(arch, variant, pt_adapter, num_classes, output_dir, force_rebuild)
             engine_path = export_engine_artifact(
-                arch, variant, pt_adapter, onnx_path, output_dir, precision, workspace_gb, force_rebuild
+                arch, variant, pt_adapter, onnx_path, output_dir, precision, workspace_gb, image_size, force_rebuild
             )
             from trt_infer import load_trt_adapter
+
+            # build_engine writes the precision it ACTUALLY built at (an fp16
+            # request can silently fall back to fp32) into this sidecar --
+            # surface it in the table so a fallback is visible in the CSV
+            # itself, not just buried in a per-engine .engine.json on disk.
+            provenance_path = Path(str(engine_path) + ".json")
+            if provenance_path.exists():
+                result["engine_precision"] = json.loads(provenance_path.read_text()).get("precision")
 
             runnable, _ = load_trt_adapter(engine_path, device)
         else:
@@ -261,12 +353,31 @@ def benchmark_cell(
 
         images = _synthetic_images(batch_size, image_size, device)
 
+        # torch.cuda.empty_cache() never frees a live tensor/model -- it only
+        # returns already-unreferenced cached blocks to the driver -- so this
+        # is safe to call with the adapter/images already built, and it gives
+        # the tightest possible floor: it flushes both this cell's own
+        # transient build garbage AND anything gc.collect() just freed from
+        # the previous cell above.
+        is_cuda = str(device).startswith("cuda")
+        if is_cuda:
+            torch.cuda.empty_cache()
+        baseline_mem_mb = read_current_mem_mb() if is_cuda else None
+
         with GpuMonitor(interval_s=gpu_poll_interval_s) as mon:
             timing = time_predict(runnable, images, device, warmup, iterations)
         gpu = mon.result
 
         result.update(timing)
-        result["gpu_mem_mb_peak"] = gpu.peak_mem_mb
+        # gpu_mem_mb_peak is peak-during-this-cell MINUS this cell's own
+        # pre-timing baseline, not a raw absolute reading -- nvml's memory
+        # counters (whole-device, or even per-process) never reset between
+        # cells, so an uncorrected peak just climbs across a sweep as
+        # torch/onnxruntime/TensorRT accumulate allocations cell over cell.
+        if gpu.peak_mem_mb is not None and baseline_mem_mb is not None:
+            result["gpu_mem_mb_peak"] = round(max(gpu.peak_mem_mb - baseline_mem_mb, 0.0), 4)
+        else:
+            result["gpu_mem_mb_peak"] = gpu.peak_mem_mb
         result["gpu_util_pct_mean"] = gpu.mean_util_pct
         result["gpu_util_pct_peak"] = gpu.peak_util_pct
         result["status"] = "ok"

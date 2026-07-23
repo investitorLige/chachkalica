@@ -212,12 +212,15 @@ class Experiment(models.Model):
         default=224.0,
         validators=[MinValueValidator(0.0)],
         verbose_name="Person-crop minimum size (px)",
-        help_text="Drop a detected person box if its crop (after expand ratio) is "
-                  "narrower or shorter than this many pixels, so degenerate tiny "
-                  "person detections never become a training or eval crop. 0 disables "
-                  "the floor. Only applied for people_detect_first — batch_people already "
-                  "starts from fixed-size tiles so its person crops don't shrink to the "
-                  "same degenerate sizes. Introduced after run PPE_v0.4_ppl_first-29's "
+        help_text="If a detected person's crop (after expand ratio) is narrower or "
+                  "shorter than this many pixels, grow it — using real neighboring "
+                  "frame pixels first, falling back to zero-padding only if the frame "
+                  "itself is smaller than the floor — rather than dropping the person "
+                  "outright; small/distant CCTV subjects must still reach the model. "
+                  "0 disables the floor. Only applied for people_detect_first — "
+                  "batch_people already starts from fixed-size tiles so its person crops "
+                  "don't shrink to the same degenerate sizes. Introduced after run "
+                  "PPE_v0.4_ppl_first-29's "
                   "RT-DETR run crashed on epoch 1 batch 1 with 'selected index k out of "
                   "range': RT-DETR's encoder does topk(num_queries) over its last feature "
                   "map, which has (padded_size / 32)^2 tokens, so a crop must be large "

@@ -412,7 +412,7 @@ def evaluate(req: EvalRequest):
             log.error("eval rejected: bad eval request %s: %s", request_path, exc)
             raise HTTPException(status_code=400, detail=f"bad eval request: {exc}")
 
-        cmd = [sys.executable, "eval_checkpoint.py", str(request_path)]
+        cmd = [sys.executable, "ml/eval_checkpoint.py", str(request_path)]
         job = _spawn(key, cmd, output_dir)
         log.info("launched eval: pid=%s request=%s output_dir=%s",
                  job["pid"], request_path, output_dir)
@@ -619,7 +619,7 @@ def export_onnx(req: ExportOnnxRequest):
     """Export a checkpoint to ONNX + meta.json synchronously.
 
     Rebuilds the adapter from the ``.pt`` and dispatches to the arch's exporter
-    (see ``onnx_export/cli.py``), writing ``<onnx_path>`` and its sibling
+    (see ``ml/onnx_export/cli.py``), writing ``<onnx_path>`` and its sibling
     ``.meta.json``. Runs on CPU — safe to call while the GPU is training.
     """
     log = _service_log()
@@ -630,7 +630,7 @@ def export_onnx(req: ExportOnnxRequest):
 
     with _export_lock:
         try:
-            from onnx_export.cli import export_checkpoint
+            from ml.onnx_export.cli import export_checkpoint
 
             onnx_path = export_checkpoint(req.checkpoint_path, req.onnx_path)
         except HTTPException:
@@ -652,7 +652,7 @@ def export_trt(req: ExportTrtRequest):
     """Build a TensorRT engine from a checkpoint synchronously.
 
     Ensures the ONNX artifact exists (exporting it first if needed), then compiles
-    it into ``<engine_path>`` via ``trt_export/cli.py``, alongside a verbatim
+    it into ``<engine_path>`` via ``ml/trt_export/cli.py``, alongside a verbatim
     ``.meta.json`` copy and a ``.engine.json`` provenance sidecar.
 
     UNLIKE ``/export_onnx`` (CPU-only, safe while the GPU is training), this runs
@@ -678,7 +678,7 @@ def export_trt(req: ExportTrtRequest):
 
     with _trt_build_lock:
         try:
-            from trt_export.cli import build_engine
+            from ml.trt_export.cli import build_engine
 
             # A static profile (min==opt==max) is what lets Faster R-CNN compile FP16;
             # when input_hw is omitted the profile is derived from the meta (dynamic).

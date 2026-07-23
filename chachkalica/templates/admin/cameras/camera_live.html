@@ -1,0 +1,23 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<style>
+  #cl-stage { max-width: 960px; }
+  #cl-stage img { width: 100%; height: auto; border-radius: 6px; background: #000; }
+  #cl-meta { margin: 8px 0; color: #666; }
+  #cl-error { color: #ba2121; margin: 8px 0; }
+</style>
+
+<div id="cl-stage">
+  <img src="{{ mjpeg_url }}" alt="Live view of {{ camera.name }}">
+  <p id="cl-meta"><strong>{{ camera.name }}</strong>
+    · status: {{ camera.status }}
+    {% if camera.last_checked_at %}· last checked {{ camera.last_checked_at }}{% endif %}
+  </p>
+  {% if camera.last_error %}
+    <p id="cl-error">{{ camera.last_error }}</p>
+  {% endif %}
+</div>
+
+<p style="margin-top:12px"><a href="../" class="button cancel-link">Back to cameras</a></p>
+{% endblock %}

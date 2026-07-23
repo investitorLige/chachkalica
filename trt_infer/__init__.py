@@ -1,7 +1,7 @@
 """TensorRT inference runtime — the GPU counterpart to ``onnx_infer``.
 
 Loads a trained detector compiled to a TensorRT ``.engine`` (built from the
-architecture-free ONNX by ``friendy_chachkalica/trt_export``) plus the same
+architecture-free ONNX by ``friendy_chachkalica/ml/trt_export``) plus the same
 ``meta.json`` sidecar, and runs it end-to-end — image in, Friendy ``(N, 6)``
 predictions out — with **no training-architecture code**.
 

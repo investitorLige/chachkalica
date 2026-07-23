@@ -28,7 +28,7 @@ DETECTOR_PIPELINES = {PEOPLE_DETECT_FIRST, BATCH_PEOPLE}
 # Pipelines that support being trained *through*: the training loop applies the
 # same frame transform (tiling, or person-cropping via the detector) it uses at
 # val/test, so the model trains on the exact sub-frames it is served on. Keep in
-# sync with friendy_chachkalica.train._TRAINABLE_PIPELINES. Only ``chain`` is
+# sync with friendy_chachkalica.ml.train._TRAINABLE_PIPELINES. Only ``chain`` is
 # excluded — merging several pipelines has no single train-time transform.
 TRAINABLE_PIPELINES = {BATCH_DETECT, PEOPLE_DETECT_FIRST, BATCH_PEOPLE}
 

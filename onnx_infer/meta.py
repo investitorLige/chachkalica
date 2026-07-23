@@ -1,7 +1,7 @@
 """``meta.json`` — Contract B: the sidecar that tells the service how to
 pre-process an input and interpret the graph's outputs.
 
-The exporter (``friendy_chachkalica/onnx_export``) writes one of these next to
+The exporter (``friendy_chachkalica/ml/onnx_export``) writes one of these next to
 every ``.onnx``. The service reads it and needs nothing else from the training
 stack. ``schema_version`` is guarded on load so an older service refuses a newer
 artifact loudly instead of silently mis-decoding it.
@@ -83,7 +83,7 @@ class ModelMeta:
     # doesn't diverge from them. RF-DETR is an exception: under "letterbox"
     # resize_mode its canvas includes real padding, so predictions can land in
     # the pad margin and need clipping on both the torch and exported paths —
-    # RF-DETR sets this True (see friendy_chachkalica/adapters/rfdetr.py predict()
+    # RF-DETR sets this True (see friendy_chachkalica/ml/adapters/rfdetr.py predict()
     # and onnx_export/arch/rfdetr.py's build_meta call, which must agree).
     clip_boxes: bool = False
     schema_version: int = SCHEMA_VERSION

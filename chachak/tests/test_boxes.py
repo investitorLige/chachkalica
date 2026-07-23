@@ -38,6 +38,47 @@ class TileFrameTest(unittest.TestCase):
         self.assertEqual(float(tile[:, 20:, :].sum()), 0.0)
         self.assertEqual(float(tile[:, :, 30:].sum()), 0.0)
 
+
+class GrowBoxToMinSizeTest(unittest.TestCase):
+    def test_box_already_large_enough_is_unchanged(self):
+        box = boxes.grow_box_to_min_size([10, 10, 50, 50], 30, 100, 100)
+        self.assertEqual(box, [10.0, 10.0, 50.0, 50.0])
+
+    def test_small_centered_box_grows_symmetrically(self):
+        # 10px box centered at (50, 50) -> grown to 30px still centered there.
+        box = boxes.grow_box_to_min_size([45, 45, 55, 55], 30, 100, 100)
+        self.assertEqual(box, [35.0, 35.0, 65.0, 65.0])
+
+    def test_box_near_edge_shifts_back_inside_frame(self):
+        # A small box flush against the left edge can't grow left of 0, so the
+        # centered window shifts right to stay inside the frame.
+        box = boxes.grow_box_to_min_size([0, 45, 5, 55], 30, 100, 100)
+        self.assertEqual(box[0], 0.0)
+        self.assertEqual(box[2] - box[0], 30.0)
+
+    def test_frame_smaller_than_floor_uses_the_whole_side(self):
+        # Frame is only 20px wide; a 30px floor can't be reached with real
+        # pixels alone, so the box is widened to the full frame width.
+        box = boxes.grow_box_to_min_size([5, 5, 10, 10], 30, 20, 100)
+        self.assertEqual((box[0], box[2]), (0.0, 20.0))
+
+
+class PadCropToMinSizeTest(unittest.TestCase):
+    def test_crop_already_large_enough_is_unchanged(self):
+        crop = torch.ones((3, 40, 40))
+        padded, size = boxes.pad_crop_to_min_size(crop, 30)
+        self.assertIs(padded, crop)
+        self.assertEqual(size, (40, 40))
+
+    def test_undersized_crop_is_zero_padded_on_right_bottom(self):
+        crop = torch.ones((3, 10, 20))
+        padded, size = boxes.pad_crop_to_min_size(crop, 30)
+        self.assertEqual(size, (30, 30))
+        self.assertEqual(tuple(padded.shape), (3, 30, 30))
+        self.assertTrue(torch.equal(padded[:, :10, :20], crop))
+        self.assertEqual(float(padded[:, 10:, :].sum()), 0.0)
+        self.assertEqual(float(padded[:, :, 20:].sum()), 0.0)
+
     def test_tiles_cover_whole_frame_including_edges(self):
         image = torch.zeros((3, 100, 100))
         # 40% of 100 -> 40px tiles.

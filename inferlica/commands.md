@@ -36,8 +36,8 @@ python inferlica/cli.py data/val runs/best.engine  --threshold 0.25 --nms 0.5 --
 # inferlica/export.py
 
 Convert a checkpoint straight to a deployable engine: chains
-`friendy_chachkalica.onnx_export` (`.pt` -> `.onnx` + `meta.json`) and
-`friendy_chachkalica.trt_export` (`.onnx` -> `.engine` + `meta.json` +
+`friendy_chachkalica.ml.onnx_export` (`.pt` -> `.onnx` + `meta.json`) and
+`friendy_chachkalica.ml.trt_export` (`.onnx` -> `.engine` + `meta.json` +
 provenance), writing every artifact into one output directory, then
 smoke-tests both exported artifacts through `onnx_infer`/`trt_infer` on a
 dummy image so a broken export fails here instead of downstream.

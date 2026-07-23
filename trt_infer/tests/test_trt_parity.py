@@ -47,12 +47,12 @@ if not torch.cuda.is_available():
     pytest.skip("TensorRT parity needs a CUDA GPU", allow_module_level=True)
 
 from friendy_chachkalica.registry import build_model  # noqa: E402
-from friendy_chachkalica.onnx_export.arch.fasterrcnn import export_fasterrcnn  # noqa: E402
-from friendy_chachkalica.onnx_export.arch.retinanet import export_retinanet  # noqa: E402
-from friendy_chachkalica.onnx_export.arch.yolox import export_yolox  # noqa: E402
-from friendy_chachkalica.onnx_export.arch.rtdetr import export_rtdetr  # noqa: E402
-from friendy_chachkalica.onnx_export.arch.rfdetr import export_rfdetr  # noqa: E402
-from friendy_chachkalica.trt_export.cli import build_engine  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.fasterrcnn import export_fasterrcnn  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.retinanet import export_retinanet  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.yolox import export_yolox  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.rtdetr import export_rtdetr  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.rfdetr import export_rfdetr  # noqa: E402
+from friendy_chachkalica.ml.trt_export.cli import build_engine  # noqa: E402
 from trt_infer import load_trt_adapter  # noqa: E402
 
 

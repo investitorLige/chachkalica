@@ -85,7 +85,7 @@ Description: parses the YAML config and shows the generated `ExperimentRun` list
 Train every dataset/model pair from the config:
 
 ```bash
-python train.py configs/experiment.yaml
+python ml/train.py configs/experiment.yaml
 ```
 
 Description: loads the config, builds the `ExperimentRun` matrix, trains each run, saves checkpoints, writes histories/results, and runs test evaluation if a test dataset is configured.
@@ -95,12 +95,12 @@ Description: loads the config, builds the `ExperimentRun` matrix, trains each ru
 If a sweep was interrupted (machine died, OOM, Ctrl-C), re-run the same command with `--resume`:
 
 ```bash
-python train.py configs/experiment.yaml --resume
+python ml/train.py configs/experiment.yaml --resume
 ```
 
 Description: with `--resume`, any run that already has a complete `result.yaml` is skipped, and any run that has a `last.pt` checkpoint but did not finish is continued from its next epoch (restoring model, optimizer, scheduler, AMP scaler, history, and best score). Without `--resume` every run starts fresh from epoch 1 and overwrites existing checkpoints. The flag also works on the full pipeline: `python run.py configs/experiment.yaml --resume`.
 
-When training finishes (resumed or not), `train.py` runs a consolidated evaluation phase across **every** run from its saved checkpoints — val split (if a val dataset is configured) and test split (if a test dataset is configured) — writing `val_results.yaml` and `test_results.yaml` under `output_dir`. This covers runs that were skipped by `--resume`, so a resumed sweep still ends with test metrics for all runs. It uses each run's `best.pt` when a val dataset exists, otherwise `last.pt`. (`run.py` keeps doing its own val/test phase, so it is unaffected.)
+When training finishes (resumed or not), `ml/train.py` runs a consolidated evaluation phase across **every** run from its saved checkpoints — val split (if a val dataset is configured) and test split (if a test dataset is configured) — writing `val_results.yaml` and `test_results.yaml` under `output_dir`. This covers runs that were skipped by `--resume`, so a resumed sweep still ends with test metrics for all runs. It uses each run's `best.pt` when a val dataset exists, otherwise `last.pt`. (`run.py` keeps doing its own val/test phase, so it is unaffected.)
 
 Note: resume reloads the saved optimizer/scheduler state into the same `output_dir`, so if you changed hyperparameters, run without `--resume` (or point at a fresh `output_dir`) instead of resuming the old trajectory.
 
@@ -123,7 +123,7 @@ runs/helmet-benchmark/
 Evaluate saved checkpoints on the configured test dataset:
 
 ```bash
-python val.py configs/experiment.yaml --split test --checkpoint best
+python ml/val.py configs/experiment.yaml --split test --checkpoint best
 ```
 
 Description: rebuilds every `ExperimentRun`, loads each run's `best.pt`, predicts on `run.test_dataset`, calls `evaluate_detection(...)`, and writes test metrics.
@@ -131,7 +131,7 @@ Description: rebuilds every `ExperimentRun`, loads each run's `best.pt`, predict
 Use the last checkpoint instead:
 
 ```bash
-python val.py configs/experiment.yaml --split test --checkpoint last
+python ml/val.py configs/experiment.yaml --split test --checkpoint last
 ```
 
 ## Evaluate Trained Runs On Validation
@@ -139,7 +139,7 @@ python val.py configs/experiment.yaml --split test --checkpoint last
 Evaluate saved checkpoints on the configured validation dataset:
 
 ```bash
-python val.py configs/experiment.yaml --split val --checkpoint best
+python ml/val.py configs/experiment.yaml --split val --checkpoint best
 ```
 
 Description: same evaluator as test, but uses `run.val_dataset` and writes validation results.
@@ -238,7 +238,7 @@ prediction_count
 Check the main Python files without training:
 
 ```bash
-python -m py_compile config.py data.py metrics.py train.py val.py registry.py formats.py
+python -m py_compile config.py data.py metrics.py ml/train.py ml/val.py registry.py formats.py
 ```
 
 Description: catches syntax errors only. It does not validate datasets, checkpoints, or model dependencies.

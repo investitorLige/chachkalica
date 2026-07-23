@@ -75,3 +75,56 @@ class AdminRenderTests(TestCase):
         resp = self.client.get(reverse("admin:cameras_camera_changelist"))
         self.assertContains(resp, "••••")
         self.assertNotContains(resp, "AxProVideo2024")
+
+
+class LiveStreamTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        User.objects.create_superuser("admin", "a@b.co", "pw")
+        self.client.login(username="admin", password="pw")
+        self.camera = Camera.objects.create(name="Lobby", rtsp_url=RTSP_URL)
+
+    def test_mjpeg_requires_login(self):
+        self.client.logout()
+        resp = self.client.get(reverse("admin:cameras_camera_mjpeg"), {"camera": self.camera.pk})
+        self.assertEqual(resp.status_code, 302)
+
+    def test_mjpeg_unknown_camera_404s(self):
+        resp = self.client.get(reverse("admin:cameras_camera_mjpeg"), {"camera": 999999})
+        self.assertEqual(resp.status_code, 404)
+
+    def test_mjpeg_content_type(self):
+        resp = self.client.get(reverse("admin:cameras_camera_mjpeg"), {"camera": self.camera.pk})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp["Content-Type"], "multipart/x-mixed-replace; boundary=frame")
+
+    def test_live_view_renders_camera(self):
+        resp = self.client.get(reverse("admin:cameras_camera_live"), {"camera": self.camera.pk})
+        self.assertContains(resp, "Lobby")
+        self.assertContains(resp, f"?camera={self.camera.pk}")
+
+    def test_live_view_unknown_camera_404s(self):
+        resp = self.client.get(reverse("admin:cameras_camera_live"), {"camera": 999999})
+        self.assertEqual(resp.status_code, 404)
+
+    def test_change_page_shows_preview_and_link(self):
+        resp = self.client.get(reverse("admin:cameras_camera_change", args=[self.camera.pk]))
+        self.assertContains(resp, "Open full live view")
+        self.assertContains(resp, f"/admin/cameras/camera/mjpeg/?camera={self.camera.pk}")
+
+    def test_action_requires_single_selection(self):
+        Camera.objects.create(name="Back yard", rtsp_url=RTSP_URL.replace("101", "102"))
+        resp = self.client.post(reverse("admin:cameras_camera_changelist"), {
+            "action": "view_live_stream",
+            "_selected_action": [str(c.pk) for c in Camera.objects.all()],
+        }, follow=True)
+        self.assertContains(resp, "Select exactly one camera")
+
+    def test_action_redirects_to_live_view(self):
+        resp = self.client.post(reverse("admin:cameras_camera_changelist"), {
+            "action": "view_live_stream",
+            "_selected_action": [str(self.camera.pk)],
+        })
+        self.assertRedirects(
+            resp, reverse("admin:cameras_camera_live") + f"?camera={self.camera.pk}",
+        )

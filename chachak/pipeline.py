@@ -28,7 +28,9 @@ try:
     from .boxes import (
         crop_image,
         expand_box,
+        grow_box_to_min_size,
         merge_predictions,
+        pad_crop_to_min_size,
         remap_local_preds_to_frame,
         tile_frame,
         tile_frame_pixels,
@@ -40,7 +42,9 @@ except ImportError:  # run as a flat script
     from boxes import (
         crop_image,
         expand_box,
+        grow_box_to_min_size,
         merge_predictions,
+        pad_crop_to_min_size,
         remap_local_preds_to_frame,
         tile_frame,
         tile_frame_pixels,
@@ -99,11 +103,18 @@ class Pipeline:
 
     name = "pipeline"
 
-    def __init__(self, model_adapter, device, config, detector=None) -> None:
+    def __init__(self, model_adapter, device, config, detector=None, box_cache=None) -> None:
         self.model_adapter = model_adapter
         self.device = device
         self.config = config
         self.detector = detector
+        # Optional dict-like cache of per-image person boxes, keyed by whatever
+        # hashable identity a caller passes as `image_ids` (e.g. image_path).
+        # None (the default) preserves the original always-run-the-detector
+        # behavior exactly. Shared across pipeline instances/epochs by callers
+        # that want the frozen detector's output reused instead of recomputed
+        # (the detector never changes, so its output per image doesn't either).
+        self.box_cache = box_cache
 
     def process_batch(
         self, images: List[torch.Tensor], targets: List[Dict[str, Any]]
@@ -112,7 +123,9 @@ class Pipeline:
         raise NotImplementedError
 
     # -- shared person-crop back-end (used by the two people pipelines) --
-    def _person_boxes(self, images: List[torch.Tensor]) -> List[torch.Tensor]:
+    def _person_boxes(
+        self, images: List[torch.Tensor], image_ids: Optional[List[Any]] = None
+    ) -> List[torch.Tensor]:
         """Per-frame person boxes as xyxy tensors in frame pixels.
 
         Implemented by the people pipelines (full-frame detection vs tiled
@@ -121,40 +134,77 @@ class Pipeline:
         raise NotImplementedError
 
     def crop_regions(
-        self, images: List[torch.Tensor]
+        self, images: List[torch.Tensor], image_ids: Optional[List[Any]] = None
     ) -> List[List[tuple]]:
         """Per-frame list of ``(crop_chw, (x0, y0), (crop_w, crop_h))`` regions.
 
         These are the person crops the pipeline feeds the trained model: each
         detected person box expanded by ``detector.expand_ratio`` and clipped to
         the frame. Shared by inference (:meth:`_crop_infer_remap`) and by
-        training-time cropping (``friendy_chachkalica.cropping.crop_batch``) so
+        training-time cropping (``friendy_chachkalica.preprocess.cropping.crop_batch``) so
         the model sees the exact same crops in both regimes. Zero-area crops are
-        skipped, as are crops narrower or shorter than ``detector.min_box_size``
-        (the same floor already applied to merged detections at inference, so a
-        person box too small to be a valid detection is equally too small to
-        become a training crop); a frame with no person detections yields an
-        empty list.
+        skipped. A crop narrower or shorter than ``detector.min_box_size`` is
+        never dropped outright — a real (if distant/small) person must still
+        reach the model — it's grown first using real neighboring frame pixels
+        (:func:`grow_box_to_min_size`), and only zero-padded
+        (:func:`pad_crop_to_min_size`) if the frame itself is smaller than the
+        floor. A frame with no person detections yields an empty list.
         """
         config = self.config
         min_box_size = config.detector.min_box_size
-        person_boxes = self._person_boxes(images)
+        person_boxes = self._person_boxes(images, image_ids=image_ids)
         regions: List[List[tuple]] = []
         for image, boxes in zip(images, person_boxes):
             frame_w, frame_h = _frame_size(image)
             frame_regions = []
             for box in boxes:
                 expanded = expand_box(box, config.detector.expand_ratio, frame_w, frame_h)
+                if min_box_size > 0:
+                    expanded = grow_box_to_min_size(expanded, min_box_size, frame_w, frame_h)
                 crop, offset, (crop_w, crop_h) = crop_image(image, expanded)
                 if crop_w < 1 or crop_h < 1:
                     continue
                 if min_box_size > 0 and (crop_w < min_box_size or crop_h < min_box_size):
-                    continue
+                    crop, (crop_w, crop_h) = pad_crop_to_min_size(crop, int(round(min_box_size)))
                 frame_regions.append((crop, offset, (crop_w, crop_h)))
             regions.append(frame_regions)
         return regions
 
-    def _crop_infer_remap(self, images: List[torch.Tensor]) -> List[torch.Tensor]:
+    def _cached_person_boxes(self, images, image_ids, compute):
+        """Return per-image person boxes, consulting/populating ``self.box_cache``.
+
+        ``compute(subset_images)`` computes boxes for exactly the images that
+        missed the cache, in order. With no cache configured, or no
+        ``image_ids`` supplied (e.g. a caller outside a dataset context), this
+        is just ``compute(images)`` — identical to the original always-run-the-
+        detector behavior. An id of ``None`` for a given image (missing
+        identity) is never cached under nor read from — it's computed fresh
+        every call so unrelated frames can't collide on a shared ``None`` key.
+        """
+        if self.box_cache is None or image_ids is None:
+            return compute(images)
+
+        results: List[Any] = [None] * len(images)
+        miss_indices = []
+        for i, image_id in enumerate(image_ids):
+            cached = self.box_cache.get(image_id) if image_id is not None else None
+            if cached is not None:
+                results[i] = cached
+            else:
+                miss_indices.append(i)
+
+        if miss_indices:
+            computed = compute([images[i] for i in miss_indices])
+            for local_i, global_i in enumerate(miss_indices):
+                results[global_i] = computed[local_i]
+                image_id = image_ids[global_i]
+                if image_id is not None:
+                    self.box_cache[image_id] = computed[local_i]
+        return results
+
+    def _crop_infer_remap(
+        self, images: List[torch.Tensor], image_ids: Optional[List[Any]] = None
+    ) -> List[torch.Tensor]:
         """Crop each person region, run the trained model, remap and merge per frame."""
         config = self.config
         crops: List[torch.Tensor] = []
@@ -162,7 +212,7 @@ class Pipeline:
         crop_meta = []  # (offset_xy, (crop_w, crop_h))
         frame_sizes = [_frame_size(image) for image in images]
 
-        for f_idx, regions in enumerate(self.crop_regions(images)):
+        for f_idx, regions in enumerate(self.crop_regions(images, image_ids=image_ids)):
             for crop, offset, (crop_w, crop_h) in regions:
                 crops.append(crop)
                 crop_frame_idx.append(f_idx)
@@ -183,11 +233,13 @@ class Pipeline:
                 )
             )
 
+        # min_box_size is not applied here: it gates which *person crops* reach
+        # the model (crop_regions), not the stage-2 model's own output boxes.
+        # Those are item-level (e.g. a PPE item on the person), routinely far
+        # smaller than a person crop, so reusing the same floor here would drop
+        # nearly all real detections regardless of camera distance.
         return [
-            merge_predictions(
-                per_frame[i], *frame_sizes[i], config.merge_nms_iou,
-                min_box_size=config.detector.min_box_size,
-            )
+            merge_predictions(per_frame[i], *frame_sizes[i], config.merge_nms_iou)
             for i in range(len(images))
         ]
 
@@ -286,18 +338,23 @@ class PeopleDetectFirstPipeline(Pipeline):
 
     name = "people_detect_first"
 
-    def _person_boxes(self, images):
+    def _person_boxes(self, images, image_ids=None):
         if self.detector is None:
             raise ValueError("people_detect_first requires a detector")
-        det_preds = self.detector.predict(images)
-        person_boxes = []
-        for image, preds in zip(images, det_preds):
-            frame_w, frame_h = _frame_size(image)
-            person_boxes.append(xywhn_preds_to_xyxy(preds.detach().cpu(), frame_w, frame_h))
-        return person_boxes
+
+        def compute(subset_images):
+            det_preds = self.detector.predict(subset_images)
+            boxes = []
+            for image, preds in zip(subset_images, det_preds):
+                frame_w, frame_h = _frame_size(image)
+                boxes.append(xywhn_preds_to_xyxy(preds.detach().cpu(), frame_w, frame_h))
+            return boxes
+
+        return self._cached_person_boxes(images, image_ids, compute)
 
     def process_batch(self, images, targets):
-        return self._crop_infer_remap(images)
+        image_ids = [target.get("image_path") for target in targets]
+        return self._crop_infer_remap(images, image_ids=image_ids)
 
 
 class BatchPeoplePipeline(Pipeline):
@@ -305,35 +362,40 @@ class BatchPeoplePipeline(Pipeline):
 
     name = "batch_people"
 
-    def _person_boxes(self, images):
+    def _person_boxes(self, images, image_ids=None):
         if self.detector is None:
             raise ValueError("batch_people requires a detector")
         config = self.config
-        person_boxes = []
-        for image in images:
-            frame_w, frame_h = _frame_size(image)
-            tiles = tile_frame(
-                image,
-                config.tiling.tile_width_pct / 100.0,
-                config.tiling.tile_height_pct / 100.0,
-                config.tiling.overlap,
-            )
-            tile_images = [tile for tile, _, _ in tiles]
-            det_preds = self.detector.predict(tile_images)
-            remapped = []
-            for (_, offset, (tile_w, tile_h)), preds in zip(tiles, det_preds):
-                remapped.append(
-                    remap_local_preds_to_frame(
-                        preds.detach().cpu(), offset, tile_w, tile_h, frame_w, frame_h
-                    )
+
+        def compute(subset_images):
+            boxes = []
+            for image in subset_images:
+                frame_w, frame_h = _frame_size(image)
+                tiles = tile_frame(
+                    image,
+                    config.tiling.tile_width_pct / 100.0,
+                    config.tiling.tile_height_pct / 100.0,
+                    config.tiling.overlap,
                 )
-            # Collapse duplicate person boxes from overlapping tiles before cropping.
-            merged = merge_predictions(remapped, frame_w, frame_h, config.detector.nms_iou)
-            person_boxes.append(xywhn_preds_to_xyxy(merged, frame_w, frame_h))
-        return person_boxes
+                tile_images = [tile for tile, _, _ in tiles]
+                det_preds = self.detector.predict(tile_images)
+                remapped = []
+                for (_, offset, (tile_w, tile_h)), preds in zip(tiles, det_preds):
+                    remapped.append(
+                        remap_local_preds_to_frame(
+                            preds.detach().cpu(), offset, tile_w, tile_h, frame_w, frame_h
+                        )
+                    )
+                # Collapse duplicate person boxes from overlapping tiles before cropping.
+                merged = merge_predictions(remapped, frame_w, frame_h, config.detector.nms_iou)
+                boxes.append(xywhn_preds_to_xyxy(merged, frame_w, frame_h))
+            return boxes
+
+        return self._cached_person_boxes(images, image_ids, compute)
 
     def process_batch(self, images, targets):
-        return self._crop_infer_remap(images)
+        image_ids = [target.get("image_path") for target in targets]
+        return self._crop_infer_remap(images, image_ids=image_ids)
 
 
 class ChainedPipeline(Pipeline):
@@ -341,8 +403,8 @@ class ChainedPipeline(Pipeline):
 
     name = "chain"
 
-    def __init__(self, model_adapter, device, config, detector=None, pipelines=None):
-        super().__init__(model_adapter, device, config, detector=detector)
+    def __init__(self, model_adapter, device, config, detector=None, pipelines=None, box_cache=None):
+        super().__init__(model_adapter, device, config, detector=detector, box_cache=box_cache)
         self.pipelines = list(pipelines or [])
         if self.pipelines:
             self.name = "chain[" + "+".join(p.name for p in self.pipelines) + "]"

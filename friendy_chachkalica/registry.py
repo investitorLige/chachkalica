@@ -1,15 +1,15 @@
 try:
-    from .adapters.fasterrcnn import build_fasterrcnn
-    from .adapters.retinanet import build_retinanet
-    from .adapters.rfdetr import build_rfdetr
-    from .adapters.rtdetr import build_rtdetr
-    from .adapters.yolox import build_yolox
+    from .ml.adapters.fasterrcnn import build_fasterrcnn
+    from .ml.adapters.retinanet import build_retinanet
+    from .ml.adapters.rfdetr import build_rfdetr
+    from .ml.adapters.rtdetr import build_rtdetr
+    from .ml.adapters.yolox import build_yolox
 except ImportError:
-    from adapters.fasterrcnn import build_fasterrcnn
-    from adapters.retinanet import build_retinanet
-    from adapters.rfdetr import build_rfdetr
-    from adapters.rtdetr import build_rtdetr
-    from adapters.yolox import build_yolox
+    from ml.adapters.fasterrcnn import build_fasterrcnn
+    from ml.adapters.retinanet import build_retinanet
+    from ml.adapters.rfdetr import build_rfdetr
+    from ml.adapters.rtdetr import build_rtdetr
+    from ml.adapters.yolox import build_yolox
 
 
 MODEL_REGISTRY = {

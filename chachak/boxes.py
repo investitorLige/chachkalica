@@ -181,6 +181,59 @@ def crop_image(
     return crop, (ix1, iy1), (ix2 - ix1, iy2 - iy1)
 
 
+def grow_box_to_min_size(
+    box_xyxy: Sequence[float],
+    min_size: float,
+    frame_w: int,
+    frame_h: int,
+) -> List[float]:
+    """Grow an xyxy box outward (same center) so neither side is below ``min_size``.
+
+    Prefers real frame pixels over padding: a short side is widened using
+    neighboring image content, shifting back inside ``[0, frame_w/h]`` if the
+    centered window would run off an edge. Only a frame itself narrower or
+    shorter than ``min_size`` leaves a side short — the caller then zero-pads
+    the crop (mirroring :func:`tile_frame_pixels`) to make up the difference.
+    """
+    x1, y1, x2, y2 = (float(v) for v in box_xyxy)
+
+    def _grow(lo, hi, total):
+        if hi - lo >= min_size:
+            return lo, hi
+        center = (lo + hi) / 2.0
+        half = min(min_size, float(total)) / 2.0
+        lo, hi = center - half, center + half
+        if lo < 0:
+            hi -= lo
+            lo = 0.0
+        if hi > total:
+            lo -= hi - total
+            hi = float(total)
+        return max(0.0, lo), hi
+
+    x1, x2 = _grow(x1, x2, frame_w)
+    y1, y2 = _grow(y1, y2, frame_h)
+    return [x1, y1, x2, y2]
+
+
+def pad_crop_to_min_size(
+    crop: torch.Tensor, min_size: int
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """Zero-pad a CHW crop on the right/bottom up to ``min_size`` square.
+
+    Only engages when the source frame itself is narrower/shorter than
+    ``min_size`` (:func:`grow_box_to_min_size` already used all available real
+    pixels), matching :func:`tile_frame_pixels`'s pad-only-when-necessary shape.
+    """
+    channels, height, width = crop.shape
+    target_h, target_w = max(height, min_size), max(width, min_size)
+    if target_h == height and target_w == width:
+        return crop, (width, height)
+    padded = crop.new_zeros((channels, target_h, target_w))
+    padded[:, :height, :width] = crop
+    return padded, (target_w, target_h)
+
+
 def remap_local_preds_to_frame(
     preds: torch.Tensor,
     offset_xy: Tuple[int, int],

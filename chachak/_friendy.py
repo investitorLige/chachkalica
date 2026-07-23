@@ -46,7 +46,7 @@ from friendy_chachkalica.config import (  # noqa: E402
     ModelConfig,
     TrainingConfig,
 )
-from friendy_chachkalica.val import _to_builtin, _write_yaml  # noqa: E402
+from friendy_chachkalica.ml.val import _to_builtin, _write_yaml  # noqa: E402
 
 __all__ = [
     "formats",

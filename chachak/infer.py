@@ -29,7 +29,7 @@ def as_class_map(classes: Union[Dict, List, None]) -> Dict[int, str]:
 def load_checkpoint_adapter(checkpoint_path: Union[str, Path], device) -> tuple:
     """Rebuild and load a Friendy checkpoint, ready for inference.
 
-    Mirrors ``friendy_chachkalica/eval_checkpoint.py``: rebuild the adapter from
+    Mirrors ``friendy_chachkalica/ml/eval_checkpoint.py``: rebuild the adapter from
     the checkpoint's ``model_name``/``num_classes``/``params`` and load the
     weights into ``adapter.model``. Returns ``(adapter, info)`` where ``info``
     carries ``model_name``, ``num_classes``, ``params`` and the training

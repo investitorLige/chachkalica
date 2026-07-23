@@ -41,16 +41,38 @@ class TrtAdapter:
         return self
 
     def predict(self, images, score_threshold: Optional[float] = None):
-        """List of CHW float [0,1] tensors -> list of Friendy ``(N,6)`` tensors."""
+        """List of CHW float [0,1] tensors -> list of Friendy ``(N,6)`` tensors.
+
+        Images whose preprocessed shape comes out identical (always true when
+        ``meta.input.resize_mode`` is ``square``/``letterbox`` — a fixed output
+        size regardless of the source image's own size, e.g. this repo's
+        person-detector engine) are stacked and submitted to the engine as one
+        real ``[B,3,H,W]`` batch instead of one ``TrtModel.run()`` call per
+        image. Images that preprocess to different shapes (possible for
+        ``resize_mode="none"``/``"longest_side"`` fed differently-sized frames)
+        still get their own call each, exactly as before — grouping only ever
+        reduces engine calls, never changes what each image sees.
+        """
         import torch
 
         threshold = self.score_threshold if score_threshold is None else score_threshold
+        prepared = [preprocess(_to_chw_numpy(image), self.meta) for image in images]
+
+        groups: dict = {}
+        for index, (batched, _transform) in enumerate(prepared):
+            groups.setdefault(batched.shape[1:], []).append(index)
+
+        raw_by_index = {}
+        for indices in groups.values():
+            stacked = np.concatenate([prepared[i][0] for i in indices], axis=0)
+            raw = self._model.run(stacked)
+            triples = raw if len(indices) > 1 else [raw]
+            for local_i, global_i in enumerate(indices):
+                raw_by_index[global_i] = triples[local_i]
+
         results = []
-        for image in images:
-            chw = _to_chw_numpy(image)
-            batched, transform = preprocess(chw, self.meta)
-            raw = self._model.run(batched)
-            boxes, scores, labels = self._handler.adapt_outputs(raw)
+        for index, (_batched, transform) in enumerate(prepared):
+            boxes, scores, labels = self._handler.adapt_outputs(raw_by_index[index])
             friendy = to_friendy(
                 boxes, scores, labels, transform, threshold,
                 clip_boxes=self.meta.clip_boxes,

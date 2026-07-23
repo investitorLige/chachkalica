@@ -136,6 +136,55 @@ class InferInChunksTest(unittest.TestCase):
             )
 
 
+class CropRegionsMinBoxSizeTest(unittest.TestCase):
+    """A too-small person crop must still reach the model, never be dropped."""
+
+    def test_tiny_detection_is_grown_not_dropped(self):
+        class TinyPersonDetector:
+            def predict(self, images):
+                # A 10x10 person box in the middle of a 300x300 frame.
+                return [torch.tensor([[0.5, 0.5, 10 / 300, 10 / 300, 0.99, 1.0]]) for _ in images]
+
+        config = make_config(
+            "people_detect_first",
+            detector=DetectorConfig(score_threshold=0.0, expand_ratio=0.0, nms_iou=0.5, min_box_size=224.0),
+        )
+        pipeline = PeopleDetectFirstPipeline(
+            model_adapter=None, device=DEVICE, config=config, detector=TinyPersonDetector()
+        )
+        image = torch.zeros(3, 300, 300)
+        regions = pipeline.crop_regions([image])
+
+        self.assertEqual(len(regions[0]), 1, "tiny person must still yield a crop region")
+        crop, _, (w, h) = regions[0][0]
+        self.assertGreaterEqual(w, 224)
+        self.assertGreaterEqual(h, 224)
+        self.assertEqual(tuple(crop.shape), (3, h, w))
+
+    def test_frame_smaller_than_floor_is_zero_padded(self):
+        class TinyPersonDetector:
+            def predict(self, images):
+                return [torch.tensor([[0.5, 0.5, 10 / 100, 10 / 100, 0.99, 1.0]]) for _ in images]
+
+        config = make_config(
+            "people_detect_first",
+            detector=DetectorConfig(score_threshold=0.0, expand_ratio=0.0, nms_iou=0.5, min_box_size=224.0),
+        )
+        pipeline = PeopleDetectFirstPipeline(
+            model_adapter=None, device=DEVICE, config=config, detector=TinyPersonDetector()
+        )
+        image = torch.ones(3, 100, 100)
+        regions = pipeline.crop_regions([image])
+
+        self.assertEqual(len(regions[0]), 1)
+        crop, _, (w, h) = regions[0][0]
+        self.assertEqual((w, h), (224, 224))
+        # Real frame content fills the top-left; the rest is zero-padding.
+        self.assertTrue(torch.equal(crop[:, :100, :100], image))
+        self.assertEqual(float(crop[:, 100:, :].sum()), 0.0)
+        self.assertEqual(float(crop[:, :, 100:].sum()), 0.0)
+
+
 class ProcessBatchTest(unittest.TestCase):
     def test_batch_detect_tiles_and_produces_boxes(self):
         images, targets = sample_frames()

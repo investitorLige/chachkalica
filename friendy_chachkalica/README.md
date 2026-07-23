@@ -10,7 +10,7 @@ models can be trained and compared fairly from a single YAML experiment file.
 - **One config, many runs** — a single experiment YAML lists your train/val/test
   datasets and models; every model is trained once per train dataset (2 datasets ×
   3 models = 6 runs).
-- **Pluggable architectures via adapters** — each model lives in `adapters/` and is
+- **Pluggable architectures via adapters** — each model lives in `ml/adapters/` and is
   registered by name. Currently supported: `retinanet`, `rtdetr`, `rfdetr`, `yolox`.
 - **Shared everything else** — YOLO dataset loading, box/NMS postprocessing,
   detection metrics (P/R, mAP50, mAP50-95, per-class AP), and a normalized output
@@ -63,7 +63,7 @@ predictions into the config's `output_dir`.
 ### CLI — evaluate a checkpoint
 
 ```bash
-.venv/bin/python eval_checkpoint.py --help
+.venv/bin/python ml/eval_checkpoint.py --help
 ```
 
 ### Python API
@@ -173,22 +173,24 @@ evaluation:
 | Path | Purpose |
 |---|---|
 | `run.py` | CLI entry point — runs a full experiment from a YAML config |
-| `train.py` / `val.py` | Config-driven training and validation |
+| `ml/train.py` / `ml/val.py` | Config-driven training and validation |
 | `config.py` | Loads/validates the experiment YAML and expands it into runs |
 | `data.py` | YOLO-format dataset loading, `Dataset` + collate |
 | `metrics.py` | Model-agnostic detection metrics (mAP, per-class AP…) |
 | `formats.py` | Shared label/prediction data structures + conversions |
 | `export.py` | Prediction export helpers |
 | `registry.py` | Maps model names to adapter builders |
-| `adapters/` | Architecture-specific code (retinanet, rtdetr, rfdetr, yolox) |
-| `eval_checkpoint.py` | Standalone checkpoint evaluation |
+| `ml/adapters/` | Architecture-specific code (retinanet, rtdetr, rfdetr, yolox) |
+| `ml/eval_checkpoint.py` | Standalone checkpoint evaluation |
+| `preprocess/` | Batch cropping/tiling + coordinate re-mapping for train-time transforms |
 | `service.py` | FastAPI service wrapping train/eval as background jobs |
 | `configs/` | Example experiment configs |
 | `vendor/` | Vendored model code (e.g. YOLOX) |
+| `tests/` | Unit tests |
 
 ## Adding a model
 
-1. Add `adapters/<name>.py` with a `build_<name>(...)` builder that returns a model
+1. Add `ml/adapters/<name>.py` with a `build_<name>(...)` builder that returns a model
    speaking the shared prediction/target format.
 2. Register it in `registry.py`'s `MODEL_REGISTRY`.
 3. Reference it by `name` in an experiment config.

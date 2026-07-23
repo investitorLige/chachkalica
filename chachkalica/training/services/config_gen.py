@@ -337,7 +337,7 @@ def combined_checkpoints(run) -> list[str]:
 
 
 def build_eval_request(eval_run, output_dir: Path | str, ts: TrainingSettings | None = None) -> dict:
-    """Assemble the eval request consumed by friendy_chachkalica's eval_checkpoint.py.
+    """Assemble the eval request consumed by friendy_chachkalica's ml/eval_checkpoint.py.
 
     ``classes`` is the *eval dataset's* class space (the target labels); the
     model's own train-class space is read from the checkpoint by the trainer.

@@ -9,13 +9,13 @@ import yaml
 try:
     from .config import ExperimentConfig, load_config
     from .export import export_universal_csv
-    from .train import train_experiment
-    from .val import val_experiment
+    from .ml.train import train_experiment
+    from .ml.val import val_experiment
 except ImportError:
     from config import ExperimentConfig, load_config
     from export import export_universal_csv
-    from train import train_experiment
-    from val import val_experiment
+    from ml.train import train_experiment
+    from ml.val import val_experiment
 
 
 def run_from_config(config_path: str | Path, resume: bool = False) -> Dict[str, Any]:

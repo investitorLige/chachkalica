@@ -103,6 +103,9 @@ class PipelineSpec:
     # each of width and height, i.e. 5% per side), clipped to the frame. None
     # falls back to chachak's default (0.0 = crop the detector box exactly).
     detector_expand_ratio: Optional[float] = None
+    # Floor (pixels) a detected person crop is grown/padded up to before it
+    # reaches the model. None falls back to chachak's default (0.0 = no floor).
+    detector_min_box_size: Optional[float] = None
     tiling: TilingSpec = field(default_factory=TilingSpec)
     chain: List[str] = field(default_factory=list)
     merge_nms_iou: Optional[float] = None
@@ -613,6 +616,11 @@ def _parse_pipeline(value: Any, base_dir: Path) -> Optional[PipelineSpec]:
         detector_expand_ratio = float(detector_expand_ratio)
         if detector_expand_ratio < 0:
             raise ValueError("pipeline.detector.expand_ratio must be >= 0")
+    detector_min_box_size = detector_raw.get("min_box_size")
+    if detector_min_box_size is not None:
+        detector_min_box_size = float(detector_min_box_size)
+        if detector_min_box_size < 0:
+            raise ValueError("pipeline.detector.min_box_size must be >= 0")
 
     tiling_raw = value.get("tiling") or {}
     if not isinstance(tiling_raw, dict):
@@ -649,6 +657,7 @@ def _parse_pipeline(value: Any, base_dir: Path) -> Optional[PipelineSpec]:
         name=name,
         detector_checkpoint=detector_checkpoint,
         detector_expand_ratio=detector_expand_ratio,
+        detector_min_box_size=detector_min_box_size,
         tiling=tiling,
         chain=chain,
         merge_nms_iou=merge_nms_iou,

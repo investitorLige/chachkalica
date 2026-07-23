@@ -4,7 +4,7 @@ Stackable inference/eval **pipelines** that wrap the trained detector from
 `friendy_chachkalica` with custom pre/post-processing. Each pipeline turns a
 directory of frames into Friendy-format predictions and scores them with
 `metrics.evaluate_detection`, writing `predictions.pt` + `result.yaml` exactly
-like `friendy_chachkalica/eval_checkpoint.py`.
+like `friendy_chachkalica/ml/eval_checkpoint.py`.
 
 ## The three pipelines
 

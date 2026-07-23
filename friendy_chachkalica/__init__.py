@@ -7,11 +7,11 @@ from .formats import (
     xyxy_to_xywh,
     xyxy_to_xywhn,
 )
-from .adapters.retinanet import RetinaNetAdapter, build_retinanet
-from .adapters.rtdetr import RTDETRAdapter, build_rtdetr
-from .adapters.yolox import YOLOXAdapter, build_yolox
+from .ml.adapters.retinanet import RetinaNetAdapter, build_retinanet
+from .ml.adapters.rtdetr import RTDETRAdapter, build_rtdetr
+from .ml.adapters.yolox import YOLOXAdapter, build_yolox
 from .registry import MODEL_REGISTRY, build_model
-from .train import train_from_config
+from .ml.train import train_from_config
 
 __all__ = [
     "train_from_config",

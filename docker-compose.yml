@@ -85,7 +85,8 @@ services:
     command: >
       sh -c "python manage.py migrate &&
              python manage.py collectstatic --noinput &&
-             gunicorn fleetsite.wsgi:application --bind 0.0.0.0:9000"
+             gunicorn fleetsite.wsgi:application --bind 0.0.0.0:9000
+             --workers 2 --worker-class gthread --threads 8 --timeout 120"
     # Published on 9000 so it inherits the webhook's host port: Label Studio
     # containers keep hitting http://host.docker.internal:9000/hook.
     ports:
@@ -94,6 +95,28 @@ services:
   worker:
     <<: *app
     command: python manage.py rqworker default
+
+  # Holds the RTSP connections for registered cameras and refreshes their
+  # latest frame in Redis (see chachkalica/cameras/management/commands/
+  # stream_cameras.py and chachkalica/docs/camera-live-preview.md).
+  # Deliberately its own service rather than `<<: *app` — it only needs
+  # Postgres (to read Camera rows) and Redis, not the docker socket, data/
+  # mount, or trainer/SAM URLs the other app services use.
+  camera-workers:
+    build: ./chachkalica
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: fleet
+      POSTGRES_USER: fleet
+      POSTGRES_PASSWORD: fleet
+      REDIS_URL: redis://redis:6379/0
+    command: python manage.py stream_cameras
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
 
   trainer:
     # Repo-root context so the image can hold BOTH friendy_chachkalica/ and

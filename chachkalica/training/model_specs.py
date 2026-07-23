@@ -8,7 +8,7 @@ instead of hand-typed JSON, while the DB stays model-agnostic — every value he
 is still stored in :attr:`ExperimentModel.params` and spread back into the model
 YAML entry by :mod:`training.services.config_gen`.
 
-Keep this in sync with ``/home/luka/workspace/chachkalica/friendy_chachkalica/adapters/*.py``:
+Keep this in sync with ``/home/luka/workspace/chachkalica/friendy_chachkalica/ml/adapters/*.py``:
 one entry per selectable ``build_<arch>`` kwarg. ``key`` is the ``params`` key
 (and the YAML kwarg name); ``kind`` picks the widget; ``default`` is the adapter
 default shown as guidance (a blank field means "use the adapter default").

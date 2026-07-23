@@ -25,11 +25,11 @@ pytest.importorskip("onnx")
 pytest.importorskip("onnxruntime")
 
 from friendy_chachkalica.registry import build_model  # noqa: E402
-from friendy_chachkalica.onnx_export.arch.fasterrcnn import export_fasterrcnn  # noqa: E402
-from friendy_chachkalica.onnx_export.arch.retinanet import export_retinanet  # noqa: E402
-from friendy_chachkalica.onnx_export.arch.yolox import export_yolox  # noqa: E402
-from friendy_chachkalica.onnx_export.arch.rtdetr import export_rtdetr  # noqa: E402
-from friendy_chachkalica.onnx_export.arch.rfdetr import export_rfdetr  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.fasterrcnn import export_fasterrcnn  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.retinanet import export_retinanet  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.yolox import export_yolox  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.rtdetr import export_rtdetr  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.rfdetr import export_rfdetr  # noqa: E402
 from onnx_infer import load_onnx_adapter  # noqa: E402
 
 

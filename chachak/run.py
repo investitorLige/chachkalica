@@ -5,7 +5,7 @@
 Loads a pipeline config, loads the trained model (and a detector when the
 pipeline needs one), builds the eval dataloader with Friendy's loader, runs the
 pipeline, and writes ``predictions.pt`` + ``result.yaml`` in the same shape as
-``friendy_chachkalica/eval_checkpoint.py`` so results drop into the eval flow.
+``friendy_chachkalica/ml/eval_checkpoint.py`` so results drop into the eval flow.
 """
 
 import argparse

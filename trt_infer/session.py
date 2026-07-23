@@ -2,8 +2,11 @@
 ``onnx_infer/session.py::OnnxModel``.
 
 Owns the deserialized engine + execution context and runs one pre-processed
-``[1,3,H,W]`` batch through it, returning the three Contract-A outputs
-(``boxes``/``scores``/``labels``) in that canonical order.
+``[B,3,H,W]`` batch through it, returning the three Contract-A outputs
+(``boxes``/``scores``/``labels``) in that canonical order — a single
+``(boxes, scores, labels)`` triple for ``B == 1`` (unchanged from before, so
+every existing single-image caller keeps working as-is), or a list of one
+triple per image for ``B > 1``.
 
 Device memory and the CUDA stream are managed with **torch** (present wherever a
 GPU runtime runs), so there is no pycuda / cuda-python dependency: input bytes go
@@ -73,7 +76,7 @@ def _build_allocator_class(trt, torch):
 
 
 class TrtModel:
-    """A loaded TensorRT engine + its meta, ready to run one ``[1,3,H,W]`` batch."""
+    """A loaded TensorRT engine + its meta, ready to run one ``[B,3,H,W]`` batch."""
 
     def __init__(self, engine_path, meta, device="cuda") -> None:
         import tensorrt as trt
@@ -146,6 +149,7 @@ class TrtModel:
         trt, torch = self._trt, self._torch
 
         batched = np.ascontiguousarray(batched, dtype=np.float32)
+        batch_size = int(batched.shape[0])
         input_gpu = torch.from_numpy(batched).to(self._device)  # keep alive through execute
 
         self.context.set_input_shape(self.input_name, tuple(int(d) for d in batched.shape))
@@ -175,16 +179,41 @@ class TrtModel:
 
         ordered = [outputs[tname] for tname in self._emit_order]
         if self._efficientnms:
-            return _unpack_efficientnms(ordered)
-        return ordered
+            triples = _unpack_efficientnms(ordered, batch_size)
+        else:
+            triples = _split_passthrough(ordered, batch_size)
+        # B == 1: return the bare triple, exactly what every caller written
+        # before batching existed still expects. B > 1: return the list so a
+        # caller that actually submitted a real batch can tell images apart.
+        return triples[0] if batch_size == 1 else triples
 
 
-def _unpack_efficientnms(ordered: list) -> list:
-    """[num_detections, boxes, scores, classes] (fixed-size, batch 1) ->
-    [boxes[N,4], scores[N], labels[N]] sliced to the valid detection count."""
+def _unpack_efficientnms(ordered: list, batch_size: int) -> list:
+    """[num_detections, boxes, scores, classes] (fixed-size *per image*) ->
+    one ``[boxes[Ni,4], scores[Ni], labels[Ni]]`` triple per image, each sliced
+    to that image's own valid detection count."""
     num_det, det_boxes, det_scores, det_classes = ordered
-    n = int(np.asarray(num_det).reshape(-1)[0])
-    boxes = np.asarray(det_boxes).reshape(-1, 4)[:n]
-    scores = np.asarray(det_scores).reshape(-1)[:n]
-    labels = np.asarray(det_classes).reshape(-1)[:n]
-    return [boxes, scores, labels]
+    num_det = np.asarray(num_det).reshape(batch_size, -1)[:, 0]
+    det_boxes = np.asarray(det_boxes).reshape(batch_size, -1, 4)
+    det_scores = np.asarray(det_scores).reshape(batch_size, -1)
+    det_classes = np.asarray(det_classes).reshape(batch_size, -1)
+    triples = []
+    for i in range(batch_size):
+        n = int(num_det[i])
+        triples.append([det_boxes[i, :n], det_scores[i, :n], det_classes[i, :n]])
+    return triples
+
+
+def _split_passthrough(ordered: list, batch_size: int) -> list:
+    """Slice already-batched passthrough outputs (leading dim = batch_size,
+    e.g. rtdetr/rfdetr, which compile straight from their own batch-aware
+    ONNX graph) into one per-image ``[boxes, scores, labels]`` triple.
+
+    Unlike the EfficientNMS path, this repo doesn't yet build any passthrough
+    arch's engine with a batch profile wider than 1, so this branch is
+    currently only exercised at ``batch_size == 1`` in practice; it's written
+    to generalize correctly (assuming the graph's own batch axis matches the
+    input batch) rather than to special-case that.
+    """
+    boxes, scores, labels = ordered
+    return [[boxes[i], scores[i], labels[i]] for i in range(batch_size)]

@@ -1,5 +1,5 @@
 """Per-architecture service handlers, one file per arch, dispatched by name —
-mirroring ``friendy_chachkalica/adapters`` + ``registry.py::MODEL_REGISTRY``.
+mirroring ``friendy_chachkalica/ml/adapters`` + ``registry.py::MODEL_REGISTRY``.
 
 Adding a new arch is a drop-in: add ``arch/<name>.py`` with an ``ArchHandler``
 subclass and register it here.

@@ -3,7 +3,7 @@
 ## Context
 
 Trained detectors are saved as `best.pt`/`last.pt` training checkpoints
-(`friendy_chachkalica/train.py:311`). To run one for inference, `chachak`
+(`friendy_chachkalica/ml/train.py:311`). To run one for inference, `chachak`
 reconstructs the model architecture in Python — `load_checkpoint_adapter`
 (`chachak/infer.py:29`) calls `build_model(model_name, num_classes, **params)`
 then `load_state_dict`. That means every consumer needs the *architecture code*
@@ -109,7 +109,7 @@ core.
 ## Package layout (`chachkalica_unified/onnx_infer/`)
 
 One `.py` file per architecture under `arch/`, dispatched through a registry —
-mirroring the existing `friendy_chachkalica/adapters/<arch>.py` +
+mirroring the existing `friendy_chachkalica/ml/adapters/<arch>.py` +
 `registry.py::MODEL_REGISTRY` convention. The generic core stays generic; each
 arch file supplies only what is genuinely arch-specific.
 
@@ -184,12 +184,12 @@ if onnx_path.exists():
 existing dict (`model_name`, `num_classes`, `params`, `train_classes` from
 `meta["class_map"]`). `detector.py:67` and everything below is untouched.
 
-## Export side (separate, out of the service — `friendy_chachkalica/onnx_export/`)
+## Export side (separate, out of the service — `friendy_chachkalica/ml/onnx_export/`)
 
 Same one-file-per-arch structure, own registry:
 
 ```
-friendy_chachkalica/onnx_export/
+friendy_chachkalica/ml/onnx_export/
   __init__.py
   cli.py          # export_onnx CLI: checkpoint path -> best.onnx + best.meta.json
   registry.py     # EXPORT_REGISTRY: {"retinanet": export_retinanet, ...}

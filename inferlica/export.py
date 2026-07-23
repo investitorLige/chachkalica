@@ -6,8 +6,8 @@ trt_infer to confirm the exported artifacts actually run.
 
 Writes into ``--output-dir`` (basename taken from the checkpoint's stem):
 
-- ``<stem>.onnx`` + ``<stem>.meta.json``               (friendy_chachkalica.onnx_export)
-- ``<stem>.engine`` + ``<stem>.meta.json`` + ``<stem>.engine.json``  (friendy_chachkalica.trt_export)
+- ``<stem>.onnx`` + ``<stem>.meta.json``               (friendy_chachkalica.ml.onnx_export)
+- ``<stem>.engine`` + ``<stem>.meta.json`` + ``<stem>.engine.json``  (friendy_chachkalica.ml.trt_export)
 - ``<stem>.trt.onnx``  (only for archs whose TRT engine needs a raw-output +
   EfficientNMS re-export, e.g. retinanet/yolox)
 
@@ -25,9 +25,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from friendy_chachkalica.onnx_export.cli import export_checkpoint
+from friendy_chachkalica.ml.onnx_export.cli import export_checkpoint
 from friendy_chachkalica.registry import build_model
-from friendy_chachkalica.trt_export.cli import build_engine
+from friendy_chachkalica.ml.trt_export.cli import build_engine
 
 HW = Tuple[int, int]
 
