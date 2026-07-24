@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import sys
 import time
 import traceback
@@ -26,17 +27,17 @@ if str(_REPO_ROOT) not in sys.path:
 import torch
 
 try:
-    from .gpu_monitor import GpuMonitor, read_current_mem_mb
+    from .gpu_monitor import GpuMonitor, own_usage_delta_mb, read_current_mem_mb, snapshot_process_mem_mb
     from .variants import ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec
 except ImportError:  # run as a flat script
-    from gpu_monitor import GpuMonitor, read_current_mem_mb  # type: ignore
+    from gpu_monitor import GpuMonitor, own_usage_delta_mb, read_current_mem_mb, snapshot_process_mem_mb  # type: ignore
     from variants import ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec  # type: ignore
 
 METRIC_ROW_ORDER = [
     "status",
     "status_reason",
     "nms_status",
-    "engine_precision",
+    "precision",
     "eval_seconds",
     "inference_seconds",
     "fps",
@@ -158,7 +159,7 @@ def _engine_cache_matches(
     ``export_engine_artifact`` used to treat "the file exists" as "the cache is
     valid" -- but a ``bench_out/`` reused across runs with a different
     ``--image-size``/``--precision`` would then silently keep serving an engine
-    built for the OLD request, mislabeling its ``engine_precision`` in the CSV
+    built for the OLD request, mislabeling the CSV's ``precision`` row
     with no warning (this is exactly how one run's ``fasterrcnn/
     mobilenet_v3_large_320_fpn`` cell reported a lone stale fp32 while its
     sibling variants, rebuilt fresh, reported fp16). Compare against the
@@ -235,8 +236,96 @@ def export_engine_artifact(
     )
 
 
+def export_onnx_fp16_artifact(onnx_path: Path, arch: str, force_rebuild: bool) -> Optional[Path]:
+    """Cast the standard (fp32) ONNX export to fp16 for a GPU onnxruntime run.
+
+    Reuses the same graph-level caster AND the same per-arch fp16 policy the
+    export CLI's ``_write_fp16_sidecar`` and the TRT builder use -- the arch's
+    ``get_fp16_op_block``/``get_fp16_node_block`` keep-lists are passed through
+    so an arch with fp16-fragile ops gets the identical fp32 treatment here as
+    everywhere else. Without them the benchmark would silently cast those ops to
+    fp16 and report 'fp16' numbers for a graph the rest of the codebase keeps
+    partly in fp32, making the cross-format comparison apples-to-oranges. I/O
+    dtypes stay fp32, so the ORIGINAL meta.json applies verbatim.
+
+    Deliberately does NOT apply the CLI sidecar's ``is_fp16_trusted`` gate: that
+    is a shipping-safety floor, whereas this is a measurement tool. The benchmark
+    times whatever precision the sweep requests (its TRT path likewise passes an
+    explicit precision straight to ``build_engine``, bypassing the auto-only
+    trust floor in ``trt_export.cli``), so gating the ONNX path on trust would
+    make it inconsistent with the engine path in the same sweep. Degrades
+    gracefully (returns ``None`` instead of raising) so one arch without an
+    importable converter never kills the sweep.
+    """
+    fp16_path = onnx_path.with_name(onnx_path.stem + "_fp16.onnx")
+    meta_path = onnx_path.with_suffix(".meta.json")
+    fp16_meta_path = fp16_path.with_suffix(".meta.json")
+    if fp16_path.exists() and fp16_meta_path.exists() and not force_rebuild:
+        return fp16_path
+
+    from friendy_chachkalica.ml.trt_export.arch import get_fp16_node_block, get_fp16_op_block
+    from friendy_chachkalica.ml.trt_export.fp16_cast import cast_onnx_bytes_to_fp16
+
+    fp16_bytes, _method = cast_onnx_bytes_to_fp16(
+        onnx_path.read_bytes(),
+        extra_fp32_ops=get_fp16_op_block(arch),
+        node_block_substrings=get_fp16_node_block(arch),
+    )
+    if fp16_bytes is None:
+        return None
+    fp16_path.write_bytes(fp16_bytes)
+    fp16_meta_path.write_text(meta_path.read_text())
+    return fp16_path
+
+
 def _synthetic_images(batch_size: int, image_size: int, device: torch.device) -> List[torch.Tensor]:
     return [torch.rand(3, image_size, image_size, device=device) for _ in range(batch_size)]
+
+
+# Once per process per runtime kind ("onnx" | "engine") -- see _prime_gpu_runtime.
+_runtime_primed: Dict[str, bool] = {}
+
+
+def _prime_gpu_runtime(fmt: str, path: Path, device: torch.device, image_size: int) -> None:
+    """Absorb TensorRT/onnxruntime's one-time CUDA runtime initialization
+    cost once per process, unmeasured, before any cell's real memory
+    baseline is taken.
+
+    Verified directly: loading three TensorRT engines back to back in one
+    process measured deltas of 402 / 110 / 112 MB -- the first alone ate
+    ~290MB of cuDNN/cuBLAS/plugin-registry setup that has nothing to do with
+    that specific model (the second and third, model-specific-only, land
+    much closer together). Without this, whichever cell happens to run
+    first in the sweep unfairly inherits that fixed tax in its reported
+    Δmem. Uses THIS cell's own already-built artifact rather than a
+    separate dummy network -- simpler, and the memory it uses is fully
+    freed (``del`` + ``gc.collect`` + ``empty_cache``) before returning, so
+    it doesn't leak into the real measurement that follows.
+    """
+    if _runtime_primed.get(fmt):
+        return
+    primer = None
+    try:
+        images = _synthetic_images(1, image_size, device)
+        if fmt == "engine":
+            from trt_infer import load_trt_adapter
+
+            primer, _ = load_trt_adapter(path, device)
+        else:
+            from onnx_infer import load_onnx_adapter
+
+            primer, _ = load_onnx_adapter(path, device)
+        from chachak.infer import predict_adapter as _predict_for_prime
+
+        _predict_for_prime(primer, images)
+        torch.cuda.synchronize()
+    except Exception:  # noqa: BLE001 - priming is best-effort, never worth failing a cell over
+        pass
+    finally:
+        del primer
+        gc.collect()
+        torch.cuda.empty_cache()
+        _runtime_primed[fmt] = True
 
 
 def time_predict(
@@ -245,35 +334,108 @@ def time_predict(
     device: torch.device,
     warmup: int,
     iterations: int,
+    amp_enabled: bool = False,
+    min_duration_s: float = 0.0,
+    profile_cuda: bool = False,
 ) -> Dict[str, float]:
     """Warmup + timed predict() loop, bracketed with torch.cuda.synchronize()
     so torch/onnxruntime-CUDA timings aren't optimistic the way
     inferlica/eval.py::run_eval's timer is (it stops before the
-    .detach().cpu() call that would force a sync)."""
+    .detach().cpu() call that would force a sync).
+
+    ``amp_enabled`` wraps the loop in ``torch.autocast`` -- the same mechanism
+    (and the same ``supports_amp`` gate) ``train.py``'s AMP path already uses,
+    rather than a blanket ``.half()`` cast, so a model with a documented fp16
+    instability (e.g. rtdetr's decoder/GIoU overflow, ``supports_amp=False``
+    on its adapter) is never forced through it here either.
+
+    ``min_duration_s`` grows ``iterations`` (never shrinks it) so the timed
+    loop reliably clears this GPU's ~1-second NVML utilization refresh
+    window -- verified directly that querying it 1.28M times in one second
+    only sees the value change once, so any cell shorter than that window
+    gets a stale/lucky snapshot rather than a real reading, no matter how
+    it's sampled. One calibration call (after warmup, unmeasured towards the
+    real timing) estimates per-iteration cost, then the loop runs enough
+    iterations to clear the target with margin.
+
+    ``profile_cuda`` runs one ADDITIONAL pass (same iteration count) wrapped
+    in ``torch.profiler`` (CUPTI-backed) after the real timed loop, and
+    returns ``cuda_busy_pct`` from it -- real kernel-level GPU busy time as a
+    percent of wall clock, not an NVML sample. Deliberately a *separate*
+    pass, not wrapped around the timed loop above: verified directly that
+    profiling has real, substantial overhead (same model, same iteration
+    count, unprofiled 241.5 fps vs profiled 182.7 fps -- a genuine ~24%
+    slowdown, not noise, roughly proportional to how many small ops a model
+    dispatches per call). Wrapping the real timing loop in the profiler would
+    have silently made every profiled cell's own fps/latency pessimistic by
+    exactly that amount -- which is what an earlier version of this function
+    did, undetected until a before/after comparison surfaced fps dropping
+    5-28% for PT specifically (smaller/faster models hit hardest, the
+    signature of a roughly fixed per-op instrumentation cost) while
+    ONNX/ENGINE (never profiled) stayed flat. Only meaningful for ``pt``:
+    onnxruntime and TensorRT dispatch their own kernels outside torch's
+    profiler, so this is not requested for those formats (they still rely on
+    GpuMonitor's NVML sampling, improved by ``min_duration_s`` above but not
+    made exact by it).
+    """
     from chachak.infer import predict_adapter
 
     is_cuda = str(device).startswith("cuda")
     iterations = max(1, iterations)
 
-    for _ in range(max(0, warmup)):
-        predict_adapter(adapter, images)
+    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+        for _ in range(max(0, warmup)):
+            predict_adapter(adapter, images)
 
-    if is_cuda:
-        torch.cuda.synchronize()
-    start = time.perf_counter()
-    for _ in range(iterations):
-        predict_adapter(adapter, images)
-    if is_cuda:
-        torch.cuda.synchronize()
-    inference_seconds = time.perf_counter() - start
+        if is_cuda:
+            torch.cuda.synchronize()
+
+        if min_duration_s > 0:
+            calib_start = time.perf_counter()
+            predict_adapter(adapter, images)
+            if is_cuda:
+                torch.cuda.synchronize()
+            per_iter_s = max(time.perf_counter() - calib_start, 1e-6)
+            iterations = max(iterations, math.ceil(min_duration_s / per_iter_s))
+
+        # The ONLY loop that determines eval_seconds/fps -- never profiled.
+        start = time.perf_counter()
+        for _ in range(iterations):
+            predict_adapter(adapter, images)
+        if is_cuda:
+            torch.cuda.synchronize()
+        inference_seconds = time.perf_counter() - start
+
+        cuda_busy_pct = None
+        if profile_cuda and is_cuda:
+            from torch.profiler import ProfilerActivity, profile
+
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                prof_start = time.perf_counter()
+                for _ in range(iterations):
+                    predict_adapter(adapter, images)
+                torch.cuda.synchronize()
+                prof_wall_s = time.perf_counter() - prof_start
+            # self_device_time_total (not device_time_total) -- the latter
+            # double/triple-counts the same kernel across nested op-level
+            # events (e.g. aten::conv2d -> aten::convolution ->
+            # aten::cudnn_convolution all reporting overlapping "total" time
+            # for one underlying kernel); "self" time is the non-overlapping
+            # figure, verified directly against the profiler's own printed
+            # "Self CUDA time total".
+            cuda_busy_us = sum(e.self_device_time_total for e in prof.key_averages())
+            cuda_busy_pct = round(min(cuda_busy_us / 1e6 / prof_wall_s * 100, 100.0), 3)
 
     num_images = iterations * len(images)
     fps = num_images / inference_seconds if inference_seconds > 0 else 0.0
-    return {
+    result = {
         "eval_seconds": round(inference_seconds, 6),
         "inference_seconds": round(inference_seconds, 6),
         "fps": round(fps, 3),
     }
+    if cuda_busy_pct is not None:
+        result["cuda_busy_pct"] = cuda_busy_pct
+    return result
 
 
 def benchmark_cell(
@@ -292,6 +454,7 @@ def benchmark_cell(
     workspace_gb: float,
     gpu_poll_interval_s: float,
     force_rebuild: bool,
+    min_duration_s: float = 0.0,
 ) -> Dict[str, Any]:
     """Benchmark one (arch, variant, format) cell.
 
@@ -304,7 +467,7 @@ def benchmark_cell(
         "status": "error",
         "status_reason": None,
         "nms_status": NMS_STATUS[arch],
-        "engine_precision": None,
+        "precision": None,
     }
 
     if fmt == "engine" and arch in NO_TRT_ARCHS:
@@ -322,16 +485,148 @@ def benchmark_cell(
     # below meaningful; see gpu_monitor.py's module docstring).
     gc.collect()
 
+    is_cuda = str(device).startswith("cuda")
+    amp_enabled = False
+
     try:
         pt_adapter = build_pt_adapter(arch, variant, num_classes)
 
+        # onnx/engine pre-allocate essentially everything they'll ever need at
+        # LOAD time -- TensorRT's execution-context workspace is fixed at
+        # build time (its own `device_memory_size_v2` property, checked
+        # directly, turned out to only cover the context's own scratch space,
+        # not the separately-allocated engine weights -- so it undercounts the
+        # real total and doesn't vary sensibly across model sizes either);
+        # onnxruntime's arena allocator (mem-pattern, the default) reuses its
+        # first-call allocation on every subsequent Run(). Verified neither
+        # allocates further during the timed loop. So for those two formats
+        # the informative number is a load-time before/after delta, not a
+        # during-loop peak -- only pt's forward pass genuinely spikes per-call
+        # (handled separately below via torch's own allocator tracker).
+        #
+        # Uses a full per-pid snapshot diff (snapshot_process_mem_mb /
+        # own_usage_delta_mb), NOT read_current_mem_mb's residual subtraction
+        # -- verified directly that this process's own CUDA activity gets
+        # listed by nvml under a pid that doesn't match os.getpid() at all
+        # (not a namespace artifact), so residual mode's "subtract every pid
+        # except ours" was accidentally subtracting our OWN entry too,
+        # netting to ~zero regardless of real usage. Diffing two full
+        # snapshots and summing whichever pids grew sidesteps needing to
+        # identify "our" pid at all.
+        #
+        # The baseline is taken PER FORMAT, after that format's runtime has
+        # been primed (see _prime_gpu_runtime) -- not once up front -- because
+        # TensorRT/onnxruntime's CUDA libraries pay a large, ~constant
+        # one-time initialization cost (cuDNN/cuBLAS/plugin-registry setup)
+        # the first time EITHER is used in this process, independent of model
+        # size: verified directly by loading three engines back to back in
+        # one process (402 / 110 / 112 MB) -- the first alone ate ~290MB of
+        # pure runtime setup that has nothing to do with that specific model.
+        # Priming once per format, per process, before any cell's real
+        # baseline, means no cell unfairly inherits that tax just for having
+        # run first in the sweep.
+        load_baseline_snapshot = None
+
         if fmt == "pt":
             runnable = pt_adapter.to(device)
+            # Same mechanism + same supports_amp gate as train.py's AMP path
+            # (see time_predict's docstring) -- not every arch's forward pass
+            # is safe under fp16 (rtdetr's adapter documents a decoder/GIoU
+            # NaN overflow), so this only ever enables autocast where that
+            # flag doesn't say otherwise.
+            amp_enabled = precision == "fp16" and is_cuda and getattr(pt_adapter, "supports_amp", True)
+            if precision == "fp16" and is_cuda and not amp_enabled:
+                result["status_reason"] = "adapter has supports_amp=False (documented fp16 instability) -- ran fp32"
+            result["precision"] = "fp16" if amp_enabled else "fp32"
         elif fmt == "onnx":
             onnx_path = export_onnx_artifact(arch, variant, pt_adapter, num_classes, output_dir, force_rebuild)
+            load_path = onnx_path
+            result["precision"] = "fp32"
+            if precision == "fp16" and is_cuda:
+                fp16_path = export_onnx_fp16_artifact(onnx_path, arch, force_rebuild)
+                if fp16_path is None:
+                    result["status_reason"] = "no ONNX fp16 converter importable -- ran fp32"
+                else:
+                    load_path = fp16_path
+                    result["precision"] = "fp16"
+
+            if is_cuda:
+                # Prime with onnx_path (the plain fp32 export), never
+                # load_path -- load_path may be the fp16-cast graph, which
+                # can be genuinely invalid for some archs (the same
+                # dangling-node/duplicate-node converter bug documented
+                # elsewhere), and priming only needs SOME valid graph to
+                # warm up onnxruntime's CUDA runtime, not this cell's own.
+                _prime_gpu_runtime("onnx", onnx_path, device, image_size)
+                torch.cuda.empty_cache()
+                load_baseline_snapshot = snapshot_process_mem_mb()
+
             from onnx_infer import load_onnx_adapter
 
-            runnable, _ = load_onnx_adapter(onnx_path, device)
+            try:
+                runnable, _ = load_onnx_adapter(load_path, device)
+            except Exception as fp16_load_exc:  # noqa: BLE001 - graceful fp16->fp32 fallback, not a cell failure
+                if load_path is onnx_path:
+                    raise  # not an fp16-cast issue -- a genuine failure, let the outer handler report it
+                # The shared fp16 caster (also used by the .engine path) can emit a
+                # graph TensorRT's parser tolerates but onnxruntime's stricter
+                # session loader rejects outright (observed: a dangling node input
+                # reference on yolox, survives an onnx_graphsurgeon toposort --
+                # a real bug in the converter, not an ordering artifact). Fall back
+                # to the plain fp32 graph rather than failing the whole cell.
+                result["status_reason"] = (
+                    f"ONNX fp16 graph failed to load ({type(fp16_load_exc).__name__}) -- ran fp32"
+                )
+                result["precision"] = "fp32"
+                load_path = onnx_path
+                runnable, _ = load_onnx_adapter(load_path, device)
+
+            # onnxruntime only actually uses CUDA if onnxruntime-gpu (with a
+            # matching CUDA/cuDNN runtime on LD_LIBRARY_PATH) is what's
+            # importable in this process -- onnx_infer/session.py already
+            # requests CUDAExecutionProvider first when device is cuda, but a
+            # provider request silently degrades to CPU if the GPU provider
+            # isn't actually available. Surface that instead of silently
+            # reporting a GPU/fp16 result that was actually CPU/fp32.
+            try:
+                actual_providers = runnable._model.session.get_providers()
+            except Exception:  # noqa: BLE001 - introspection is best-effort
+                actual_providers = None
+            if is_cuda and actual_providers is None:
+                # Couldn't confirm the execution provider (wrapper internals
+                # moved). Fail closed: flag that the reported precision/device
+                # is unverified rather than letting a possible silent CPU
+                # degrade pass as a clean fp16/CUDA result.
+                unverified = (
+                    "could not verify onnx execution provider "
+                    "-- reported precision/device unconfirmed"
+                )
+                result["status_reason"] = (
+                    f"{result['status_reason']}; {unverified}"
+                    if result["status_reason"]
+                    else unverified
+                )
+            elif is_cuda and "CUDAExecutionProvider" not in actual_providers:
+                # Preserve any earlier fp16-converter/-load reason instead of
+                # overwriting it -- the CPU degrade is additional context, not a
+                # replacement for a real fp16-export defect the operator needs.
+                cpu_reason = (
+                    f"onnx requested cuda but CUDAExecutionProvider unavailable "
+                    f"(providers={actual_providers}) -- ran CPU fp32"
+                )
+                result["status_reason"] = (
+                    f"{result['status_reason']}; {cpu_reason}"
+                    if result["status_reason"]
+                    else cpu_reason
+                )
+                # If we'd loaded the fp16-cast graph, reload the real fp32 graph
+                # before timing: an fp16-interior graph emulated on the CPU EP is
+                # not fp32, so timing/labelling it as fp32 (as the old code did)
+                # is exactly the mislabel this block exists to prevent.
+                if load_path is not onnx_path:
+                    load_path = onnx_path
+                    runnable, _ = load_onnx_adapter(load_path, device)
+                result["precision"] = "fp32"
         elif fmt == "engine":
             onnx_path = export_onnx_artifact(arch, variant, pt_adapter, num_classes, output_dir, force_rebuild)
             engine_path = export_engine_artifact(
@@ -345,7 +640,12 @@ def benchmark_cell(
             # itself, not just buried in a per-engine .engine.json on disk.
             provenance_path = Path(str(engine_path) + ".json")
             if provenance_path.exists():
-                result["engine_precision"] = json.loads(provenance_path.read_text()).get("precision")
+                result["precision"] = json.loads(provenance_path.read_text()).get("precision")
+
+            if is_cuda:
+                _prime_gpu_runtime("engine", engine_path, device, image_size)
+                torch.cuda.empty_cache()
+                load_baseline_snapshot = snapshot_process_mem_mb()
 
             runnable, _ = load_trt_adapter(engine_path, device)
         else:
@@ -353,33 +653,83 @@ def benchmark_cell(
 
         images = _synthetic_images(batch_size, image_size, device)
 
+        # One settling call before the "after" snapshot, for the same reason
+        # noted above: ORT's arena and TRT's internal setup should already be
+        # steady-state by the time the timed loop's own warmup runs, not
+        # still catching up mid-measurement. Uses the same warmup count as
+        # the timed loop for consistency, not because more than ~1 call is
+        # expected to matter.
+        load_delta_mem_mb = None
+        if fmt in ("onnx", "engine") and is_cuda and load_baseline_snapshot is not None:
+            from chachak.infer import predict_adapter as _predict_for_load
+
+            for _ in range(max(1, warmup)):
+                _predict_for_load(runnable, images)
+            torch.cuda.synchronize()
+            load_after_snapshot = snapshot_process_mem_mb()
+            load_delta_mem_mb = own_usage_delta_mb(load_baseline_snapshot, load_after_snapshot)
+
         # torch.cuda.empty_cache() never frees a live tensor/model -- it only
         # returns already-unreferenced cached blocks to the driver -- so this
         # is safe to call with the adapter/images already built, and it gives
         # the tightest possible floor: it flushes both this cell's own
         # transient build garbage AND anything gc.collect() just freed from
         # the previous cell above.
-        is_cuda = str(device).startswith("cuda")
         if is_cuda:
             torch.cuda.empty_cache()
         baseline_mem_mb = read_current_mem_mb() if is_cuda else None
+        # pt gets exact (not sampled) treatment via torch's own allocator
+        # bookkeeping -- updated synchronously on every alloc/free, so it
+        # cannot miss a spike between two polls the way GpuMonitor's NVML
+        # sampling can (confirmed: NVML sampling read 0.0 MB on a cell torch's
+        # own tracker measured at ~479 MB peak allocated). pt's forward pass
+        # genuinely spikes per-call (unlike onnx/engine, handled above via a
+        # load-time delta instead), so this brackets the timed loop itself
+        # rather than just the load.
+        pt_baseline_alloc_bytes = None
+        if fmt == "pt" and is_cuda:
+            torch.cuda.synchronize()
+            pt_baseline_alloc_bytes = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
 
+        # profile_cuda only for pt -- onnxruntime/TensorRT dispatch their own
+        # kernels outside torch's dispatcher, so torch.profiler can't see
+        # them; those two still rely on GpuMonitor's NVML sampling below,
+        # just over a longer (min_duration_s-stretched) window.
         with GpuMonitor(interval_s=gpu_poll_interval_s) as mon:
-            timing = time_predict(runnable, images, device, warmup, iterations)
+            timing = time_predict(
+                runnable, images, device, warmup, iterations,
+                amp_enabled=amp_enabled, min_duration_s=min_duration_s, profile_cuda=(fmt == "pt"),
+            )
         gpu = mon.result
 
         result.update(timing)
-        # gpu_mem_mb_peak is peak-during-this-cell MINUS this cell's own
-        # pre-timing baseline, not a raw absolute reading -- nvml's memory
-        # counters (whole-device, or even per-process) never reset between
-        # cells, so an uncorrected peak just climbs across a sweep as
-        # torch/onnxruntime/TensorRT accumulate allocations cell over cell.
-        if gpu.peak_mem_mb is not None and baseline_mem_mb is not None:
+        if fmt == "pt" and pt_baseline_alloc_bytes is not None:
+            peak_alloc_bytes = torch.cuda.max_memory_allocated()
+            result["gpu_mem_mb_peak"] = round(max(peak_alloc_bytes - pt_baseline_alloc_bytes, 0) / (1024 * 1024), 4)
+        elif load_delta_mem_mb is not None:
+            # onnx/engine: load-time before/after delta (see above) --
+            # includes weights + workspace/arena, not just execution-context
+            # scratch, and isn't vulnerable to missing a during-loop spike
+            # since there isn't one for either format once loaded.
+            result["gpu_mem_mb_peak"] = round(load_delta_mem_mb, 4)
+        elif gpu.peak_mem_mb is not None and baseline_mem_mb is not None:
+            # Fallback only: shouldn't normally fire for cuda pt/onnx/engine
+            # given the branches above, but kept for a CPU-provider-only
+            # environment or any future format.
             result["gpu_mem_mb_peak"] = round(max(gpu.peak_mem_mb - baseline_mem_mb, 0.0), 4)
         else:
             result["gpu_mem_mb_peak"] = gpu.peak_mem_mb
-        result["gpu_util_pct_mean"] = gpu.mean_util_pct
-        result["gpu_util_pct_peak"] = gpu.peak_util_pct
+
+        cuda_busy_pct = timing.get("cuda_busy_pct")
+        if cuda_busy_pct is not None:
+            # pt: exact (CUPTI-backed), not an NVML sample -- mean == peak
+            # since there's no sampling involved, just a single true reading.
+            result["gpu_util_pct_mean"] = cuda_busy_pct
+            result["gpu_util_pct_peak"] = cuda_busy_pct
+        else:
+            result["gpu_util_pct_mean"] = gpu.mean_util_pct
+            result["gpu_util_pct_peak"] = gpu.peak_util_pct
         result["status"] = "ok"
     except Exception as exc:  # noqa: BLE001 - fault isolation is the point
         result["status"] = "error"
@@ -425,6 +775,7 @@ def run_sweep(
     gpu_poll_interval_s: float,
     force_rebuild: bool,
     variant_names: Optional[List[str]] = None,
+    min_duration_s: float = 0.0,
 ) -> Dict[str, Any]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -441,6 +792,7 @@ def run_sweep(
         workspace_gb=workspace_gb,
         gpu_poll_interval_s=gpu_poll_interval_s,
         force_rebuild=force_rebuild,
+        min_duration_s=min_duration_s,
     )
 
     dataframes: Dict[str, Any] = {}

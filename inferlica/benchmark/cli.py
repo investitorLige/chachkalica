@@ -55,14 +55,35 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5, help="Untimed calls before timing starts (default: 5)")
     parser.add_argument("--image-size", type=int, default=640, help="Synthetic square image HxW (default: 640)")
     parser.add_argument("--device", default="auto", help="auto | cpu | cuda (default: auto)")
-    parser.add_argument("--precision", choices=["fp16", "fp32"], default="fp16", help="TensorRT build precision")
+    parser.add_argument(
+        "--precision", choices=["fp16", "fp32"], default="fp16",
+        help="Precision to attempt across every format: TensorRT engine build, PT via "
+        "torch.autocast (skipped per-adapter if supports_amp=False), and ONNX via a graph-level "
+        "fp16 cast run through onnxruntime's CUDA execution provider (falls back to fp32 for any "
+        "of the three if that format's fp16 path isn't available; see the CSV's precision row)",
+    )
     parser.add_argument("--workspace-gb", type=float, default=4.0, help="TensorRT builder workspace (default: 4.0)")
     parser.add_argument(
         "--force-rebuild", action="store_true",
         help="Rebuild cached .onnx/.engine artifacts even if already present in --output-dir",
     )
     parser.add_argument(
-        "--gpu-poll-interval-ms", type=float, default=50.0, help="GPU sampling interval in ms (default: 50)"
+        "--gpu-poll-interval-ms", type=float, default=4.0,
+        help="GPU sampling interval in ms (default: 4). Most cells time out well under 100ms "
+        "(TRT engines especially) -- at the old 50ms default a ~12ms cell got only 2 background-thread "
+        "samples for its whole gpu_util_pct_mean/peak, so the number was closer to a coin flip on "
+        "whichever instant it landed on than a real average. 4ms keeps NVML query overhead negligible "
+        "relative to the GPU work itself while giving even a ~50ms cell a dozen-plus samples.",
+    )
+    parser.add_argument(
+        "--gpu-util-min-duration-s", type=float, default=0.0,
+        help="Grow --iterations (never shrink it) so each cell's timed loop runs at least this many "
+        "seconds (default: 0, off). This GPU's NVML utilization counter only refreshes about once a "
+        "second regardless of poll rate (measured: 1.28M queries/sec, 1 change) -- a cell shorter than "
+        "that window gets a stale/lucky snapshot, not a real reading, no matter how it's sampled. "
+        "2.0-3.0 reliably clears that window with margin; onnx/engine still rely on NVML sampling even "
+        "with this set (it just gives them a fair shot at a real sample), pt gets an exact CUPTI-backed "
+        "reading regardless via torch.profiler.",
     )
     args = parser.parse_args()
 
@@ -86,6 +107,7 @@ def main() -> None:
         gpu_poll_interval_s=args.gpu_poll_interval_ms / 1000.0,
         force_rebuild=args.force_rebuild,
         variant_names=args.variants,
+        min_duration_s=args.gpu_util_min_duration_s,
     )
 
     print("\n=== benchmark summary ===")

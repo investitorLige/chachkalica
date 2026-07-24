@@ -104,10 +104,14 @@ class RTDETRAdapter:
             ((image.to(device).float() - image_mean) / image_std)
             for image in images
         ]
-        max_height = max(image.shape[-2] for image in prepared_images)
-        max_width = max(image.shape[-1] for image in prepared_images)
-        max_height = _ceil_to_multiple(max_height, self.input_size_multiple)
-        max_width = _ceil_to_multiple(max_width, self.input_size_multiple)
+        canvas_size = self._fixed_canvas_size()
+        if canvas_size is not None:
+            max_height = max_width = canvas_size
+        else:
+            max_height = max(image.shape[-2] for image in prepared_images)
+            max_width = max(image.shape[-1] for image in prepared_images)
+            max_height = _ceil_to_multiple(max_height, self.input_size_multiple)
+            max_width = _ceil_to_multiple(max_width, self.input_size_multiple)
 
         pixel_values = []
         pixel_masks = []
@@ -125,6 +129,30 @@ class RTDETRAdapter:
             "pixel_values": torch.stack(pixel_values),
             "pixel_mask": torch.stack(pixel_masks),
         }
+
+    def _fixed_canvas_size(self) -> Optional[int]:
+        """Square token-grid side every batch pads/letterboxes to, or ``None``
+        to fall back to the old batch-derived size (only when resizing is
+        disabled via ``input_max_size``).
+
+        HF's RT-DETR never applies ``pixel_mask`` to encoder attention or to
+        the two-stage anchor/topk selection (confirmed against
+        ``transformers.models.rt_detr.modeling_rt_detr``: the mask is
+        downsampled in the backbone and then discarded, and the anchor
+        ``valid_mask`` used at the topk step is purely geometric) — padding is
+        scored identically to real content. Deriving the canvas from the
+        actual images in a batch therefore let the real-content-vs-padding
+        token ratio (and even the raw token count relative to
+        ``num_queries``) swing with whatever crops happened to land in the
+        same micro-batch — most visible with the person crops
+        ``people_detect_first`` produces, whose aspect ratios vary far more
+        than tiles/full frames. A canvas fixed to ``input_max_size`` makes the
+        token count, and so the topk selection's real-vs-padding odds, depend
+        only on that setting, never on batch composition.
+        """
+        if self.input_max_size is None or self.input_max_size <= 0:
+            return None
+        return _ceil_to_multiple(self.input_max_size, self.input_size_multiple)
 
     def _resize_training_inputs(self, images, targets):
         resized_images = []
@@ -146,12 +174,24 @@ class RTDETRAdapter:
         return resized_image
 
     def _resize_image_with_scale(self, image):
+        """Aspect-preserving scale to land the longest side on ``input_max_size``.
+
+        Always scales — up as well as down. A crop smaller than
+        ``input_max_size`` (e.g. a person_detect_first crop grown only to
+        ``detector_min_box_size``) is bilinearly upscaled to fill more of the
+        fixed canvas ``_fixed_canvas_size`` pads to, instead of being left at
+        native resolution and mostly zero-padded: the backbone's fixed stride
+        (32px of input per token) means a small subject spans more tokens
+        after upscaling, giving the encoder/decoder actual spatial resolution
+        to separate it (and anything on it) from its neighbors, at the cost of
+        interpolation blur rather than any new captured detail.
+        """
         if self.input_max_size is None or self.input_max_size <= 0:
             return image, 1.0, 1.0
 
         height, width = image.shape[-2:]
         longest_side = max(height, width)
-        if longest_side <= self.input_max_size:
+        if longest_side == self.input_max_size:
             return image, 1.0, 1.0
 
         scale = self.input_max_size / float(longest_side)

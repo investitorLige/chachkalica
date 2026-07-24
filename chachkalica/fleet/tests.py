@@ -307,6 +307,24 @@ class DatasetAnalyticsTests(TestCase):
         self.assertEqual(size["Medium (1–10%)"], 1)
         self.assertEqual(size["Large (≥10%)"], 1)
 
+    def test_image_dimension_distribution(self):
+        ds = _make_dataset(
+            self.src, "dimensions", "", ["thing"], ["a.jpg", "b.jpg", "c.jpg"],
+            labels={"a.txt": "0 0.5 0.5 0.1 0.1\n"},
+        )
+        with mock.patch(
+            "fleet.services.analytics._image_dimensions",
+            side_effect=[(1920, 1080), (640, 480), (1920, 1080)],
+        ):
+            report = analytics_svc.analyze_dataset(ds)
+
+        self.assertEqual(report["readable_images"], 3)
+        self.assertEqual(report["unreadable_images"], 0)
+        self.assertEqual(report["image_size_dist"], [
+            {"label": "1920 × 1080", "count": 2, "pct": 66.7},
+            {"label": "640 × 480", "count": 1, "pct": 33.3},
+        ])
+
     def test_per_image_density_and_empties(self):
         # img1: 1 box; img2: 12 boxes (crowded); img3: empty label file; img4: no file.
         twelve = "0 0.5 0.5 0.1 0.1\n" * 12

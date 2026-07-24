@@ -45,7 +45,13 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
             "key": "variant", "label": "Size / variant", "kind": "choice",
             "choices": ["resnet50_fpn", "resnet50_fpn_v2"],
             "default": "resnet50_fpn_v2",
-            "help": "RetinaNet backbone/FPN variant.",
+            "help": "RetinaNet backbone/FPN variant. Resize isn't exposed here — "
+                    "torchvision's internal default always applies (800 shorter "
+                    "side, capped at 1333 longer side, aspect-preserving, not "
+                    "square). After resizing, torchvision zero-pads each side up "
+                    "to a multiple of 32 so a batch can stack; that canvas is "
+                    "rectangular and depends on whatever's in the batch, not a "
+                    "fixed size — unlike rtdetr/rfdetr/yolox's fixed square canvas.",
         },
         {
             "key": "weights_backbone", "label": "Backbone weights", "kind": "str",
@@ -72,7 +78,9 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
             "help": "Square input size, pre-filled with the selected variant's native "
                     "resolution. Must stay divisible by the variant's patch stride (56 for "
                     "base, 32 for nano/small/medium/large) or it crashes on epoch 1. "
-                    "Blank = the variant's native resolution.",
+                    "Every input is resized (up or down, aspect-preserving) so its longest "
+                    "side hits this, then zero-padded (bottom-right) onto the square canvas "
+                    "— never stretched. Blank = the variant's native resolution.",
         },
         {
             "key": "score_threshold", "label": "Score threshold", "kind": "float",
@@ -108,7 +116,12 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
         },
         {
             "key": "input_max_size", "label": "Input max size", "kind": "int",
-            "default": 640, "help": "Longest-side cap; larger inputs are downscaled.",
+            "default": 640, "help": "Working resolution: every input is resized "
+                    "(up OR down) so its longest side hits this, then padded to a "
+                    "square. Higher = more accurate and more memory. For person-crop "
+                    "pipelines keep it at the model's native size (640 for rtdetr) — "
+                    "lowering it to 'match' small crops upscales them less and "
+                    "reduces accuracy.",
         },
         {
             "key": "input_size_multiple", "label": "Input size multiple", "kind": "int",
@@ -136,7 +149,11 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
         },
         {
             "key": "max_size", "label": "Resize max side", "kind": "int",
-            "help": "Longer-side resize cap. Blank = torchvision default (1333).",
+            "help": "Longer-side resize cap. Blank = torchvision default (1333). "
+                    "Aspect ratio is preserved (not square); after resizing, "
+                    "torchvision zero-pads each side up to a multiple of 32 so a "
+                    "batch can stack — that canvas is rectangular and depends on "
+                    "whatever's in the batch, not a fixed size.",
         },
         {
             "key": "variant", "label": "Size / variant", "kind": "choice",
@@ -210,6 +227,21 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
         {
             "key": "nms_threshold", "label": "nms_iou_threshold", "kind": "float",
             "default": 0.45, "help": "IoU threshold for non-maximum suppression.",
+        },
+        {
+            "key": "input_max_size", "label": "Input max size", "kind": "int",
+            "default": 640, "help": "Working resolution: every input is resized "
+                    "(up OR down) so its longest side hits this, then letterboxed "
+                    "onto a square canvas — padded with YOLOX's native gray value "
+                    "(114), not zero. Higher = more accurate and more memory. "
+                    "Native test/train size is 416 for nano/tiny, 640 for "
+                    "s/m/l/x — for TRT export keep this at the variant's native "
+                    "size (see the pretrained-weights dropdown above for which).",
+        },
+        {
+            "key": "input_size_multiple", "label": "Input size multiple", "kind": "int",
+            "default": 32, "help": "Pad each side up to this multiple. YOLOX's FPN "
+                    "downsamples by 32, so the canvas must stay a multiple of it.",
         },
         {
             "key": "trainable_backbone_layers", "label": "Trainable backbone layers",

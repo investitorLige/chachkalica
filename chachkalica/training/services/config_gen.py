@@ -8,6 +8,7 @@ point at an ``images`` dir and a ``labels`` dir with a ``classes`` list, plus
 the same on-disk resolvers the fleet annotation side already uses.
 """
 
+import math
 from pathlib import Path
 
 import yaml
@@ -105,12 +106,20 @@ def augmentation_entry(exp_dataset: ExperimentDataset) -> dict:
     return augmentation
 
 
-# rtdetr's encoder does topk(num_queries) over its last feature map, which has
-# (padded_crop_size / 32)^2 tokens; HF's own default (300) assumes near-full-frame
-# inputs and reliably crashes ("selected index k out of range") on the small
-# person crops people_detect_first produces. 25 pairs with
-# Experiment.detector_min_box_size's default (224px, >= 49 tokens) with margin,
-# and comfortably covers the handful of PPE items expected on one person crop.
+# rtdetr's encoder runs topk(num_queries) over its feature-pyramid tokens, so
+# num_queries must not exceed that token count or the forward pass crashes
+# ("selected index k out of range"). The adapter now upscales every crop and
+# pads it to a square canvas fixed by input_max_size (not one derived from the
+# batch's own crops — see RTDETRAdapter._fixed_canvas_size), so the crash floor
+# is now a function of input_max_size, NOT the raw crop size: model_entry below
+# enforces input_max_size >= input_size_multiple * ceil(sqrt(num_queries)), which
+# makes the coarsest (stride input_size_multiple) level alone clear num_queries
+# with margin. 25 is kept low anyway — HF's own default (300) assumes near-full-
+# frame subjects with many objects, whereas 25 comfortably covers the handful of
+# PPE items on one person crop, and a smaller query budget wastes fewer queries
+# on the fixed canvas's padding (HF never masks padding out of topk — see
+# _fixed_canvas_size). This replaces the old coupling to detector_min_box_size,
+# which floored the *crop* size back when crops were fed at native resolution.
 # Only injected for people_detect_first (see model_entry) — other pipelines
 # don't hit this mismatch (batch_people's tiles are already sized generously;
 # full-frame training was never undersized to begin with).
@@ -143,9 +152,31 @@ def model_entry(exp_model: ExperimentModel, pipeline_name: str | None = None) ->
     if (
         exp_model.arch == ExperimentModel.RTDETR
         and pipeline_name == pipelines.PEOPLE_DETECT_FIRST
-        and "num_queries" not in params
     ):
-        entry["num_queries"] = PEOPLE_DETECT_FIRST_RTDETR_NUM_QUERIES_DEFAULT
+        if "num_queries" not in params:
+            entry["num_queries"] = PEOPLE_DETECT_FIRST_RTDETR_NUM_QUERIES_DEFAULT
+        # Guard rtdetr's topk crash floor here (see the comment on
+        # PEOPLE_DETECT_FIRST_RTDETR_NUM_QUERIES_DEFAULT) rather than letting the
+        # trainer die at the first forward pass. input_max_size is now the
+        # working resolution each crop is upscaled to; require the coarsest
+        # (stride input_size_multiple) feature level to hold >= num_queries tokens
+        # on its own. Absent input_max_size -> the adapter's 640 default, safe.
+        input_max_size = params.get("input_max_size")
+        if input_max_size is not None:
+            num_queries = int(entry["num_queries"])
+            multiple = int(params.get("input_size_multiple", 32) or 32)
+            min_side = multiple * math.ceil(math.sqrt(num_queries))
+            if int(input_max_size) < min_side:
+                raise ValueError(
+                    f"{exp_model.arch}: Input max size {int(input_max_size)} is too "
+                    f"small for {pipelines.PEOPLE_DETECT_FIRST} with "
+                    f"num_queries={num_queries}. Person crops are upscaled to this "
+                    f"resolution and topk({num_queries}) runs over the resulting "
+                    f"feature tokens, so anything below {min_side} crashes the "
+                    f"forward pass and lower values under-resolve small PPE items. "
+                    f"Raise Input max size to at least {min_side} (leave it blank "
+                    f"for the 640 default), or lower num_queries."
+                )
     return entry
 
 

@@ -61,11 +61,22 @@ ARCH_VARIANTS: Dict[str, List[VariantSpec]] = {
     "rfdetr": [
         # weights=False is required: build_rfdetr defaults to weights=True,
         # which downloads the variant's published COCO checkpoint.
-        VariantSpec("nano", {"variant": "nano", "weights": False}),
-        VariantSpec("small", {"variant": "small", "weights": False}),
-        VariantSpec("medium", {"variant": "medium", "weights": False}),
-        VariantSpec("base", {"variant": "base", "weights": False}),
-        VariantSpec("large", {"variant": "large", "weights": False}),
+        #
+        # resolution=640 pins every variant to the same input size as the other
+        # 4 archs for a fair FPS/latency comparison (rfdetr's ONNX/TRT export is
+        # always static-shaped at whatever `resolution` the adapter reports --
+        # see friendy_chachkalica/ml/onnx_export/arch/rfdetr.py -- so this
+        # overrides each variant's native resolution: nano 384->640,
+        # small 512->640, medium 576->640, large 704->640). Verified all 4
+        # build + run a full predict() at 640 with no shape errors.
+        VariantSpec("nano", {"variant": "nano", "weights": False, "resolution": 640}),
+        VariantSpec("small", {"variant": "small", "weights": False, "resolution": 640}),
+        VariantSpec("medium", {"variant": "medium", "weights": False, "resolution": 640}),
+        # base's windowed-attention backbone hard-requires the resolution be a
+        # multiple of patch_size*num_windows=56 (640 isn't); 672 is the
+        # nearest valid size at or above 640.
+        VariantSpec("base", {"variant": "base", "weights": False, "resolution": 672}),
+        VariantSpec("large", {"variant": "large", "weights": False, "resolution": 640}),
         # xlarge/2xlarge deliberately excluded: rfdetr[plus], PML-1.0
         # non-commercial license -- the adapter itself refuses to build them.
     ],

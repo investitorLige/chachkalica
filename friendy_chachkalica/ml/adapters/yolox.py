@@ -17,6 +17,13 @@ except ImportError:
 
 DEFAULT_YOLOX_VARIANT = "yolox-s"
 
+# YOLOX's own letterbox convention pads with gray (114, 114, 114) in raw 0-255
+# pixel space. This pipeline's dataset already normalizes images to [0,1]
+# before they reach the adapter (see FriendyDetectionDataset), so the
+# equivalent pad value here is 114/255, not the raw 114 — padding with
+# unscaled 114 would be ~113x brighter than any real pixel the model ever sees.
+YOLOX_PAD_VALUE = 114.0 / 255.0
+
 # Official COCO-pretrained YOLOX checkpoints, keyed by variant. Passing
 # ``weights=True`` fetches the one matching ``variant`` — the yolox counterpart
 # to RF-DETR's default download and RT-DETR's ``weights=True``.
@@ -44,6 +51,8 @@ class YOLOXAdapter:
     score_threshold: float = 0.3
     nms_threshold: float = 0.45
     frozen_backbone_stages: tuple = ()
+    input_max_size: Optional[int] = 640
+    input_size_multiple: int = 32
     name: str = "yolox"
 
     def to(self, device):
@@ -62,6 +71,7 @@ class YOLOXAdapter:
         self.model.train()
         for stage in self.frozen_backbone_stages:
             _set_batch_norm_eval(stage)
+        images, targets = self._resize_training_inputs(images, targets)
         return self._loss_forward(images, targets)
 
     def validation_step(self, images, targets):
@@ -69,6 +79,7 @@ class YOLOXAdapter:
         self.model.train()
         _set_batch_norm_eval(self.model)
         try:
+            images, targets = self._resize_training_inputs(images, targets)
             return self._loss_forward(images, targets)
         finally:
             self.model.train(was_training)
@@ -93,7 +104,8 @@ class YOLOXAdapter:
             from vendor.yolox.utils import postprocess
 
         self.model.eval()
-        batch = self._prepare_batch(images)
+        resized = [self._resize_image_with_scale(image) for image in images]
+        batch = self._prepare_batch([r[0] for r in resized])
         outputs = self.model(batch)
         detections = postprocess(
             outputs,
@@ -102,21 +114,25 @@ class YOLOXAdapter:
             nms_thre=self.nms_threshold if nms_threshold is None else nms_threshold,
         )
         return [
-            yolox_detection_to_friendy(detection, image)
-            for detection, image in zip(detections, images)
+            yolox_detection_to_friendy(detection, image, scale_y, scale_x)
+            for detection, image, (_, scale_y, scale_x) in zip(detections, images, resized)
         ]
 
     def _prepare_batch(self, images):
         device = next(self.model.parameters()).device
         prepared_images = [image.to(device).float() for image in images]
-        max_height = _make_divisible(
-            max(image.shape[-2] for image in prepared_images),
-            32,
-        )
-        max_width = _make_divisible(
-            max(image.shape[-1] for image in prepared_images),
-            32,
-        )
+        canvas_size = self._fixed_canvas_size()
+        if canvas_size is not None:
+            max_height = max_width = canvas_size
+        else:
+            max_height = _make_divisible(
+                max(image.shape[-2] for image in prepared_images),
+                self.input_size_multiple,
+            )
+            max_width = _make_divisible(
+                max(image.shape[-1] for image in prepared_images),
+                self.input_size_multiple,
+            )
 
         padded_images = []
         for image in prepared_images:
@@ -125,11 +141,64 @@ class YOLOXAdapter:
                 F.pad(
                     image,
                     (0, max_width - width, 0, max_height - height),
-                    value=0.0,
+                    value=YOLOX_PAD_VALUE,
                 )
             )
 
         return torch.stack(padded_images)
+
+    def _fixed_canvas_size(self) -> Optional[int]:
+        """Square canvas side every batch letterboxes to, or ``None`` to fall
+        back to the old batch-derived size (only when resizing is disabled via
+        ``input_max_size``). Mirrors RTDETRAdapter._fixed_canvas_size."""
+        if self.input_max_size is None or self.input_max_size <= 0:
+            return None
+        return _make_divisible(self.input_max_size, self.input_size_multiple)
+
+    def _resize_training_inputs(self, images, targets):
+        resized_images = []
+        resized_targets = []
+        for image, target in zip(images, targets):
+            resized_image, scale_y, scale_x = self._resize_image_with_scale(image)
+            resized_target = dict(target)
+            if scale_y != 1.0 or scale_x != 1.0:
+                boxes = target["boxes"].clone()
+                boxes[:, [0, 2]] *= scale_x
+                boxes[:, [1, 3]] *= scale_y
+                resized_target["boxes"] = boxes
+            resized_images.append(resized_image)
+            resized_targets.append(resized_target)
+        return resized_images, resized_targets
+
+    def _resize_image(self, image):
+        resized_image, _, _ = self._resize_image_with_scale(image)
+        return resized_image
+
+    def _resize_image_with_scale(self, image):
+        """Aspect-preserving scale to land the longest side on ``input_max_size``.
+
+        Always scales — up as well as down — matching RTDETRAdapter's resize:
+        a crop smaller than ``input_max_size`` is upscaled to fill more of the
+        fixed canvas instead of being left native and mostly letterboxed.
+        """
+        if self.input_max_size is None or self.input_max_size <= 0:
+            return image, 1.0, 1.0
+
+        height, width = image.shape[-2:]
+        longest_side = max(height, width)
+        if longest_side == self.input_max_size:
+            return image, 1.0, 1.0
+
+        scale = self.input_max_size / float(longest_side)
+        resized_height = max(1, round(height * scale))
+        resized_width = max(1, round(width * scale))
+        resized = F.interpolate(
+            image.unsqueeze(0),
+            size=(resized_height, resized_width),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+        return resized, resized_height / float(height), resized_width / float(width)
 
     def _prepare_targets(self, targets, images):
         device = next(self.model.parameters()).device
@@ -160,6 +229,8 @@ def build_yolox(
     score_threshold: float = 0.3,
     nms_threshold: float = 0.45,
     trainable_backbone_layers: Optional[int] = None,
+    input_max_size: Optional[int] = 640,
+    input_size_multiple: int = 32,
     **builder_options: Any,
 ) -> YOLOXAdapter:
     try:
@@ -205,19 +276,29 @@ def build_yolox(
         score_threshold=score_threshold,
         nms_threshold=nms_threshold,
         frozen_backbone_stages=frozen_backbone_stages,
+        input_max_size=input_max_size,
+        input_size_multiple=input_size_multiple,
     )
 
 
 def yolox_detection_to_friendy(
     detection: Optional[torch.Tensor],
     image: torch.Tensor,
+    scale_y: float = 1.0,
+    scale_x: float = 1.0,
 ) -> torch.Tensor:
     if detection is None or detection.numel() == 0:
         return image.new_zeros((0, 6))
 
+    boxes = detection[:, 0:4]
+    if scale_y != 1.0 or scale_x != 1.0:
+        boxes = boxes.clone()
+        boxes[:, [0, 2]] /= scale_x
+        boxes[:, [1, 3]] /= scale_y
+
     image_height, image_width = image.shape[-2:]
     boxes = clip_xyxy(
-        detection[:, 0:4],
+        boxes,
         image_width=image_width,
         image_height=image_height,
     )
@@ -251,6 +332,8 @@ def _freeze_yolox_backbone(model: torch.nn.Module, trainable_backbone_layers: in
 
 
 def _make_divisible(value: int, divisor: int) -> int:
+    if divisor <= 1:
+        return value
     return int((value + divisor - 1) // divisor * divisor)
 
 

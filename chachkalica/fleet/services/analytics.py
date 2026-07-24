@@ -62,6 +62,48 @@ def _pct(part: int, whole: int) -> float:
     return round(100 * part / whole, 1) if whole else 0.0
 
 
+def _image_dimensions(image_path: Path) -> tuple[int, int] | None:
+    """Read dimensions from common image headers without loading pixel data."""
+    try:
+        with image_path.open("rb") as image:
+            header = image.read(32)
+            if header.startswith(b"\x89PNG\r\n\x1a\n"):
+                return (int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big"))
+            if header[:6] in (b"GIF87a", b"GIF89a"):
+                return (int.from_bytes(header[6:8], "little"), int.from_bytes(header[8:10], "little"))
+            if header[:2] == b"BM":
+                return (int.from_bytes(header[18:22], "little"), abs(int.from_bytes(header[22:26], "little", signed=True)))
+            if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+                image.seek(12)
+                chunk = image.read(18)
+                if chunk[:4] == b"VP8X":
+                    return (1 + int.from_bytes(chunk[12:15], "little"), 1 + int.from_bytes(chunk[15:18], "little"))
+                if chunk[:4] == b"VP8 " and chunk[11:14] == b"\x9d\x01\x2a":
+                    return (int.from_bytes(chunk[14:16], "little") & 0x3fff, int.from_bytes(chunk[16:18], "little") & 0x3fff)
+                if chunk[:4] == b"VP8L" and chunk[8:9] == b"\x2f":
+                    bits = int.from_bytes(chunk[9:13], "little")
+                    return (1 + (bits & 0x3fff), 1 + ((bits >> 14) & 0x3fff))
+                return None
+
+            if header[:2] != b"\xff\xd8":
+                return None
+            while True:
+                marker = image.read(1)
+                while marker == b"\xff":
+                    marker = image.read(1)
+                if not marker or marker in (b"\xd9", b"\xda"):
+                    return None
+                length = int.from_bytes(image.read(2), "big")
+                if length < 2:
+                    return None
+                if marker[0] in (0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf):
+                    data = image.read(5)
+                    return (int.from_bytes(data[3:5], "big"), int.from_bytes(data[1:3], "big"))
+                image.seek(length - 2, 1)
+    except OSError:
+        return None
+
+
 def _conic_gradient(rows: list[dict], pct_key: str) -> str:
     """Build a CSS ``conic-gradient`` value from per-class slices.
 
@@ -100,6 +142,18 @@ def analyze_dataset(dataset: Dataset) -> dict:
         p for p in sorted(image_dir.iterdir())
         if p.suffix.lower() in lsapi.IMAGE_EXTENSIONS
     ]
+
+    # Resolution distribution is based on source images, independently of their
+    # annotations. This makes mixed-resolution datasets visible even when a
+    # portion has not been labeled yet.
+    dimension_counts: dict[tuple[int, int], int] = {}
+    unreadable_images = 0
+    for image_path in images:
+        dimensions = _image_dimensions(image_path)
+        if dimensions is None:
+            unreadable_images += 1
+            continue
+        dimension_counts[dimensions] = dimension_counts.get(dimensions, 0) + 1
 
     region_counts = [0] * len(names)  # annotation regions per class
     image_counts = [0] * len(names)   # images containing the class at least once
@@ -219,6 +273,18 @@ def analyze_dataset(dataset: Dataset) -> dict:
         {"label": "Large (≥10%)", "count": size_large, "pct": _pct(size_large, total_regions), "color": "#2563eb"},
     ]
 
+    readable_images = image_count - unreadable_images
+    image_size_dist = [
+        {
+            "label": f"{width} × {height}",
+            "count": count,
+            "pct": _pct(count, readable_images),
+        }
+        for (width, height), count in sorted(
+            dimension_counts.items(), key=lambda item: (-item[1], item[0][0], item[0][1])
+        )
+    ]
+
     quality = {
         "orphan_label_files": orphan_count,
         "orphan_examples": orphan_examples,
@@ -239,6 +305,9 @@ def analyze_dataset(dataset: Dataset) -> dict:
         "summary": summary,
         "rows": rows,
         "size_dist": size_dist,
+        "image_size_dist": image_size_dist,
+        "readable_images": readable_images,
+        "unreadable_images": unreadable_images,
         "quality": quality,
         "label_gradient": _conic_gradient(
             sorted(rows, key=lambda r: (-r["region_count"], r["name"])), "region_pct"

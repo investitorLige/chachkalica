@@ -627,6 +627,9 @@ class DatasetAdmin(admin.ModelAdmin):
             return JsonResponse({"error": "dataset has no images"}, status=400)
         index = _preview_bounded_index(request, len(images))
         image_path = images[index]
+        dimensions = analytics_svc._image_dimensions(image_path)
+        width, height = dimensions if dimensions is not None else (None, None)
+
 
         label_dir = _preview_label_dir(request, dataset)
         shapes = (
@@ -636,6 +639,8 @@ class DatasetAdmin(admin.ModelAdmin):
         return JsonResponse({
             "shapes": shapes,
             "image": image_path.name,
+            "width": width,
+            "height": height,
             "index": index,
             "count": len(images),
         })

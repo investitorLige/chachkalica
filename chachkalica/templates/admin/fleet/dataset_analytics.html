@@ -114,6 +114,25 @@
       <div class="num">{{ report.summary.bbox_regions }} / {{ report.summary.polygon_regions }}</div><div class="lbl">Boxes / polygons<span class="ds-info-mark">ⓘ</span></div></div>
   </div>
 
+  <div class="ds-section">
+    <div class="cap ds-info" data-info-title="Image dimensions"
+         data-info="Original pixel dimensions of the source images. Each bar shows how many readable images share that exact width and height.">Image dimensions<span class="sub"> — original width × height in pixels</span></div>
+    {% if report.image_size_dist %}
+      {% for size in report.image_size_dist %}
+      <div style="display:flex; align-items:center; gap:10px; margin:6px 0; max-width:560px;">
+        <span style="width:100px; text-align:right; font-variant-numeric:tabular-nums;">{{ size.label }}</span>
+        <div style="flex:1; height:18px; border-radius:4px; overflow:hidden; background:#0f1a12; border:1px solid #1d2a20;">
+          <span style="display:block; width:{{ size.pct }}%; min-width:2px; height:100%; background:#0891b2;"></span>
+        </div>
+        <span class="ds-note" style="min-width:88px;">{{ size.count }} image{{ size.count|pluralize }} ({{ size.pct }}%)</span>
+      </div>
+      {% endfor %}
+      {% if report.unreadable_images %}<p class="ds-note">{{ report.unreadable_images }} image{{ report.unreadable_images|pluralize }} could not be read for dimensions.</p>{% endif %}
+    {% else %}
+      <p class="ds-note">No readable image dimensions found.</p>
+    {% endif %}
+  </div>
+
   {% if report.summary.total_regions %}
   <div class="ds-charts">
     <div class="ds-chart">

@@ -16,10 +16,18 @@ wrapper so Contract A holds:
   * confidence floor at ``conf_thre`` then class-aware ``batched_nms`` at
     ``nms_thre`` (identical ops to the vendored ``postprocess``).
 
-Boxes come out in input-pixel xyxy; the service clips them to the original image
-(``clip_boxes: true``, mirroring the adapter's ``clip_xyxy``). The service does
-no resize/normalize — YOLOX eats the raw ``[0,1]`` image and pads to a multiple
-of 32 (``resize_mode: none``, ``normalize: null``, ``multiple: 32``).
+Boxes come out in **canvas**-pixel xyxy — the adapter now letterboxes onto a
+fixed square canvas (``YOLOXAdapter.input_max_size``/``input_size_multiple``,
+mirroring RT-DETR's resize), so a canvas coordinate is not the same as an
+original-image coordinate once padding is involved. The service therefore
+inverts the same scale/pad-offset-0 it recorded for this image
+(``onnx_infer/preprocess.py``'s ``"letterbox"`` resize_mode +
+``onnx_infer/postprocess.py``'s ``input_pixels`` inverse — the same mechanism
+RF-DETR already uses, see ``onnx_export/arch/rfdetr.py``) and then clips to the
+original image bounds (``clip_boxes: true``, mirroring the adapter's
+``clip_xyxy``). The pad value is YOLOX's own native gray (114 in 0-255 space,
+``adapters.yolox.YOLOX_PAD_VALUE`` in this pipeline's ``[0,1]`` scale) — not
+zero.
 """
 
 from __future__ import annotations
@@ -31,6 +39,11 @@ try:
 except ImportError:  # run as a flat script
     from common import build_meta, export_detection_wrapper
 
+try:
+    from ...adapters.yolox import YOLOX_PAD_VALUE, _make_divisible
+except ImportError:
+    from adapters.yolox import YOLOX_PAD_VALUE, _make_divisible
+
 
 def export_yolox(adapter, *, num_classes, params, class_map, onnx_path: str | Path) -> dict:
     import torch
@@ -40,6 +53,8 @@ def export_yolox(adapter, *, num_classes, params, class_map, onnx_path: str | Pa
     conf_thre = float(adapter.score_threshold)
     nms_thre = float(adapter.nms_threshold)
     n_classes = int(adapter.num_classes)
+    # Same square canvas the adapter letterboxes to (YOLOXAdapter._fixed_canvas_size).
+    canvas_size = _make_divisible(int(adapter.input_max_size), int(adapter.input_size_multiple))
 
     class YOLOXExport(nn.Module):
         def __init__(self, model: nn.Module) -> None:
@@ -64,17 +79,19 @@ def export_yolox(adapter, *, num_classes, params, class_map, onnx_path: str | Pa
             return boxes[nms_idx], scores[nms_idx], labels[nms_idx].to(torch.int64)
 
     wrapper = YOLOXExport(adapter.model.eval())
-    export_detection_wrapper(wrapper, onnx_path)
+    export_detection_wrapper(wrapper, onnx_path, dummy_hw=(canvas_size, canvas_size))
 
     return build_meta(
         arch="yolox",
         num_classes=num_classes,
         class_map=class_map,
         score_threshold=conf_thre,  # the conf floor baked into the graph
-        resize_mode="none",
-        multiple=32,
-        pad_value=0.0,
+        resize_mode="letterbox",
+        size=canvas_size,
+        multiple=0,  # letterbox already pads to the exact square; no second pad
+        pad_value=YOLOX_PAD_VALUE,
         input_scale="unit",  # the adapter feeds the raw [0,1] image (no *255)
         normalize=None,
-        clip_boxes=True,  # adapter clips to the original image (clip_xyxy)
+        clip_boxes=True,  # predictions can land in the letterbox margin
+        box_coords="input_pixels",  # canvas-pixel; service inverts scale/pad
     )

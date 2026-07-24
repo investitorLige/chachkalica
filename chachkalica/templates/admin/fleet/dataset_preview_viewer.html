@@ -145,7 +145,11 @@ Use ← / → or the buttons to step through.
         if (!res.ok) { errorEl.textContent = res.j.error || "failed to load labels"; statusEl.textContent = ""; return; }
         current = res.j;
         var n = (current.shapes || []).length;
-        statusEl.textContent = (current.image || "") + " — " + n + " label" + (n === 1 ? "" : "s");
+        var dimensions = current.width && current.height
+          ? current.width + " × " + current.height + " px"
+          : "dimensions unavailable";
+        statusEl.textContent = (current.image || "") + " — " + dimensions + " — "
+          + n + " label" + (n === 1 ? "" : "s");
         renderLegend();
         draw();
       })
