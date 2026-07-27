@@ -22,9 +22,10 @@ from django.urls import path, reverse
 from django.utils.html import format_html
 
 from fleet.admin import _status_badge as _job_status_badge
+from training.models import TrainedModel
 from videos import jobs
-from videos.models import FrameExtractionJob, Video
-from videos.services import downloader, frame_extraction
+from videos.models import FrameExtractionJob, InferenceJob, Video
+from videos.services import downloader, frame_extraction, inference
 from videos.services.videos import list_video_files
 
 _STATUS_COLORS = {
@@ -74,6 +75,18 @@ def _parse_int_in_range(raw: str, default, low: int, high: int):
         return default
     try:
         value = int(raw)
+    except ValueError:
+        return None
+    return value if low <= value <= high else None
+
+
+def _parse_float_in_range(raw: str, default, low: float, high: float):
+    """Parse a float within ``[low, high]`` from POST data; blank -> ``default``, invalid -> ``None``."""
+    raw = (raw or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
     except ValueError:
         return None
     return value if low <= value <= high else None
@@ -137,7 +150,7 @@ class VideoAdmin(admin.ModelAdmin):
     list_filter = ["status"]
     search_fields = ["name", "filename", "source_url"]
     readonly_fields = ["status", "filename", "player", "last_error", "created_at", "updated_at"]
-    actions = ["play_video", "extract_frames", "import_all_new", "redownload"]
+    actions = ["play_video", "extract_frames", "run_inference", "import_all_new", "redownload"]
 
     # ------------------------------------------------------------------ forms
     def get_form(self, request, obj=None, **kwargs):
@@ -311,6 +324,65 @@ class VideoAdmin(admin.ModelAdmin):
         }
         return TemplateResponse(request, "admin/videos/extract_frames.html", context)
 
+    @admin.action(description="Run model inference…")
+    def run_inference(self, request, queryset):
+        if queryset.count() != 1:
+            self.message_user(request, "Select exactly one video to run inference on.",
+                              level=messages.WARNING)
+            return None
+        video = queryset.first()
+        if not video.exists():
+            self.message_user(request, f"{video.name}: no file on disk yet.",
+                              level=messages.WARNING)
+            return None
+
+        if request.POST.get("apply"):
+            trained_model = TrainedModel.objects.filter(
+                pk=request.POST.get("trained_model") or None
+            ).first()
+            if trained_model is None:
+                self.message_user(request, "Choose a trained model.", level=messages.WARNING)
+                return None
+
+            score_threshold = _parse_float_in_range(
+                request.POST.get("score_threshold"), default=0.5, low=0.0, high=1.0)
+            if score_threshold is None:
+                self.message_user(request, "Score threshold must be between 0 and 1.",
+                                  level=messages.WARNING)
+                return None
+
+            frame_stride = _parse_positive_int(request.POST.get("frame_stride"), default=1)
+            if frame_stride is None:
+                self.message_user(request, "Frame stride must be a positive integer.",
+                                  level=messages.WARNING)
+                return None
+
+            job = InferenceJob.objects.create(
+                video=video,
+                trained_model=trained_model,
+                score_threshold=score_threshold,
+                frame_stride=frame_stride,
+                output_filename=inference.unique_output_filename(video.name),
+            )
+            _queue().enqueue(jobs.run_inference, job.id, job_timeout=jobs.INFERENCE_JOB_TIMEOUT)
+            self.message_user(
+                request,
+                f"Inference queued for {video.name} with model {trained_model.name!r} "
+                "— see the Inferred videos tab for progress.",
+            )
+            return None
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Run model inference — {video.name}",
+            "video": video,
+            "trained_models": TrainedModel.objects.order_by("name"),
+            "action": "run_inference",
+            "selected": [str(video.pk)],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+        }
+        return TemplateResponse(request, "admin/videos/run_inference.html", context)
+
     @admin.action(description="Import every new file in the videos folder")
     def import_all_new(self, request, queryset):
         taken = set(Video.objects.values_list("filename", flat=True))
@@ -436,3 +508,82 @@ class FrameExtractionJobAdmin(admin.ModelAdmin):
             return "—"
         url = reverse("admin:fleet_dataset_change", args=[obj.dataset_id])
         return format_html('<a href="{}">{}</a>', url, obj.dataset.name)
+
+
+@admin.register(InferenceJob)
+class InferenceJobAdmin(admin.ModelAdmin):
+    """Read-only log of "Run model inference…" runs — rows are only created by the action."""
+
+    list_display = ["video", "trained_model", "status_badge", "frames_processed",
+                     "play_link", "created_at"]
+    list_filter = ["status", "trained_model"]
+    search_fields = ["video__name", "trained_model__name"]
+    readonly_fields = [f.name for f in InferenceJob._meta.fields]
+    ordering = ["-created_at"]
+
+    def has_add_permission(self, request):
+        return False
+
+    @admin.display(description="status", ordering="status")
+    def status_badge(self, obj):
+        return _job_status_badge(obj.status)
+
+    @admin.display(description="")
+    def play_link(self, obj):
+        if not obj.output_exists():
+            return "—"
+        url = reverse("admin:videos_inferencejob_play") + f"?job={obj.pk}"
+        return format_html('<a class="button" href="{}">▶ play</a>', url)
+
+    def get_urls(self):
+        custom = [
+            path("play/", self.admin_site.admin_view(self.play_view),
+                 name="videos_inferencejob_play"),
+            path("stream/", self.admin_site.admin_view(self.stream_view),
+                 name="videos_inferencejob_stream"),
+        ]
+        return custom + super().get_urls()
+
+    def play_view(self, request):
+        job = InferenceJob.objects.select_related("video").filter(
+            pk=request.GET.get("job")).first()
+        if job is None:
+            raise Http404("unknown inference job")
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Inferred — {job.video.name}",
+            "job": job,
+            "exists": job.output_exists(),
+            "stream_url": reverse("admin:videos_inferencejob_stream") + f"?job={job.pk}",
+        }
+        return TemplateResponse(request, "admin/videos/inference_player.html", context)
+
+    def stream_view(self, request):
+        """Stream the annotated mp4, honouring HTTP Range so the player can seek."""
+        job = InferenceJob.objects.filter(pk=request.GET.get("job")).first()
+        if job is None or not job.output_exists():
+            raise Http404("inference output not found")
+        path = job.output_path()
+        size = path.stat().st_size
+        content_type = "video/mp4"
+
+        range_header = request.headers.get("Range", "")
+        match = re.match(r"bytes=(\d+)-(\d*)", range_header.strip())
+        if not match:
+            resp = FileResponse(open(path, "rb"), content_type=content_type)
+            resp["Accept-Ranges"] = "bytes"
+            return resp
+
+        start = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) else size - 1
+        end = min(end, size - 1)
+        start = min(start, end)
+        length = end - start + 1
+
+        resp = StreamingHttpResponse(
+            _file_chunks(path, start, length), status=206, content_type=content_type
+        )
+        resp["Content-Length"] = str(length)
+        resp["Content-Range"] = f"bytes {start}-{end}/{size}"
+        resp["Accept-Ranges"] = "bytes"
+        return resp

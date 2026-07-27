@@ -28,10 +28,12 @@ import torch
 
 try:
     from .gpu_monitor import GpuMonitor, own_usage_delta_mb, read_current_mem_mb, snapshot_process_mem_mb
-    from .variants import ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec
+    from .kernel_util import native_kernel_busy_pct
+    from .variants import ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec, rfdetr_variant_specs, yolox_variant_specs
 except ImportError:  # run as a flat script
     from gpu_monitor import GpuMonitor, own_usage_delta_mb, read_current_mem_mb, snapshot_process_mem_mb  # type: ignore
-    from variants import ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec  # type: ignore
+    from kernel_util import native_kernel_busy_pct  # type: ignore
+    from variants import ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec, rfdetr_variant_specs, yolox_variant_specs  # type: ignore
 
 METRIC_ROW_ORDER = [
     "status",
@@ -44,6 +46,7 @@ METRIC_ROW_ORDER = [
     "gpu_mem_mb_peak",
     "gpu_util_pct_mean",
     "gpu_util_pct_peak",
+    "gpu_util_method",
 ]
 
 # Archs whose default TensorRT profile is dynamic (a wide min/opt/max range) --
@@ -60,7 +63,13 @@ METRIC_ROW_ORDER = [
 # claiming "rtdetr is unaffected (its longest_side profile builds fp16
 # as-is)" -- that comment is stale relative to observed behavior; verify here
 # whether pinning the profile actually fixes it.
-ARCHS_NEEDING_STATIC_FP16_PROFILE = {"fasterrcnn", "rtdetr"}
+#
+# retinanet was added later for the same two payoffs: its default dynamic
+# 256-896² profile (a) stayed fp32 (same Myelin issue) and (b) can't run an
+# input larger than 896 (a 960 sweep errored with execute_async_v3 -> False).
+# Pinning the profile to the cell's image_size fixes both -- retinanet now
+# builds fp16 and follows --image-size like the others.
+ARCHS_NEEDING_STATIC_FP16_PROFILE = {"fasterrcnn", "rtdetr", "retinanet"}
 
 
 def _build_rtdetr_variant(repo_id: str, num_classes: int):
@@ -372,11 +381,16 @@ def time_predict(
     did, undetected until a before/after comparison surfaced fps dropping
     5-28% for PT specifically (smaller/faster models hit hardest, the
     signature of a roughly fixed per-op instrumentation cost) while
-    ONNX/ENGINE (never profiled) stayed flat. Only meaningful for ``pt``:
-    onnxruntime and TensorRT dispatch their own kernels outside torch's
-    profiler, so this is not requested for those formats (they still rely on
-    GpuMonitor's NVML sampling, improved by ``min_duration_s`` above but not
-    made exact by it).
+    ONNX/ENGINE (never profiled) stayed flat.
+
+    Now requested for ALL cuda formats, not just pt: CUPTI traces the CUDA
+    driver timeline for the whole process, so it also captures kernels
+    launched by onnxruntime and TensorRT (an earlier version wrongly assumed
+    it could only see torch's own dispatcher). When it does, that exact
+    per-process kernel-busy% replaces NVML's whole-device ~1Hz sample for
+    those formats too; when CUPTI reports nothing for a cell,
+    core.benchmark_cell falls back to a runtime-native profiler
+    (kernel_util.py) and only then to GpuMonitor's NVML sampling.
     """
     from chachak.infer import predict_adapter
 
@@ -408,23 +422,36 @@ def time_predict(
 
         cuda_busy_pct = None
         if profile_cuda and is_cuda:
-            from torch.profiler import ProfilerActivity, profile
+            # CUPTI traces the CUDA driver timeline for the whole PROCESS, not
+            # just torch's dispatcher -- so this same pass captures kernels
+            # launched by onnxruntime and TensorRT too (TRT runs on torch's own
+            # current stream; ORT shares the process's CUDA context). It returns
+            # 0 only if CUPTI genuinely saw no device activity for this cell,
+            # which core.benchmark_cell treats as the signal to fall back to a
+            # runtime-native profiler (kernel_util.py) and then to NVML. Wrapped
+            # so any CUPTI unavailability (missing libcupti, a co-attached
+            # profiler) degrades to None rather than failing the cell.
+            try:
+                from torch.profiler import ProfilerActivity, profile
 
-            with profile(activities=[ProfilerActivity.CUDA]) as prof:
-                prof_start = time.perf_counter()
-                for _ in range(iterations):
-                    predict_adapter(adapter, images)
-                torch.cuda.synchronize()
-                prof_wall_s = time.perf_counter() - prof_start
-            # self_device_time_total (not device_time_total) -- the latter
-            # double/triple-counts the same kernel across nested op-level
-            # events (e.g. aten::conv2d -> aten::convolution ->
-            # aten::cudnn_convolution all reporting overlapping "total" time
-            # for one underlying kernel); "self" time is the non-overlapping
-            # figure, verified directly against the profiler's own printed
-            # "Self CUDA time total".
-            cuda_busy_us = sum(e.self_device_time_total for e in prof.key_averages())
-            cuda_busy_pct = round(min(cuda_busy_us / 1e6 / prof_wall_s * 100, 100.0), 3)
+                with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                    prof_start = time.perf_counter()
+                    for _ in range(iterations):
+                        predict_adapter(adapter, images)
+                    torch.cuda.synchronize()
+                    prof_wall_s = time.perf_counter() - prof_start
+                # self_device_time_total (not device_time_total) -- the latter
+                # double/triple-counts the same kernel across nested op-level
+                # events (e.g. aten::conv2d -> aten::convolution ->
+                # aten::cudnn_convolution all reporting overlapping "total" time
+                # for one underlying kernel); "self" time is the non-overlapping
+                # figure, verified directly against the profiler's own printed
+                # "Self CUDA time total".
+                cuda_busy_us = sum(e.self_device_time_total for e in prof.key_averages())
+                if prof_wall_s > 0:
+                    cuda_busy_pct = round(min(cuda_busy_us / 1e6 / prof_wall_s * 100, 100.0), 3)
+            except Exception:  # noqa: BLE001 - profiling is a measurement extra, never fatal
+                cuda_busy_pct = None
 
     num_images = iterations * len(images)
     fps = num_images / inference_seconds if inference_seconds > 0 else 0.0
@@ -692,14 +719,16 @@ def benchmark_cell(
             pt_baseline_alloc_bytes = torch.cuda.memory_allocated()
             torch.cuda.reset_peak_memory_stats()
 
-        # profile_cuda only for pt -- onnxruntime/TensorRT dispatch their own
-        # kernels outside torch's dispatcher, so torch.profiler can't see
-        # them; those two still rely on GpuMonitor's NVML sampling below,
-        # just over a longer (min_duration_s-stretched) window.
+        # profile_cuda for ALL cuda formats now: CUPTI sees onnxruntime's and
+        # TensorRT's kernels too (whole-process driver trace), so it can give
+        # the same exact per-process busy% for them that it always gave pt.
+        # GpuMonitor still runs in parallel so its NVML sample is available as a
+        # last-resort fallback for any cell where CUPTI (and the native
+        # profiler) come up empty.
         with GpuMonitor(interval_s=gpu_poll_interval_s) as mon:
             timing = time_predict(
                 runnable, images, device, warmup, iterations,
-                amp_enabled=amp_enabled, min_duration_s=min_duration_s, profile_cuda=(fmt == "pt"),
+                amp_enabled=amp_enabled, min_duration_s=min_duration_s, profile_cuda=is_cuda,
             )
         gpu = mon.result
 
@@ -721,15 +750,41 @@ def benchmark_cell(
         else:
             result["gpu_mem_mb_peak"] = gpu.peak_mem_mb
 
+        # GPU utilization, in strict preference order (see kernel_util.py for
+        # why NVML sampling is the least-trustworthy option for onnx/engine):
+        #   1. CUPTI (exact, per-process). The only path for pt; for onnx/engine
+        #      a >0 reading means CUPTI did capture their kernels this cell.
+        #   2. onnx/engine, if CUPTI came up empty: the runtime's OWN profiler.
+        #   3. NVML whole-device sampling -- last resort, flagged as such.
+        # The winning method is recorded in gpu_util_method so a reader can see
+        # exactly how each cell's number was obtained (and discount NVML ones).
+        util_pct = None
+        util_method = None
         cuda_busy_pct = timing.get("cuda_busy_pct")
-        if cuda_busy_pct is not None:
-            # pt: exact (CUPTI-backed), not an NVML sample -- mean == peak
-            # since there's no sampling involved, just a single true reading.
-            result["gpu_util_pct_mean"] = cuda_busy_pct
-            result["gpu_util_pct_peak"] = cuda_busy_pct
+        if cuda_busy_pct is not None and (fmt == "pt" or cuda_busy_pct > 0.0):
+            util_pct = cuda_busy_pct
+            util_method = "cupti"
+        elif fmt in ("onnx", "engine") and is_cuda:
+            # Size the native profiler's own pass to roughly match the timed
+            # loop's duration (per_iter_s = batch_size / fps).
+            native_iters = iterations
+            fps = timing.get("fps") or 0.0
+            if fps > 0 and min_duration_s > 0:
+                native_iters = max(iterations, math.ceil(min_duration_s * fps / max(1, batch_size)))
+            native = native_kernel_busy_pct(runnable, fmt, images, device, native_iters)
+            if native is not None:
+                util_pct = native
+                util_method = "trt-iprofiler" if fmt == "engine" else "ort-profiling"
+
+        if util_pct is not None:
+            # Exact single reading -> mean == peak, exactly as the pt path reports.
+            result["gpu_util_pct_mean"] = util_pct
+            result["gpu_util_pct_peak"] = util_pct
+            result["gpu_util_method"] = util_method
         else:
             result["gpu_util_pct_mean"] = gpu.mean_util_pct
             result["gpu_util_pct_peak"] = gpu.peak_util_pct
+            result["gpu_util_method"] = "nvml-sampled"
         result["status"] = "ok"
     except Exception as exc:  # noqa: BLE001 - fault isolation is the point
         result["status"] = "error"
@@ -776,6 +831,7 @@ def run_sweep(
     force_rebuild: bool,
     variant_names: Optional[List[str]] = None,
     min_duration_s: float = 0.0,
+    follow_image_size: bool = False,
 ) -> Dict[str, Any]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -798,7 +854,17 @@ def run_sweep(
     dataframes: Dict[str, Any] = {}
     summary: Dict[str, Any] = {}
     for arch in archs:
-        variants = ARCH_VARIANTS[arch]
+        # rfdetr's resolution and yolox's canvas are architectural, so they
+        # normally ignore --image-size; when asked to follow it, rebuild each at
+        # the size (rfdetr snapped to the nearest valid resolution, yolox at the
+        # size directly). retinanet/fasterrcnn/rtdetr follow via the static
+        # profile in ARCHS_NEEDING_STATIC_FP16_PROFILE regardless of this flag.
+        if arch == "rfdetr" and follow_image_size:
+            variants = rfdetr_variant_specs(image_size)
+        elif arch == "yolox" and follow_image_size:
+            variants = yolox_variant_specs(image_size)
+        else:
+            variants = ARCH_VARIANTS[arch]
         if variant_names:
             wanted = set(variant_names)
             variants = [v for v in variants if v.name in wanted]

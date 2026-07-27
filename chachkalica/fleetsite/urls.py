@@ -8,11 +8,20 @@
 from django.contrib import admin
 from django.urls import include, path
 
+from fleetsite.admin_views import benchmark_console_view
+
 admin.site.site_header = "Chachkalica Fleet"
 admin.site.site_title = "Chachkalica Fleet"
 admin.site.index_title = "Label Studio annotator fleet"
 
 urlpatterns = [
+    # Standalone admin page (must precede admin.site.urls so it isn't shadowed);
+    # admin_view enforces the same staff-only auth as the rest of the admin.
+    path(
+        "admin/benchmarks/",
+        admin.site.admin_view(benchmark_console_view),
+        name="benchmark-console",
+    ),
     path("admin/", admin.site.urls),
     path("django-rq/", include("django_rq.urls")),
     path("", include("fleet.urls")),

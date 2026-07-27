@@ -9,6 +9,9 @@ from friendy_chachkalica.ml.adapters.retinanet import (
     RetinaNetAdapter,
     _build_retinanet_model,
 )
+from friendy_chachkalica.ml.adapters.rfdetr import RFDETRAdapter
+from friendy_chachkalica.ml.adapters.rtdetr import RTDETRAdapter
+from friendy_chachkalica.ml.adapters.yolox import YOLOXAdapter, yolox_detection_to_friendy
 
 
 class _FakeRetinaNet(torch.nn.Module):
@@ -178,6 +181,91 @@ class FasterRCNNPretrainedTransferTests(unittest.TestCase):
         self.assertIs(result, sentinel)
         self.assertEqual(calls[0]["num_classes"], 6)
         self.assertEqual(calls[0]["weights_backbone"], "imagenet-weights")
+
+
+class _DummyDetector(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, batch, *args, **kwargs):
+        return {"batch": batch}
+
+
+class _FixedRFPostprocess:
+    def __init__(self, boxes):
+        self.boxes = boxes
+
+    def __call__(self, outputs, target_sizes):
+        return [{
+            "boxes": self.boxes.to(target_sizes.device),
+            "scores": torch.tensor([0.9], device=target_sizes.device),
+            "labels": torch.tensor([0], device=target_sizes.device),
+        }]
+
+
+class AdapterResizeRoundTripTests(unittest.TestCase):
+    IMAGE_H = 333
+    IMAGE_W = 1000
+    BOX = torch.tensor([[100.0, 50.0, 500.0, 300.0]])
+
+    def _target(self):
+        return {"boxes": self.BOX.clone(), "labels": torch.tensor([0])}
+
+    def test_yolox_uses_actual_rounded_resize_scales_in_both_directions(self):
+        adapter = YOLOXAdapter(model=_DummyDetector(), num_classes=1, input_max_size=640)
+        image = torch.zeros(3, self.IMAGE_H, self.IMAGE_W)
+        resized, targets = adapter._resize_training_inputs([image], [self._target()])
+        scale_y = resized[0].shape[-2] / self.IMAGE_H
+        scale_x = resized[0].shape[-1] / self.IMAGE_W
+        expected = self.BOX.clone()
+        expected[:, [0, 2]] *= scale_x
+        expected[:, [1, 3]] *= scale_y
+        self.assertTrue(torch.allclose(targets[0]["boxes"], expected))
+
+        detection = torch.cat([expected, torch.tensor([[0.9, 1.0, 0.0]])], dim=1)
+        pred = yolox_detection_to_friendy(detection, image, scale_y, scale_x)
+        self.assertTrue(torch.allclose(pred[0, :4], torch.tensor([0.3, 175.0 / 333.0, 0.4, 250.0 / 333.0])))
+
+    def test_rtdetr_uses_actual_rounded_resize_scales_for_loss_labels(self):
+        adapter = RTDETRAdapter(
+            model=_DummyDetector(), image_processor=None, num_classes=1, input_max_size=640
+        )
+        image = torch.zeros(3, self.IMAGE_H, self.IMAGE_W)
+        resized, targets = adapter._resize_training_inputs([image], [self._target()])
+        labels = adapter._prepare_labels(targets, resized)
+        self.assertTrue(torch.allclose(labels[0]["boxes"], torch.tensor([[0.3, 175.0 / 333.0, 0.4, 250.0 / 333.0]])))
+
+    def test_rfdetr_round_trip_uses_actual_per_axis_scale_after_rounding(self):
+        image = torch.zeros(3, self.IMAGE_H, self.IMAGE_W)
+        adapter = RFDETRAdapter(
+            model=_DummyDetector(),
+            criterion=None,
+            postprocess=_FixedRFPostprocess(torch.tensor([[64.0, 50.0 * 213.0 / 333.0, 320.0, 300.0 * 213.0 / 333.0]])),
+            num_classes=1,
+            resolution=640,
+        )
+        _batch, scales = adapter._prepare_batch([image])
+        scale_y, scale_x = scales[0]
+        self.assertEqual(scale_x, 0.64)
+        self.assertEqual(scale_y, 213 / 333)
+
+        labels = adapter._prepare_labels([self._target()], scales)
+        expected_canvas = self.BOX.clone()
+        expected_canvas[:, [0, 2]] *= scale_x
+        expected_canvas[:, [1, 3]] *= scale_y
+        expected_label = torch.tensor([[
+            (expected_canvas[0, 0] + expected_canvas[0, 2]) / 2 / 640,
+            (expected_canvas[0, 1] + expected_canvas[0, 3]) / 2 / 640,
+            (expected_canvas[0, 2] - expected_canvas[0, 0]) / 640,
+            (expected_canvas[0, 3] - expected_canvas[0, 1]) / 640,
+        ]])
+        self.assertTrue(torch.allclose(labels[0]["boxes"], expected_label))
+
+        pred = adapter.predict([image], score_threshold=0.0)[0]
+        # The canvas box corresponds to [100, 50, 500, 300] using the actual
+        # (rounded) resize dimensions: 640x213.
+        self.assertTrue(torch.allclose(pred[0, :4], torch.tensor([0.3, 175.0 / 333.0, 0.4, 250.0 / 333.0])))
 
 
 if __name__ == "__main__":

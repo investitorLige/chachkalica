@@ -1,0 +1,27 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<style>
+  #vp-stage { max-width: 960px; }
+  #vp-stage video { width: 100%; height: auto; border-radius: 6px; background: #000; }
+  #vp-meta { margin: 8px 0; color: #666; }
+  #vp-error { color: #ba2121; margin: 8px 0; }
+</style>
+
+<div id="vp-stage">
+  {% if exists %}
+    <video controls autoplay preload="metadata" playsinline>
+      <source src="{{ stream_url }}" type="video/mp4">
+      Your browser cannot play this video.
+    </video>
+    <p id="vp-meta"><strong>{{ job.video.name }}</strong> · model {{ job.trained_model.name }}
+      · {{ job.frames_processed }}/{{ job.frames_total }} frames inferred
+    </p>
+  {% else %}
+    <p id="vp-error">No output file on disk for this job (status: {{ job.status }}).
+      {% if job.last_error %} {{ job.last_error }}{% endif %}</p>
+  {% endif %}
+</div>
+
+<p style="margin-top:12px"><a href="../" class="button cancel-link">Back to inferred videos</a></p>
+{% endblock %}

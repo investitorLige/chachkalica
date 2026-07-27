@@ -1,0 +1,308 @@
+{% load static %}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Benchmark Console | Chachkalica</title>
+<style>
+  :root {
+    --bg: #0a0f0c; --bg-panel: #0e1512; --bg-inset: #0b1210; --bg-head: #0c1613;
+    --line: #1b2b23; --line-strong: #23402f;
+    --ink: #dbe9e0; --ink-dim: #6f8c7c; --ink-faint: #48594e;
+    --accent: #45d992; --accent-soft: #2a8f63; --accent-wash: rgba(69, 217, 146, 0.09);
+    --warn: #e3b341; --warn-wash: rgba(227, 179, 65, 0.1);
+    --mono: ui-monospace, "JetBrains Mono", "Fira Code", "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    background-image: radial-gradient(ellipse 900px 500px at 12% -10%, var(--accent-wash), transparent 60%);
+    color: var(--ink); font-family: var(--sans); font-size: 15px; line-height: 1.6;
+    margin: 0; padding: 0 24px 80px;
+  }
+  a { color: var(--accent); }
+  ::selection { background: var(--accent-soft); color: #04140c; }
+  .wrap { max-width: 1320px; margin: 0 auto; }
+
+  header.top {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(10, 15, 12, 0.92); backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--line); margin: 0 -24px; padding: 16px 24px 14px;
+  }
+  header.top .inner { max-width: 1320px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px 24px; }
+  .brand { font-family: var(--mono); font-size: 13px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); display: flex; align-items: center; gap: 10px; }
+  .brand .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); flex: none; }
+  .brand .title { color: var(--ink); font-weight: 600; letter-spacing: 0.02em; }
+  .meta-row { font-family: var(--mono); font-size: 12px; color: var(--ink-dim); display: flex; gap: 18px; flex-wrap: wrap; }
+  .meta-row b { color: var(--ink); font-weight: 500; }
+
+  .controls { display: flex; align-items: center; gap: 16px; }
+  .sizetabs { display: flex; gap: 6px; align-items: center; }
+  .sizetabs .lbl { font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint); }
+  .sizetabs a { font-family: var(--mono); font-size: 12px; padding: 3px 11px; border: 1px solid var(--line-strong); color: var(--ink-dim); text-decoration: none; }
+  .sizetabs a.active { color: #04140c; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .sizetabs a:hover:not(.active) { color: var(--ink); border-color: var(--accent-soft); }
+  .backlink { font-family: var(--mono); font-size: 12px; color: var(--ink-dim); text-decoration: none; white-space: nowrap; }
+  .backlink:hover { color: var(--accent); }
+
+  main { padding-top: 30px; }
+  section { margin-bottom: 48px; }
+  h2.section-head { font-family: var(--mono); font-size: 12.5px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--accent); margin: 0 0 4px; display: flex; align-items: center; gap: 10px; }
+  h2.section-head::after { content: ""; flex: 1; height: 1px; background: linear-gradient(90deg, var(--line-strong), transparent); }
+  .section-sub { color: var(--ink-dim); font-size: 13.5px; margin: 0 0 22px; max-width: 68ch; }
+  p { max-width: 70ch; }
+  p.lead { font-size: 16px; color: var(--ink); }
+
+  .legend { display: grid; grid-template-columns: 200px 1fr; gap: 3px 20px; font-size: 13.5px; }
+  .legend dt { font-family: var(--mono); color: var(--ink); font-weight: 600; padding: 9px 0; border-top: 1px solid var(--line); }
+  .legend dd { margin: 0; padding: 9px 0; border-top: 1px solid var(--line); color: var(--ink-dim); }
+  .legend dt:first-of-type, .legend dd:first-of-type { border-top: none; }
+
+  .arch-block { margin-bottom: 44px; }
+  .arch-title-row { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 3px; }
+  .arch-title { font-family: var(--mono); font-size: 17px; font-weight: 700; color: var(--ink); }
+  .arch-tag { font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-dim); border: 1px solid var(--line-strong); padding: 2px 7px; }
+  .arch-note { color: var(--ink-dim); font-size: 13px; margin: 4px 0 14px; max-width: 80ch; }
+
+  .table-scroll { overflow-x: auto; border: 1px solid var(--line); }
+  table.bench { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+  table.bench th, table.bench td { padding: 7px 12px; text-align: right; font-variant-numeric: tabular-nums; }
+  table.bench th.rowlabel, table.bench td.rowlabel { text-align: left; position: sticky; left: 0; background: var(--bg-head); color: var(--ink); font-weight: 600; z-index: 2; box-shadow: 1px 0 0 var(--line); }
+  table.bench thead tr.variant-row th { background: var(--bg-head); color: var(--accent); font-size: 11.5px; letter-spacing: 0.05em; text-transform: uppercase; border-bottom: 1px solid var(--line); padding-top: 10px; }
+  table.bench thead tr.variant-row th:not(.rowlabel) { border-left: 1px solid var(--line-strong); }
+  table.bench thead tr.fmt-row th { background: var(--bg-inset); color: var(--ink-dim); font-weight: 500; font-size: 11px; border-bottom: 1px solid var(--line-strong); }
+  table.bench tbody th.rowlabel { background: var(--bg-panel); font-size: 12px; font-weight: 500; color: var(--ink-dim); }
+  table.bench td.fmt-boundary, table.bench th.fmt-boundary { border-left: 1px solid var(--line); }
+  table.bench tbody tr:nth-child(odd) td:not(.rowlabel), table.bench tbody tr:nth-child(odd) th.rowlabel { background: rgba(255,255,255,0.012); }
+  table.bench tbody tr:hover td:not(.rowlabel) { background: var(--accent-wash); }
+
+  .pill { display: inline-block; padding: 1.5px 7px; font-size: 11px; border: 1px solid transparent; }
+  .pill.ok { color: var(--accent); border-color: var(--accent-soft); }
+  .pill.err { color: #e3695f; border-color: #7a2f2a; }
+  .pill.skip { color: var(--ink-dim); border-color: var(--line-strong); }
+  .pill.fp16 { color: var(--accent); border-color: var(--accent-soft); background: var(--accent-wash); }
+  .pill.fp32 { color: var(--warn); border-color: #6b551f; background: var(--warn-wash); }
+  .pill--flagged { text-decoration: underline dotted; text-underline-offset: 3px; cursor: help; }
+  .dash { color: var(--ink-faint); }
+  .cliff { color: var(--warn); }
+
+  ul.limits { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 12px; }
+  ul.limits li { position: relative; padding-left: 20px; font-size: 13.5px; color: var(--ink-dim); max-width: 76ch; }
+  ul.limits li::before { content: "\25B8"; position: absolute; left: 0; color: var(--accent-soft); }
+  ul.limits li b { color: var(--ink); font-weight: 600; }
+  code { font-family: var(--mono); background: var(--bg-inset); border: 1px solid var(--line); padding: 1px 6px; font-size: 0.92em; color: var(--ink); }
+  footer { border-top: 1px solid var(--line); margin-top: 40px; padding-top: 18px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="inner">
+    <div class="brand"><span class="dot"></span><span>bench&#8203;/inferlica</span><span class="title">Benchmark Console</span></div>
+    <div class="meta-row">
+      <span>device <b>{{ bench.device|default:"cuda:0 · GPU" }}</b></span>
+      <span>image size <b>{{ bench.label|default:bench.image_size }}</b></span>
+      {% if bench.rfdetr_note %}<span>rfdetr <b>{{ bench.rfdetr_note }}</b></span>{% endif %}
+      <span>util <b>CUPTI</b></span>
+    </div>
+    <div class="controls">
+      <div class="sizetabs">
+        <span class="lbl">size</span>
+        {% for s in sizes %}<a href="?size={{ s.image_size }}"{% if s.current %} class="active"{% endif %}>{{ s.label }}</a>{% endfor %}
+      </div>
+      <a class="backlink" href="{% url 'admin:index' %}">&larr; Admin</a>
+    </div>
+  </div>
+</header>
+
+{{ bench_data|json_script:"bench-data" }}
+
+<div class="wrap">
+<main>
+
+  <section>
+    <h2 class="section-head">Overview</h2>
+    <p class="lead">Five detection architectures &times; every registered variant &times; three export formats
+      (<code>.pt</code>, <code>.onnx</code>, <code>.engine</code>), timed on synthetic random-init inputs in the
+      trainer container &mdash; a compute-cost and precision-behavior instrument, not an accuracy measurement.</p>
+    <p>Measured on an otherwise-idle GPU so throughput is uncontended. Each format runs on GPU and attempts fp16
+      where safe, falling back to fp32 honestly wherever a format's own fp16 path isn't available (hover a
+      <span class="pill fp32 pill--flagged">FP32</span> badge for why). <b>GPU utilization is an exact, per-process
+      CUPTI reading for all three formats</b> &mdash; a single value (mean == peak), not a whole-device NVML sample.
+      Use the <b>size</b> switcher above to compare image sizes.</p>
+  </section>
+
+  <section>
+    <h2 class="section-head">Reading the tables</h2>
+    <p class="section-sub">One row per metric, three columns per variant (PT / ONNX / ENGINE), so a variant's cost
+      across export formats reads left to right.</p>
+    <dl class="legend">
+      <dt>Precision</dt>
+      <dd>What actually ran. An fp16 request can fall back to fp32 per cell: ENGINE if TensorRT won't compile fp16 at
+        that profile; PT if the adapter is <code>supports_amp=False</code>; ONNX if its fp16-cast graph won't load. A
+        dotted-underline <span class="pill fp32 pill--flagged">FP32</span> badge has the reason on hover.</dd>
+      <dt>Latency / Throughput</dt>
+      <dd>Per-image time (<code>1000/fps</code>) and images/sec over a timed <code>predict()</code> loop grown to
+        &ge;2&nbsp;s, <code>cuda.synchronize()</code>-bracketed, with 5 untimed warmup calls first.</dd>
+      <dt>GPU &Delta;mem</dt>
+      <dd>PT: exact <code>max_memory_allocated()</code>. ENGINE/ONNX: load-time before/after per-pid delta after a
+        priming pass. ONNX's figure is arena reservation, not working set &mdash; compare it only to other ONNX cells.</dd>
+      <dt>GPU util</dt>
+      <dd>Exact, per-process, via CUPTI (<code>torch.profiler</code>, separate pass) &mdash; real kernel-busy % of wall
+        clock, captured for onnxruntime and TensorRT kernels too. One true reading, so a single value is shown. The
+        source is recorded per cell (<code>gpu_util_method</code>); runtime-native profilers and NVML remain as
+        fallbacks.</dd>
+    </dl>
+  </section>
+
+  <section>
+    <h2 class="section-head">Benchmark data</h2>
+    <div id="tables"></div>
+  </section>
+
+  <section>
+    <h2 class="section-head">Known limitations</h2>
+    <ul class="limits">
+      <li><b>RF-DETR's exported formats fall off a cliff above ~640.</b> Its ONNX/ENGINE throughput craters (to ~16%
+        util) once the input grows past 640, while PT is unaffected &mdash; a kernel-fusion cliff at the larger token
+        grids, not a raw compute cost. It is resolution-driven, not a windowed-attention quirk: <code>large</code> is
+        architecturally identical to <code>medium</code> and still hits it at its larger size.</li>
+      <li><b>ONNX &Delta;mem is arena reservation, not working set</b> &mdash; onnxruntime grabs a large pool on first
+        Run() and reuses it, so ONNX cells read high and flat regardless of model size.</li>
+      <li><b>ENGINE &Delta;mem is coarse for small models</b> &mdash; per-pid NVML memory is attributed in blocks, so
+        the smallest engines round to flat values (e.g. rfdetr's shared ViT-S encoder dominates and reads ~90&nbsp;MB
+        across variants). Where footprints genuinely diverge (yolox, rtdetr, fasterrcnn backbones) they scale as
+        expected.</li>
+      <li><b>ONNX fp16 doesn't load for fasterrcnn/retinanet/yolox</b> &mdash; the shared graph-level fp16 cast makes a
+        graph TensorRT accepts but onnxruntime's session loader rejects; those cells fall back to fp32-on-GPU.</li>
+      <li><b>retinanet's engine stays fp32 on purpose</b> (dynamic-profile Myelin incompatibility, out of scope), which
+        is also why its engines need far more workspace memory than fasterrcnn's fixed-profile ones.</li>
+      <li><b>Random-init weights throughout</b> &mdash; no checkpoint, no real images. Says nothing about accuracy.</li>
+    </ul>
+  </section>
+
+</main>
+</div>
+
+<footer>
+  <span>inferlica/benchmark &middot; friendy_chachkalica/ml/trt_export</span>
+  <span>trainer container &middot; util via CUPTI{% if bench.generated %} &middot; {{ bench.generated }}{% endif %}</span>
+</footer>
+
+{% verbatim %}
+<script>
+const DATA = JSON.parse(document.getElementById('bench-data').textContent);
+
+const ROWS = [
+  { label: 'Status', fmt: c => statusPill(c) },
+  { label: 'Precision', fmt: c => precisionPill(c) },
+  { label: 'Latency', fmt: c => c.fps ? (1000 / c.fps).toFixed(2) + ' ms' : dash() },
+  { label: 'Throughput', fmt: c => c.fps != null ? c.fps.toFixed(1) + ' fps' : dash() },
+  { label: 'GPU Δmem', fmt: c => formatMem(c.mem) },
+  { label: 'GPU util', fmt: c => formatUtil(c) },
+];
+
+const FORMATS = ['pt', 'onnx', 'engine'];
+const FORMAT_LABEL = { pt: 'PT', onnx: 'ONNX', engine: 'ENGINE' };
+
+function esc(s) { return String(s).replace(/"/g, '&quot;'); }
+function dash() { return '<span class="dash">&ndash;</span>'; }
+
+function statusPill(c) {
+  const cls = c.status === 'ok' ? 'ok' : c.status === 'error' ? 'err' : c.status === 'skipped' ? 'skip' : null;
+  if (!cls) return dash();
+  const title = c.reason ? ` title="${esc(c.reason)}"` : '';
+  return `<span class="pill ${cls}"${title}>${c.status === 'skipped' ? 'skip' : c.status}</span>`;
+}
+
+function precisionPill(c) {
+  const p = c.precision;
+  if (p !== 'fp16' && p !== 'fp32') return dash();
+  const title = c.reason ? ` title="${esc(c.reason)}"` : '';
+  const flagged = c.reason ? ' pill--flagged' : '';
+  return `<span class="pill ${p}${flagged}"${title}>${p.toUpperCase()}</span>`;
+}
+
+function formatMem(mb) {
+  if (mb == null) return dash();
+  if (mb >= 1000) return (mb / 1024).toFixed(2) + ' GB';
+  return Math.round(mb) + ' MB';
+}
+
+function formatUtil(c) {
+  if (c.util_mean == null) return dash();
+  const m = Math.round(c.util_mean), p = Math.round(c.util_peak);
+  const low = m < 20 ? 'cliff' : '';
+  return m === p ? `<span class="${low}">${m}%</span>` : `${m}% / ${p}%`;
+}
+
+const ARCH_META = {
+  fasterrcnn: { title: 'Faster R-CNN', tag: 'two-stage', note: 'ENGINE builds fp16 clean via the EfficientNMS re-export; memory scales with backbone (resnet50 > mobilenet_v3). PT: fp16 via autocast. ONNX runs on GPU but its fp16-cast graph won’t load in onnxruntime, so it falls back to fp32-on-GPU.' },
+  retinanet: { title: 'RetinaNet', tag: 'single-stage', note: 'ENGINE left on the dynamic default profile (256–896²), so both variants stay fp32 there and need far more workspace memory than a fixed profile — see limitations. PT: fp16 via autocast. ONNX: same fp16-cast-won’t-load issue as fasterrcnn/yolox.' },
+  rfdetr: { title: 'RF-DETR', tag: 'DETR · nms-free', note: 'fp16 clean on all three formats. Its exported (ONNX/ENGINE) throughput falls off a cliff above ~640 while PT stays flat — resolution-driven, see limitations. ENGINE memory reads a flat ~90 MB where variants share the ViT-S encoder.' },
+  rtdetr: { title: 'RT-DETR', tag: 'DETR · nms-free', note: 'ENGINE: static profile takes all four variants from fp32 to fp16, memory scales cleanly with backbone (r18vd → r101vd). ONNX: fp16 clean too. PT stays fp32 on purpose — its adapter documents a decoder/GIoU overflow under fp16 autocast.' },
+  yolox: { title: 'YOLOX', tag: 'single-stage', note: 'ENGINE: fp16 clean, memory scales monotonically with variant size (nano → x). PT: fp16 via autocast. ONNX: same fp16-cast-won’t-load issue as fasterrcnn/retinanet.' },
+};
+
+function renderArch(archKey) {
+  const arch = DATA[archKey];
+  if (!arch) return null;
+  const meta = ARCH_META[archKey] || { title: archKey, tag: '', note: '' };
+  const block = document.createElement('div');
+  block.className = 'arch-block';
+  block.innerHTML = `
+    <div class="arch-title-row">
+      <span class="arch-title">${meta.title}</span>
+      ${meta.tag ? `<span class="arch-tag">${meta.tag}</span>` : ''}
+    </div>
+    <p class="arch-note">${meta.note} NMS: ${arch.nms}.</p>`;
+
+  const scroll = document.createElement('div');
+  scroll.className = 'table-scroll';
+  const table = document.createElement('table');
+  table.className = 'bench';
+
+  const variantRow = document.createElement('tr');
+  variantRow.className = 'variant-row';
+  variantRow.innerHTML = '<th class="rowlabel"></th>' + arch.variants.map(v => `<th colspan="3">${v}</th>`).join('');
+
+  const fmtRow = document.createElement('tr');
+  fmtRow.className = 'fmt-row';
+  fmtRow.innerHTML = '<th class="rowlabel">metric</th>' + arch.variants.map(() =>
+    FORMATS.map((f, i) => `<th${i === 0 ? ' class="fmt-boundary"' : ''}>${FORMAT_LABEL[f]}</th>`).join('')
+  ).join('');
+
+  const thead = document.createElement('thead');
+  thead.appendChild(variantRow);
+  thead.appendChild(fmtRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  ROWS.forEach(row => {
+    const tr = document.createElement('tr');
+    let html = `<th class="rowlabel">${row.label}</th>`;
+    arch.variants.forEach(v => {
+      FORMATS.forEach((f, i) => {
+        const cell = arch.cells[`${v}__${f}`];
+        html += `<td${i === 0 ? ' class="fmt-boundary"' : ''}>${cell ? row.fmt(cell) : dash()}</td>`;
+      });
+    });
+    tr.innerHTML = html;
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  scroll.appendChild(table);
+  block.appendChild(scroll);
+  return block;
+}
+
+const container = document.getElementById('tables');
+['fasterrcnn', 'retinanet', 'rfdetr', 'rtdetr', 'yolox'].forEach(a => {
+  const el = renderArch(a);
+  if (el) container.appendChild(el);
+});
+</script>
+{% endverbatim %}
+</body>
+</html>

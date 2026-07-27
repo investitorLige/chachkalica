@@ -45,6 +45,58 @@ NMS_STATUS: Dict[str, str] = {
     "rfdetr": "nms-free (DETR set-prediction)",
 }
 
+# Backbone block size (patch_size * num_windows) that each rfdetr variant's
+# resolution must be an exact multiple of -- base is patch14/windows4 (56), the
+# rest are patch16/windows2 (32). Used to snap an arbitrary requested image size
+# to the nearest valid rfdetr resolution so the sweep can benchmark rfdetr
+# across image sizes despite its resolution being architectural, not a runtime
+# input size (see rfdetr_variant_specs).
+RFDETR_BLOCK: Dict[str, int] = {"nano": 32, "small": 32, "medium": 32, "large": 32, "base": 56}
+
+
+def _snap_to_block(image_size: int, block: int) -> int:
+    """Nearest positive multiple of ``block`` to ``image_size``."""
+    return max(block, int(round(image_size / block)) * block)
+
+
+def rfdetr_variant_specs(image_size: int) -> List["VariantSpec"]:
+    """rfdetr VariantSpecs with each variant's resolution snapped to the nearest
+    valid multiple of its backbone block size for ``image_size``.
+
+    rfdetr's ONNX/TRT export is static-shaped at whatever ``resolution`` the
+    adapter reports, and that resolution must satisfy the windowed-attention
+    block constraint -- so "benchmark rfdetr at 320/960" means picking the
+    closest valid resolution per variant (e.g. at 960: 960 for the block-32
+    variants, 952 for base). Used only when the sweep is asked to make rfdetr
+    follow ``--image-size``; the default ARCH_VARIANTS list below keeps each
+    variant at its native resolution instead.
+    """
+    order = ("nano", "small", "medium", "base", "large")
+    return [
+        VariantSpec(name, {"variant": name, "weights": False,
+                           "resolution": _snap_to_block(image_size, RFDETR_BLOCK[name])})
+        for name in order
+    ]
+
+
+def yolox_variant_specs(image_size: int) -> List["VariantSpec"]:
+    """yolox VariantSpecs with the export canvas set to ``image_size``.
+
+    yolox's ONNX/TRT input is a fixed square canvas
+    (``YOLOXAdapter.input_max_size``, default 640, rounded to a multiple of 32),
+    so it otherwise ignores ``--image-size`` -- a 320/960 synthetic input just
+    gets letterboxed onto the 640 canvas. Passing ``input_max_size=image_size``
+    through ``build_yolox`` builds the adapter (and therefore the traced
+    ONNX/engine) at that size instead. ``image_size`` must be a multiple of 32.
+    """
+    specs = []
+    for spec in ARCH_VARIANTS["yolox"]:
+        kwargs = dict(spec.build_kwargs)
+        kwargs["input_max_size"] = image_size
+        specs.append(VariantSpec(spec.name, kwargs))
+    return specs
+
+
 ARCH_VARIANTS: Dict[str, List[VariantSpec]] = {
     "fasterrcnn": [
         # All formats incl. ".engine": fasterrcnn builds a TRT engine via the
@@ -62,21 +114,43 @@ ARCH_VARIANTS: Dict[str, List[VariantSpec]] = {
         # weights=False is required: build_rfdetr defaults to weights=True,
         # which downloads the variant's published COCO checkpoint.
         #
-        # resolution=640 pins every variant to the same input size as the other
+        # resolution=640 pins most variants to the same input size as the other
         # 4 archs for a fair FPS/latency comparison (rfdetr's ONNX/TRT export is
         # always static-shaped at whatever `resolution` the adapter reports --
         # see friendy_chachkalica/ml/onnx_export/arch/rfdetr.py -- so this
         # overrides each variant's native resolution: nano 384->640,
-        # small 512->640, medium 576->640, large 704->640). Verified all 4
-        # build + run a full predict() at 640 with no shape errors.
+        # small 512->640, medium 576->640). Verified they build + run a full
+        # predict() at 640 with no shape errors.
         VariantSpec("nano", {"variant": "nano", "weights": False, "resolution": 640}),
         VariantSpec("small", {"variant": "small", "weights": False, "resolution": 640}),
         VariantSpec("medium", {"variant": "medium", "weights": False, "resolution": 640}),
         # base's windowed-attention backbone hard-requires the resolution be a
-        # multiple of patch_size*num_windows=56 (640 isn't); 672 is the
-        # nearest valid size at or above 640.
+        # multiple of patch_size*num_windows=56 (640 isn't); 672 is the nearest
+        # valid size at or above 640. base's .onnx/.engine run FAR slower than
+        # its .pt (engine ~62 fps @ ~17% GPU util vs pt ~118 fps) -- a real
+        # export cliff. It is NOT caused by base's num_windows=4 / patch_size=14
+        # defaults, as first assumed: large below (num_windows=2, patch_size=16,
+        # identical to medium) hits the SAME cliff at 704, so the driver is
+        # resolution > 640, not the window count -- see the large note.
         VariantSpec("base", {"variant": "base", "weights": False, "resolution": 672}),
-        VariantSpec("large", {"variant": "large", "weights": False, "resolution": 640}),
+        # large stays at its NATIVE 704, deliberately NOT overridden to 640.
+        # The 2026 RFDETRLargeConfig is architecturally identical to medium
+        # (same dinov2_windowed_small encoder, hidden_dim 256, dec_layers 4,
+        # num_windows 2, patch_size 16, [P4] projector) -- the ONLY difference
+        # is native resolution (704 vs 576). That makes large-vs-medium a clean
+        # controlled experiment on resolution, and it exposed a real finding:
+        # rfdetr's EXPORTED formats fall off a cliff above 640. medium@640
+        # engine ~266 fps @ 60% util; large@704 engine ~56 fps @ 16% util --
+        # same graph, only the input size differs. The SAME large engine ran
+        # ~255 fps when this was pinned to 640, and PT is unaffected at any size
+        # (base/large pt ~110-118 fps), so it's specifically an ONNX/TRT
+        # kernel-fusion cliff at the 672/704 token grids (42/44 patches/side vs
+        # 40 at 640), reproduced on an idle GPU so it isn't a build-time
+        # tactic-selection artifact. Overriding large->640 would hide this by
+        # collapsing it onto medium@640 (verified identical). (The old
+        # heavyweight ViT-B large is now RFDETRLargeDeprecatedConfig; the
+        # shipping `large` is this ViT-S one.)
+        VariantSpec("large", {"variant": "large", "weights": False, "resolution": 704}),
         # xlarge/2xlarge deliberately excluded: rfdetr[plus], PML-1.0
         # non-commercial license -- the adapter itself refuses to build them.
     ],

@@ -109,12 +109,14 @@ class RFDETRAdapter:
         )
         results = self.postprocess(outputs, target_sizes)
         predictions = []
-        for result, image, scale in zip(results, images, scales):
+        for result, image, (scale_y, scale_x) in zip(results, images, scales):
             # RF-DETR's head has num_classes + 1 slots; the extra last slot is the
             # no-object/background class. Real classes are 0..num_classes-1, so drop
             # any background prediction along with sub-threshold ones.
             keep = (result["scores"] >= threshold) & (result["labels"] < self.num_classes)
-            boxes = result["boxes"][keep] / scale
+            boxes = result["boxes"][keep].clone()
+            boxes[:, [0, 2]] /= scale_x
+            boxes[:, [1, 3]] /= scale_y
             scores = result["scores"][keep]
             labels = result["labels"][keep]
             image_height, image_width = image.shape[-2:]
@@ -166,17 +168,21 @@ class RFDETRAdapter:
             canvas = normalized.new_zeros((3, self.resolution, self.resolution))
             canvas[:, :new_h, :new_w] = normalized
             prepared.append(canvas)
-            scales.append(scale)
+            # F.interpolate receives rounded output dimensions, so retain the actual
+            # scale applied on each axis for exact label and prediction geometry.
+            scales.append((new_h / float(h), new_w / float(w)))
         return torch.stack(prepared), scales
 
     def _prepare_labels(self, targets, scales) -> List[Dict[str, torch.Tensor]]:
         device = next(self.model.parameters()).device
         labels = []
-        for target, scale in zip(targets, scales):
+        for target, (scale_y, scale_x) in zip(targets, scales):
             # Map original-pixel boxes into canvas-pixel space (offset 0, since
             # padding is bottom-right), then normalize by the canvas size — not
             # the original image size, since the canvas includes padding.
-            boxes = target["boxes"].to(device).float() * scale
+            boxes = target["boxes"].to(device).float().clone()
+            boxes[:, [0, 2]] *= scale_x
+            boxes[:, [1, 3]] *= scale_y
             labels.append(
                 {
                     "labels": target["labels"].to(device).long(),

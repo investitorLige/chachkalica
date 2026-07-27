@@ -123,3 +123,70 @@ class FrameExtractionJob(models.Model):
 
     def __str__(self) -> str:
         return f"{self.video.name} → {self.dataset_name}"
+
+
+class InferenceJob(models.Model):
+    """One "Run model inference…" run: a trained model applied frame-by-frame
+    to a video, with detected boxes burned onto an annotated output video.
+
+    Mirrors :class:`FrameExtractionJob` — a dedicated row per run (a video can
+    reasonably be re-run against different models/thresholds), status lifecycle
+    ``queued -> running -> ok``/``error``. The output video lives under
+    ``<videos_root>/inferred/`` (see ``videos.services.inference.output_dir``),
+    same "DB stores metadata, bytes stay on disk" convention as ``Video``.
+    """
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    OK = "ok"
+    ERROR = "error"
+    STATUS_CHOICES = [
+        (QUEUED, "queued"),
+        (RUNNING, "running"),
+        (OK, "ok"),
+        (ERROR, "error"),
+    ]
+
+    video = models.ForeignKey(Video, on_delete=models.CASCADE, related_name="inference_jobs")
+    trained_model = models.ForeignKey(
+        "training.TrainedModel", on_delete=models.CASCADE, related_name="video_inference_jobs",
+    )
+    score_threshold = models.FloatField(
+        default=0.5, help_text="Detections below this confidence are dropped.",
+    )
+    frame_stride = models.PositiveIntegerField(
+        default=1,
+        help_text="Run inference every Nth frame; frames in between reuse the last "
+                  "inferred boxes. Higher = faster, less temporally precise.",
+    )
+
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=QUEUED)
+    last_error = models.TextField(blank=True)
+    output_filename = models.CharField(
+        max_length=512, blank=True,
+        help_text="File name under <videos_root>/inferred/ holding the annotated video.",
+    )
+    frames_total = models.PositiveIntegerField(null=True, blank=True)
+    frames_processed = models.PositiveIntegerField(
+        null=True, blank=True, help_text="Number of frames actually run through the model.",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Inferred video"
+        verbose_name_plural = "Inferred videos"
+
+    def __str__(self) -> str:
+        return f"{self.video.name} → {self.trained_model.name}"
+
+    def output_path(self) -> Path:
+        from videos.services.inference import output_dir
+
+        return output_dir() / self.output_filename
+
+    def output_exists(self) -> bool:
+        return bool(self.output_filename) and self.output_path().is_file()

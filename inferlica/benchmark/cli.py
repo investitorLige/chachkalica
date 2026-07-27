@@ -85,6 +85,14 @@ def main() -> None:
         "with this set (it just gives them a fair shot at a real sample), pt gets an exact CUPTI-backed "
         "reading regardless via torch.profiler.",
     )
+    parser.add_argument(
+        "--follow-image-size", action="store_true",
+        help="Make rfdetr AND yolox follow --image-size too. Both have an architectural input size "
+        "(rfdetr's per-variant resolution, yolox's fixed canvas) that otherwise ignores --image-size; "
+        "with this flag rfdetr is rebuilt at the nearest valid resolution (multiples of 32, or 56 for "
+        "base) and yolox at the size directly (multiple of 32). fasterrcnn/rtdetr/retinanet follow via "
+        "their static engine profile regardless. Leave off to keep native sizes.",
+    )
     args = parser.parse_args()
 
     from friendy_chachkalica.device import resolve_device
@@ -108,6 +116,7 @@ def main() -> None:
         force_rebuild=args.force_rebuild,
         variant_names=args.variants,
         min_duration_s=args.gpu_util_min_duration_s,
+        follow_image_size=args.follow_image_size,
     )
 
     print("\n=== benchmark summary ===")

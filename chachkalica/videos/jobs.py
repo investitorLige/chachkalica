@@ -9,12 +9,16 @@ from django.db import IntegrityError
 from django.utils import timezone
 
 from fleet.services.paths import videos_root
-from videos.models import FrameExtractionJob, Video
-from videos.services import downloader, frame_extraction
+from videos.models import FrameExtractionJob, InferenceJob, Video
+from videos.services import downloader, frame_extraction, inference
 
 # The queue's DEFAULT_TIMEOUT is only 900s; a long/densely-sampled video can run
 # past that, so extract_frames is always enqueued with job_timeout=JOB_TIMEOUT.
 JOB_TIMEOUT = 1800
+
+# Running a model over every frame + encoding the result is heavier than sampled
+# frame extraction, so inference jobs get a longer budget.
+INFERENCE_JOB_TIMEOUT = 3600
 
 
 def _unique_name(base: str, exclude_pk: int | None = None) -> str:
@@ -95,4 +99,30 @@ def extract_frames(job_id: int) -> dict:
         "status", "frames_extracted", "frames_dropped_similar", "frames_dropped_no_person",
         "dataset", "finished_at",
     ])
+    return result
+
+
+def run_inference(job_id: int) -> dict:
+    job = InferenceJob.objects.select_related("video", "trained_model").get(pk=job_id)
+    job.status = InferenceJob.RUNNING
+    job.started_at = timezone.now()
+    job.last_error = ""
+    job.save(update_fields=["status", "started_at", "last_error"])
+
+    try:
+        result = inference.run_inference_on_video(job)
+    except Exception as exc:
+        job.refresh_from_db()
+        job.status = InferenceJob.ERROR
+        job.last_error = str(exc)
+        job.finished_at = timezone.now()
+        job.save(update_fields=["status", "last_error", "finished_at"])
+        raise
+
+    job.refresh_from_db()
+    job.status = InferenceJob.OK
+    job.frames_total = result["frames_total"]
+    job.frames_processed = result["frames_processed"]
+    job.finished_at = timezone.now()
+    job.save(update_fields=["status", "frames_total", "frames_processed", "finished_at"])
     return result
