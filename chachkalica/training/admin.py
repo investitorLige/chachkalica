@@ -33,6 +33,7 @@ from training.models import (
     Experiment,
     ExperimentDataset,
     ExperimentModel,
+    ExportRun,
     RunResult,
     TrainedModel,
     TrainingRun,
@@ -40,7 +41,9 @@ from training.models import (
 )
 from training import model_specs, pipelines
 from training.forms import ExperimentModelForm
-from training.services import combine, config_gen, ingest, promote, runner, teardown
+from training.services import (
+    combine, config_gen, exports, ingest, pipeline_meta, promote, runner, teardown,
+)
 
 
 _HARD_IMAGE_TOKEN_SALT = "training.hard-image-path"
@@ -80,7 +83,8 @@ def _hard_image_path_from_request(request, images):
 
 @admin.register(TrainingSettings)
 class TrainingSettingsAdmin(admin.ModelAdmin):
-    list_display = ["__str__", "configs_root", "runs_root", "default_device", "service_base_url"]
+    list_display = ["__str__", "configs_root", "runs_root", "exports_root",
+                    "default_device", "service_base_url"]
 
     def has_add_permission(self, request):
         return not TrainingSettings.objects.exists()
@@ -659,6 +663,11 @@ def _float_or_none(raw):
     return float(raw) if raw else None
 
 
+def _int_or_none(raw):
+    raw = (raw or "").strip()
+    return int(float(raw)) if raw else None
+
+
 def _preview_index(request, count):
     """Parse a 0-based ``?index=`` and bound it to ``[0, count)`` or 404."""
     if count <= 0:
@@ -842,9 +851,12 @@ class TrainedModelAdmin(admin.ModelAdmin):
                 pipeline=pipeline,
                 detector_checkpoint=(request.POST.get("detector_checkpoint") or "").strip(),
                 detector_expand_ratio=expand_ratio,
+                detector_min_box_size=_float("detector_min_box_size"),
+                tile_size_px=_int_or_none(request.POST.get("tile_size_px")),
                 tile_width_pct=_float("tile_width_pct"),
                 tile_height_pct=_float("tile_height_pct"),
                 overlap=_float("overlap"),
+                merge_nms_iou=_float("merge_nms_iou"),
                 chain=chain,
                 map_score_threshold=_map_score_threshold(),
                 score_threshold=_score_threshold(),
@@ -881,6 +893,10 @@ class TrainedModelAdmin(admin.ModelAdmin):
             "tiling_pipelines": " ".join([
                 PipelineEvalRun.BATCH_DETECT, PipelineEvalRun.BATCH_PEOPLE, PipelineEvalRun.CHAIN]),
             "chain_pipelines": PipelineEvalRun.CHAIN,
+            # Every pipeline merges several predictions per image back together;
+            # only the no-pipeline / raw option has nothing to merge.
+            "merging_pipelines": " ".join(
+                value for value, _label in PipelineEvalRun.PIPELINE_CHOICES),
             # Pre-fill the pipeline fields from the experiment the model came from,
             # so a later manual eval defaults to the params the model was trained
             # with. Empty dict when the model has no originating experiment or that
@@ -894,20 +910,17 @@ class TrainedModelAdmin(admin.ModelAdmin):
 
     @staticmethod
     def _experiment_pipeline_defaults(model) -> dict:
-        """Pipeline config saved on the experiment this model was trained in."""
-        rr = getattr(model, "source_run_result", None)
-        experiment = getattr(getattr(rr, "run", None), "experiment", None)
-        if experiment is None or not experiment.pipeline:
+        """The model's frozen pipeline metadata, shaped for a form template.
+
+        Shared by the eval and preview forms, which offer the same pipeline
+        vocabulary. Blank for a full-frame model, since the eval form's "no
+        pipeline" option *is* the plain-eval path — there is nothing to prefill.
+        ``chain`` becomes the comma-separated string the form field takes.
+        """
+        meta = pipeline_meta.for_trained_model(model)
+        if meta["pipeline"] == pipeline_meta.RAW:
             return {}
-        return {
-            "pipeline": experiment.pipeline,
-            "detector_checkpoint": experiment.detector_checkpoint,
-            "detector_expand_ratio": experiment.detector_expand_ratio,
-            "tile_width_pct": experiment.tile_width_pct,
-            "tile_height_pct": experiment.tile_height_pct,
-            "overlap": experiment.overlap,
-            "chain": ", ".join(experiment.chain or []),
-        }
+        return {**meta, "chain": ", ".join(meta["chain"])}
 
     # ------------------------------------------------------------------ preview
     RAW_PIPELINE = ("raw", "Raw model (no pipeline)")
@@ -937,9 +950,13 @@ class TrainedModelAdmin(admin.ModelAdmin):
                 "dataset": dataset.pk,
                 "pipeline": request.POST.get("pipeline") or self.RAW_PIPELINE[0],
                 "detector_checkpoint": (request.POST.get("detector_checkpoint") or "").strip(),
+                "detector_expand_ratio": (request.POST.get("detector_expand_ratio") or "").strip(),
+                "detector_min_box_size": (request.POST.get("detector_min_box_size") or "").strip(),
+                "tile_size_px": (request.POST.get("tile_size_px") or "").strip(),
                 "tile_width_pct": (request.POST.get("tile_width_pct") or "").strip(),
                 "tile_height_pct": (request.POST.get("tile_height_pct") or "").strip(),
                 "overlap": (request.POST.get("overlap") or "").strip(),
+                "merge_nms_iou": (request.POST.get("merge_nms_iou") or "").strip(),
                 "chain": (request.POST.get("chain") or "").strip(),
                 "score": (request.POST.get("score") or "").strip(),
                 "label_source": request.POST.get("label_source") or "",
@@ -961,6 +978,15 @@ class TrainedModelAdmin(admin.ModelAdmin):
             "tiling_pipelines": " ".join([
                 PipelineEvalRun.BATCH_DETECT, PipelineEvalRun.BATCH_PEOPLE, PipelineEvalRun.CHAIN]),
             "chain_pipelines": PipelineEvalRun.CHAIN,
+            # Every pipeline merges several predictions per image back together;
+            # only the no-pipeline / raw option has nothing to merge.
+            "merging_pipelines": " ".join(
+                value for value, _label in PipelineEvalRun.PIPELINE_CHOICES),
+            # Same "serve it the way it was trained" prefill as the video/camera
+            # inference forms, off the same frozen record — a preview run through
+            # different geometry than the model was trained with is misleading, so
+            # the trained pipeline is the default and overriding it is deliberate.
+            "pipeline_defaults": self._experiment_pipeline_defaults(model),
             "action": "preview_on_dataset",
             "selected": [str(model.pk)],
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
@@ -995,15 +1021,34 @@ class TrainedModelAdmin(admin.ModelAdmin):
         slug = re.sub(r"[^A-Za-z0-9._-]+", "_", model_name).strip("_")
         return slug or "model"
 
+    @staticmethod
+    def _trained_size_hint(checkpoints) -> dict:
+        """Best-effort ``runner.inspect_checkpoint`` on the first checkpoint, to
+        prefill/confirm the export forms' static input size.
+
+        Never raises — a trainer-service hiccup here must not block opening the
+        form; the operator just sees no hint and can still type a size by hand
+        (or, for ONNX, the export itself still resolves the size correctly).
+        """
+        if not checkpoints:
+            return {}
+        _, checkpoint_path = checkpoints[0]
+        try:
+            return runner.inspect_checkpoint(checkpoint_path)
+        except Exception:  # noqa: BLE001 - best-effort hint only
+            return {}
+
     @admin.action(description="Export best + last to ONNX…")
     def export_onnx(self, request, queryset):
-        """Export a model's best and last ``.pt`` to ONNX under a chosen directory.
+        """Queue a model's best and last ``.pt`` for ONNX export under a chosen directory.
 
-        Drives the trainer service's synchronous ``/export_onnx`` (the export must
-        run in the trainer's torch env), writing ``<name>-best.onnx`` /
-        ``<name>-last.onnx`` (each with a sibling ``.meta.json``) into the operator's
-        directory. Relative paths resolve against the project root, like the other
-        training paths.
+        Creates one ``ExportRun`` per checkpoint and enqueues ``jobs.run_export_onnx``
+        on the ``django_rq`` worker — the export itself (plus its pipeline sidecar and
+        best-effort infer bundle) runs there against the trainer service's
+        ``/export_onnx`` (torch env), instead of blocking this request. Writes
+        ``<name>-best.onnx`` / ``<name>-last.onnx`` (each with a sibling ``.meta.json``)
+        into the operator's directory. Relative paths resolve against the project root,
+        like the other training paths.
         """
         if queryset.count() != 1:
             self.message_user(request, "Select exactly one model to export.",
@@ -1025,32 +1070,30 @@ class TrainedModelAdmin(admin.ModelAdmin):
                 return None
             out_dir = config_gen._resolve(output_dir)
             stem = self._onnx_stem(model.name)
-            exported = 0
+            queue = _queue()
             for label, checkpoint in checkpoints:
                 onnx_path = out_dir / f"{stem}-{label}.onnx"
-                try:
-                    result = runner.export_onnx(checkpoint, onnx_path)
-                except Exception as exc:  # noqa: BLE001 - surface service/network errors
-                    self.message_user(
-                        request, f"{label} ({checkpoint}): {exc}", level=messages.ERROR)
-                    continue
-                exported += 1
-                self.message_user(
-                    request,
-                    f"Exported {label} → {result.get('onnx_path')} "
-                    f"(+ {Path(result.get('meta_path', '')).name}).")
-            if exported:
-                self.message_user(request, f"Exported {exported} checkpoint(s) for {model.name}.")
+                export_run = ExportRun.objects.create(
+                    model=model, kind=ExportRun.ONNX, checkpoint_label=label,
+                    checkpoint_path=checkpoint, output_path=str(onnx_path),
+                )
+                queue.enqueue(
+                    jobs.run_export_onnx, export_run.pk, job_timeout=jobs.EXPORT_ONNX_JOB_TIMEOUT)
+            self.message_user(
+                request,
+                f"Queued {len(checkpoints)} ONNX export job(s) for {model.name} — see "
+                f"Export runs for progress.")
             return None
 
-        ts = TrainingSettings.load()
-        default_dir = config_gen._resolve(ts.runs_root) / "onnx_exports"
+        default_dir = exports.exports_root()
+        trained_size = self._trained_size_hint(checkpoints).get("trained_size")
         context = {
             **self.admin_site.each_context(request),
             "title": f"Export {model.name} to ONNX",
             "model": model,
             "checkpoints": [{"label": label, "path": path} for label, path in checkpoints],
             "default_output_dir": str(default_dir),
+            "trained_size_hint": f"{trained_size[0]}×{trained_size[1]}" if trained_size else "",
             "action": "export_onnx",
             "selected": [str(model.pk)],
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
@@ -1060,15 +1103,20 @@ class TrainedModelAdmin(admin.ModelAdmin):
     # ------------------------------------------------------------------- TensorRT export
     @admin.action(description="Export best + last to TensorRT…")
     def export_trt(self, request, queryset):
-        """Build TensorRT engines for a model's best and last ``.pt`` under a chosen dir.
+        """Queue TensorRT engine builds for a model's best and last ``.pt``.
 
-        Drives the trainer service's synchronous ``/export_trt`` (the build must run
-        in the trainer's GPU env), writing ``<name>-best.engine`` / ``<name>-last.engine``
-        (each with sibling ``.meta.json`` + ``.engine.json``) into the operator's
-        directory. Relative paths resolve against the project root.
+        Creates one ``ExportRun`` per checkpoint and enqueues ``jobs.run_export_trt``
+        on the ``django_rq`` worker — the build itself (plus its pipeline sidecar and
+        best-effort infer bundle) runs there against the trainer service's
+        ``/export_trt`` (GPU env), instead of blocking this request. Writes
+        ``<name>-best.engine`` / ``<name>-last.engine`` (each with sibling
+        ``.meta.json`` + ``.engine.json``) into the operator's directory. Relative
+        paths resolve against the project root.
 
         NOTE: unlike ONNX export, this uses the GPU and competes with active training;
-        engines are non-portable (tied to the trainer's GPU + TensorRT version).
+        engines are non-portable (tied to the trainer's GPU + TensorRT version). Check
+        "Export runs" afterward for whether the requested precision actually built (an
+        fp16 request can silently fall back to fp32).
         """
         if queryset.count() != 1:
             self.message_user(request, "Select exactly one model to export.",
@@ -1115,43 +1163,31 @@ class TrainedModelAdmin(admin.ModelAdmin):
                     return None
             out_dir = config_gen._resolve(output_dir)
             stem = self._onnx_stem(model.name)
-            exported = 0
+            queue = _queue()
             for label, checkpoint in checkpoints:
                 engine_path = out_dir / f"{stem}-{label}.engine"
-                try:
-                    result = runner.export_trt(
-                        checkpoint, engine_path, precision=precision, input_hw=input_hw)
-                except Exception as exc:  # noqa: BLE001 - surface service/network errors
-                    self.message_user(
-                        request, f"{label} ({checkpoint}): {exc}", level=messages.ERROR)
-                    continue
-                exported += 1
-                built = result.get("precision", precision)
-                self.message_user(
-                    request,
-                    f"Built {label} → {result.get('engine_path')} "
-                    f"(+ {Path(result.get('meta_path', '')).name}) [{built}].")
-                # Loud warning when an fp16 request silently downgraded — for
-                # Faster R-CNN this means the input size wasn't pinned.
-                if precision == "fp16" and built != "fp16":
-                    self.message_user(
-                        request,
-                        f"{label}: requested FP16 but built {built.upper()} (the FP16 build "
-                        f"produced no engine). For Faster R-CNN, set a static Input size to "
-                        f"get FP16.", level=messages.WARNING)
-            if exported:
-                self.message_user(
-                    request, f"Built {exported} engine(s) for {model.name} ({precision}).")
+                export_run = ExportRun.objects.create(
+                    model=model, kind=ExportRun.TRT, checkpoint_label=label,
+                    checkpoint_path=checkpoint, output_path=str(engine_path),
+                    precision=precision, input_hw=list(input_hw) if input_hw else None,
+                )
+                queue.enqueue(
+                    jobs.run_export_trt, export_run.pk, job_timeout=jobs.EXPORT_TRT_JOB_TIMEOUT)
+            self.message_user(
+                request,
+                f"Queued {len(checkpoints)} TensorRT export job(s) for {model.name} "
+                f"({precision}) — see Export runs for progress.")
             return None
 
-        ts = TrainingSettings.load()
-        default_dir = config_gen._resolve(ts.runs_root) / "trt_exports"
+        default_dir = exports.exports_root()
+        trained_size = self._trained_size_hint(checkpoints).get("trained_size")
         context = {
             **self.admin_site.each_context(request),
             "title": f"Export {model.name} to TensorRT",
             "model": model,
             "checkpoints": [{"label": label, "path": path} for label, path in checkpoints],
             "default_output_dir": str(default_dir),
+            "default_input_size": f"{trained_size[0]}x{trained_size[1]}" if trained_size else "",
             "action": "export_trt",
             "selected": [str(model.pk)],
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
@@ -1230,9 +1266,13 @@ class TrainedModelAdmin(admin.ModelAdmin):
                 request.GET.get("pipeline") or self.RAW_PIPELINE[0],
                 str(image_path),
                 detector_checkpoint=(request.GET.get("detector_checkpoint") or "").strip(),
+                detector_expand_ratio=_float_or_none(request.GET.get("detector_expand_ratio")),
+                detector_min_box_size=_float_or_none(request.GET.get("detector_min_box_size")),
+                tile_size_px=_int_or_none(request.GET.get("tile_size_px")),
                 tile_width_pct=_float_or_none(request.GET.get("tile_width_pct")),
                 tile_height_pct=_float_or_none(request.GET.get("tile_height_pct")),
                 overlap=_float_or_none(request.GET.get("overlap")),
+                merge_nms_iou=_float_or_none(request.GET.get("merge_nms_iou")),
                 chain=chain,
                 score_threshold=0.05 if score is None else score,
             )
@@ -1371,6 +1411,49 @@ class TrainedModelAdmin(admin.ModelAdmin):
             "index": index,
             "count": len(images),
         })
+
+
+@admin.register(ExportRun)
+class ExportRunAdmin(admin.ModelAdmin):
+    """Queued ONNX/TensorRT export jobs — one row per checkpoint per action.
+
+    Created by ``TrainedModelAdmin.export_onnx``/``export_trt`` and driven by
+    ``training.jobs.run_export_onnx``/``run_export_trt`` on the ``django_rq``
+    worker; nothing here is editable by hand.
+    """
+
+    list_display = [
+        "__str__", "model", "kind", "checkpoint_label", "status_badge",
+        "built_precision", "output_path", "bundle_dir", "created_at",
+    ]
+    list_filter = ["kind", "status", "model"]
+    readonly_fields = [
+        "model", "kind", "checkpoint_label", "checkpoint_path", "output_path",
+        "precision", "input_hw", "status", "result", "bundle_dir", "bundle_error",
+        "last_error", "started_at", "finished_at", "created_at",
+    ]
+
+    def has_add_permission(self, request):
+        # Rows are created by the export actions, not by hand.
+        return False
+
+    @admin.display(description="status", ordering="status")
+    def status_badge(self, obj):
+        return _status_badge(obj.status)
+
+    @admin.display(description="precision")
+    def built_precision(self, obj):
+        """The engine's actual precision vs. what was requested — an fp16
+        request can silently fall back to fp32 (e.g. Faster R-CNN with a
+        dynamic profile; see ``export_trt.html``'s help text)."""
+        if obj.kind != ExportRun.TRT or not obj.precision:
+            return ""
+        built = (obj.result or {}).get("precision")
+        if not built:
+            return obj.precision
+        if built != obj.precision:
+            return f"{obj.precision} → {built} (fallback)"
+        return built
 
 
 # EvalRun's admin lives in ``eval_pipelines.admin`` (as the "Base Eval" proxy)

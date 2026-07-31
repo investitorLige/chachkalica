@@ -11,7 +11,7 @@ classes: [class_a, class_b]
 output_dir: runs/people_detect_first_demo
 
 device: auto
-infer_batch_size: 4                 # crops per model forward pass
+infer_batch_size: 4                 # crops per model (2nd-stage) forward pass
 num_workers: 4
 score_threshold: 0.001
 merge_nms_iou: 0.5
@@ -24,3 +24,4 @@ detector:
   expand_ratio: 0.0                 # pad each person box outward before cropping
   nms_iou: 0.5
   min_box_size: 0.0                 # drop tiny final boxes (pixels)
+  batch_size: 4                     # frames per detector forward pass (independent of infer_batch_size); capped by the detector engine's exported max batch profile

@@ -14,6 +14,7 @@ from fleet.models import Annotator, Dataset, GroundingSamRun, Project
 from fleet.services import datasets as datasets_svc
 from fleet.services import grounding_sam as grounding_sam_svc
 from fleet.services import merge as merge_svc
+from fleet.services import overlap as overlap_svc
 from fleet.services import provisioning, sync as sync_svc
 
 
@@ -126,6 +127,19 @@ def merge_datasets(dataset_ids: list[int], new_name: str) -> dict:
     # Preserve a deterministic order (by name) regardless of pk ordering.
     datasets.sort(key=lambda d: d.name)
     return merge_svc.merge_datasets(datasets, new_name)
+
+
+def prune_overlaps(left_id: int, right_id: int, *, prune_left: bool, prune_right: bool) -> dict:
+    """Re-fingerprint a dataset pair and delete the duplicate copies found.
+
+    Re-hashes rather than reusing the report shown on screen, since that report
+    may be stale by the time the worker picks this up (the picture on disk is
+    the only thing safe to prune from).
+    """
+    left = Dataset.objects.get(pk=left_id)
+    right = Dataset.objects.get(pk=right_id)
+    report = overlap_svc.compare_pair(left, right)
+    return overlap_svc.prune_overlaps(report, prune_left=prune_left, prune_right=prune_right)
 
 
 def sync_project(project_id: int) -> dict:

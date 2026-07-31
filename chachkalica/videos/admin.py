@@ -8,6 +8,7 @@ A "Play selected video…" action (and per-row ▶ play link) opens an HTML5 pla
 backed by a Range-aware streaming endpoint so seeking works.
 """
 
+import json
 import re
 from pathlib import Path
 
@@ -22,7 +23,9 @@ from django.urls import path, reverse
 from django.utils.html import format_html
 
 from fleet.admin import _status_badge as _job_status_badge
+from training import pipelines
 from training.models import TrainedModel
+from training.services import exports, pipeline_meta
 from videos import jobs
 from videos.models import FrameExtractionJob, InferenceJob, Video
 from videos.services import downloader, frame_extraction, inference
@@ -43,6 +46,16 @@ _QUALITY_CHOICES = [
     ("720", "720p"),
     ("480", "480p"),
 ]
+
+
+# Every input on the run-inference form: the shared pipeline metadata vocabulary
+# (training.services.pipeline_meta.FIELDS) plus `frame_stride`, which is a property
+# of this run rather than of the model. Deriving the tuple from FIELDS rather than
+# restating it means a knob added to the metadata shows up here automatically.
+_FORM_FIELDS = (*pipeline_meta.FIELDS, "frame_stride")
+
+_DEFAULT_SCORE_THRESHOLD = 0.5
+_DEFAULT_FRAME_STRIDE = 1
 
 
 def _queue():
@@ -90,6 +103,55 @@ def _parse_float_in_range(raw: str, default, low: float, high: float):
     except ValueError:
         return None
     return value if low <= value <= high else None
+
+
+# Sentinel for the *optional* parsers below, which must tell "operator left it
+# blank" (a valid None) apart from "operator typed nonsense".
+_INVALID = object()
+
+
+def _parse_optional_float(raw: str, low: float, high: float):
+    """Parse an optional float in ``[low, high]``; blank -> ``None``, bad -> ``_INVALID``."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return _INVALID
+    return value if low <= value <= high else _INVALID
+
+
+def _parse_optional_int(raw: str, low: int, high: int):
+    """Parse an optional int in ``[low, high]``; blank -> ``None``, bad -> ``_INVALID``."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return _INVALID
+    return value if low <= value <= high else _INVALID
+
+
+def _form_values(defaults: dict, posted) -> dict:
+    """The values to render the step-2 form with.
+
+    A re-render after a validation warning keeps whatever the operator typed
+    (``posted`` wins); a first render uses the selected model's pipeline metadata,
+    so the page *arrives* configured the way the model was trained instead of
+    blank. ``chain`` is a list in the metadata and a comma-separated string in the
+    form.
+    """
+    if posted.get("apply"):
+        return {key: posted.get(key, "") for key in _FORM_FIELDS}
+
+    values = {key: defaults.get(key) for key in _FORM_FIELDS}
+    values["chain"] = ", ".join(defaults.get("chain") or [])
+    values["frame_stride"] = _DEFAULT_FRAME_STRIDE
+    if values.get("score_threshold") is None:
+        values["score_threshold"] = _DEFAULT_SCORE_THRESHOLD
+    return {key: "" if value is None else value for key, value in values.items()}
 
 
 class VideoAddForm(forms.ModelForm):
@@ -326,6 +388,16 @@ class VideoAdmin(admin.ModelAdmin):
 
     @admin.action(description="Run model inference…")
     def run_inference(self, request, queryset):
+        """Two-step "Run model inference…": pick where the model comes from, then
+        configure that model plus the pipeline the frames go through.
+
+        Step 1 only asks trained-catalogue vs exported-artifact; step 2 is rendered
+        for the chosen source, so the model selector is either the ``TrainedModel``
+        list or a scan of the export output directory (there is no DB row for an
+        exported ``.onnx``/``.engine``). Both land on the same submit, which
+        pre-flights the resulting ``/predict_image`` payload before enqueuing so a
+        missing detector/artifact is reported here rather than as a failed job.
+        """
         if queryset.count() != 1:
             self.message_user(request, "Select exactly one video to run inference on.",
                               level=messages.WARNING)
@@ -336,52 +408,212 @@ class VideoAdmin(admin.ModelAdmin):
                               level=messages.WARNING)
             return None
 
-        if request.POST.get("apply"):
-            trained_model = TrainedModel.objects.filter(
-                pk=request.POST.get("trained_model") or None
-            ).first()
-            if trained_model is None:
-                self.message_user(request, "Choose a trained model.", level=messages.WARNING)
-                return None
-
-            score_threshold = _parse_float_in_range(
-                request.POST.get("score_threshold"), default=0.5, low=0.0, high=1.0)
-            if score_threshold is None:
-                self.message_user(request, "Score threshold must be between 0 and 1.",
-                                  level=messages.WARNING)
-                return None
-
-            frame_stride = _parse_positive_int(request.POST.get("frame_stride"), default=1)
-            if frame_stride is None:
-                self.message_user(request, "Frame stride must be a positive integer.",
-                                  level=messages.WARNING)
-                return None
-
-            job = InferenceJob.objects.create(
-                video=video,
-                trained_model=trained_model,
-                score_threshold=score_threshold,
-                frame_stride=frame_stride,
-                output_filename=inference.unique_output_filename(video.name),
-            )
-            _queue().enqueue(jobs.run_inference, job.id, job_timeout=jobs.INFERENCE_JOB_TIMEOUT)
-            self.message_user(
-                request,
-                f"Inference queued for {video.name} with model {trained_model.name!r} "
-                "— see the Inferred videos tab for progress.",
-            )
-            return None
-
-        context = {
+        base_context = {
             **self.admin_site.each_context(request),
-            "title": f"Run model inference — {video.name}",
             "video": video,
-            "trained_models": TrainedModel.objects.order_by("name"),
             "action": "run_inference",
             "selected": [str(video.pk)],
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
         }
+
+        # ------------------------------------------------- step 1: model source
+        model_source = request.POST.get("model_source") or ""
+        if model_source not in (InferenceJob.TRAINED, InferenceJob.EXPORTED):
+            if request.POST.get("configure") or request.POST.get("apply"):
+                self.message_user(request, "Choose which kind of model to run.",
+                                  level=messages.WARNING)
+            return TemplateResponse(request, "admin/videos/run_inference_source.html", {
+                **base_context,
+                "title": f"Run model inference — {video.name}",
+                "model_source_choices": InferenceJob.MODEL_SOURCE_CHOICES,
+                "default_model_source": InferenceJob.TRAINED,
+                "artifact_count": len(exports.list_artifacts()),
+                "exports_root": str(exports.exports_root()),
+            })
+
+        # ------------------------------------------------------- step 2: submit
+        if request.POST.get("apply"):
+            job, error = self._build_inference_job(request, video, model_source)
+            if error:
+                self.message_user(request, error, level=messages.WARNING)
+            else:
+                job.save()
+                _queue().enqueue(jobs.run_inference, job.id,
+                                 job_timeout=jobs.INFERENCE_JOB_TIMEOUT)
+                self.message_user(
+                    request,
+                    f"Inference queued for {video.name} with {job.model_label()} "
+                    f"[{job.pipeline}] — see the Inferred videos tab for progress.",
+                )
+                return None
+
+        # ------------------------------------------ step 2: render the full form
+        # Both model lists are newest-first and the first entry is preselected, so
+        # the page arrives with a model chosen *and* its pipeline metadata filled
+        # in — the common case ("run this model the way it was trained") needs no
+        # selection at all. Picking a different model reapplies its own metadata
+        # client-side from the maps below.
+        artifacts = exports.list_artifacts()
+        is_exported = model_source == InferenceJob.EXPORTED
+        trained_models = list(
+            TrainedModel.objects
+            .select_related("source_run_result__run__experiment")
+            .order_by("-created_at", "name")
+        )
+        trained_defaults = {
+            str(tm.pk): pipeline_meta.for_trained_model(tm) for tm in trained_models
+        }
+        # An artifact with neither a ".pipeline.json" sidecar nor a catalogued model
+        # behind it has nothing on record (see exports.read_pipeline_defaults) and is
+        # simply left out of the map — selecting it leaves the form as it stands.
+        artifact_defaults = {
+            a["relpath"]: d
+            for a in artifacts
+            for d in [exports.read_pipeline_defaults(a["relpath"])] if d
+        }
+
+        if is_exported:
+            selected = request.POST.get("artifact_path") or (
+                artifacts[0]["relpath"] if artifacts else "")
+            defaults = artifact_defaults.get(selected) or pipeline_meta.raw()
+        else:
+            selected = request.POST.get("trained_model") or (
+                str(trained_models[0].pk) if trained_models else "")
+            defaults = trained_defaults.get(selected) or pipeline_meta.raw()
+
+        context = {
+            **base_context,
+            "title": f"Run model inference — {video.name}",
+            "model_source": model_source,
+            "is_exported": is_exported,
+            "trained_models": trained_models,
+            "trained_defaults": json.dumps(trained_defaults),
+            "artifacts": artifacts,
+            "artifact_defaults": json.dumps(artifact_defaults),
+            "selected_model": selected,
+            "values": _form_values(defaults, request.POST),
+            "default_score_threshold": _DEFAULT_SCORE_THRESHOLD,
+            "exports_root": str(exports.exports_root()),
+            "pipeline_choices": InferenceJob.PIPELINE_CHOICES,
+            "detector_pipelines": " ".join(sorted(pipelines.DETECTOR_PIPELINES)),
+            "tiling_pipelines": " ".join([
+                pipelines.BATCH_DETECT, pipelines.BATCH_PEOPLE, pipelines.CHAIN]),
+            "chain_pipelines": pipelines.CHAIN,
+            # Every pipeline merges several per-frame predictions back together;
+            # only "raw" has nothing to merge.
+            "merging_pipelines": " ".join(
+                value for value, _label in pipelines.PIPELINE_CHOICES),
+        }
         return TemplateResponse(request, "admin/videos/run_inference.html", context)
+
+    def _build_inference_job(self, request, video, model_source):
+        """Validate the step-2 POST into an unsaved :class:`InferenceJob`.
+
+        Returns ``(job, None)`` on success or ``(None, message)`` on the first
+        problem found, so the caller can re-render the form with a warning.
+        """
+        trained_model = None
+        artifact_path = ""
+        if model_source == InferenceJob.EXPORTED:
+            artifact_path = (request.POST.get("artifact_path") or "").strip()
+            if not artifact_path:
+                return None, "Choose an exported artifact."
+        else:
+            trained_model = TrainedModel.objects.filter(
+                pk=request.POST.get("trained_model") or None
+            ).first()
+            if trained_model is None:
+                return None, "Choose a trained model."
+
+        pipeline = request.POST.get("pipeline") or InferenceJob.RAW
+        if pipeline not in dict(InferenceJob.PIPELINE_CHOICES):
+            return None, f"Unknown pipeline {pipeline!r}."
+
+        score_threshold = _parse_float_in_range(
+            request.POST.get("score_threshold"), default=0.5, low=0.0, high=1.0)
+        if score_threshold is None:
+            return None, "Score threshold must be between 0 and 1."
+
+        frame_stride = _parse_positive_int(request.POST.get("frame_stride"), default=1)
+        if frame_stride is None:
+            return None, "Frame stride must be a positive integer."
+
+        numbers = {}
+        for field, raw, low, high, label in [
+            ("detector_expand_ratio", request.POST.get("detector_expand_ratio"),
+             0.0, 10.0, "Person-box expand ratio must be between 0 and 10."),
+            ("tile_width_pct", request.POST.get("tile_width_pct"),
+             0.0001, 100.0, "Tile width % must be in (0, 100]."),
+            ("tile_height_pct", request.POST.get("tile_height_pct"),
+             0.0001, 100.0, "Tile height % must be in (0, 100]."),
+            ("overlap", request.POST.get("overlap"),
+             0.0, 0.99, "Tile overlap must be in [0, 1)."),
+            ("merge_nms_iou", request.POST.get("merge_nms_iou"),
+             0.0, 1.0, "Merge NMS IoU must be between 0 and 1."),
+            ("detector_min_box_size", request.POST.get("detector_min_box_size"),
+             0.0, 100000.0, "Person-crop minimum size must be 0 or more pixels."),
+        ]:
+            value = _parse_optional_float(raw, low, high)
+            if value is _INVALID:
+                return None, label
+            numbers[field] = value
+
+        tile_size_px = _parse_optional_int(request.POST.get("tile_size_px"), 1, 100000)
+        if tile_size_px is _INVALID:
+            return None, "Tile size must be a positive number of pixels."
+
+        chain = [
+            part.strip() for part in (request.POST.get("chain") or "").split(",")
+            if part.strip()
+        ]
+
+        # The form hides irrelevant rows with CSS, which still submits them — drop
+        # the ones the chosen pipeline can't use so the saved row is an honest
+        # record of what actually ran. 'chain' can contain anything, so it keeps
+        # every knob.
+        detector_checkpoint = (request.POST.get("detector_checkpoint") or "").strip()
+        uses_detector = pipeline in pipelines.DETECTOR_PIPELINES or pipeline == pipelines.CHAIN
+        uses_tiling = pipeline in (
+            pipelines.BATCH_DETECT, pipelines.BATCH_PEOPLE, pipelines.CHAIN)
+        if not uses_detector:
+            detector_checkpoint = ""
+            numbers["detector_expand_ratio"] = None
+            numbers["detector_min_box_size"] = None
+        if not uses_tiling:
+            tile_size_px = None
+            numbers["tile_width_pct"] = None
+            numbers["tile_height_pct"] = None
+            numbers["overlap"] = None
+        # merge_nms_iou applies to every pipeline that produces several predictions
+        # per frame to reconcile — that is, all of them except "raw", which runs the
+        # model once on the whole frame and has nothing to merge.
+        if pipeline == InferenceJob.RAW:
+            numbers["merge_nms_iou"] = None
+        if pipeline != pipelines.CHAIN:
+            chain = []
+
+        job = InferenceJob(
+            video=video,
+            model_source=model_source,
+            trained_model=trained_model,
+            artifact_path=artifact_path,
+            score_threshold=score_threshold,
+            frame_stride=frame_stride,
+            pipeline=pipeline,
+            detector_checkpoint=detector_checkpoint,
+            tile_size_px=tile_size_px,
+            chain=chain,
+            output_filename=inference.unique_output_filename(video.name),
+            **numbers,
+        )
+
+        # Pre-flight the exact payload the job will send, so a missing artifact,
+        # an out-of-root path, or a detector-less person pipeline fails here.
+        try:
+            inference.build_predict_payload(job)
+        except RuntimeError as exc:
+            return None, str(exc)
+        return job, None
 
     @admin.action(description="Import every new file in the videos folder")
     def import_all_new(self, request, queryset):
@@ -514,19 +746,51 @@ class FrameExtractionJobAdmin(admin.ModelAdmin):
 class InferenceJobAdmin(admin.ModelAdmin):
     """Read-only log of "Run model inference…" runs — rows are only created by the action."""
 
-    list_display = ["video", "trained_model", "status_badge", "frames_processed",
-                     "play_link", "created_at"]
-    list_filter = ["status", "trained_model"]
-    search_fields = ["video__name", "trained_model__name"]
+    list_display = ["video", "model_display", "pipeline", "status_badge",
+                     "frames_processed", "play_link", "created_at"]
+    list_filter = ["status", "model_source", "pipeline", "trained_model"]
+    search_fields = ["video__name", "trained_model__name", "artifact_path"]
     readonly_fields = [f.name for f in InferenceJob._meta.fields]
     ordering = ["-created_at"]
 
     def has_add_permission(self, request):
         return False
 
+    def get_actions(self, request):
+        """Relabel the stock ``delete_selected`` so it's clear the annotated
+        mp4 goes with the row, not just orphaned under ``inferred/``."""
+        actions = super().get_actions(request)
+        if "delete_selected" in actions:
+            func, name, _desc = actions["delete_selected"]
+            actions["delete_selected"] = (
+                func, name,
+                "Delete selected inferred videos (also deletes the annotated file)",
+            )
+        return actions
+
+    def delete_model(self, request, obj):
+        obj.output_path().unlink(missing_ok=True)
+        super().delete_model(request, obj)
+
+    def delete_queryset(self, request, queryset):
+        for job in queryset:
+            job.output_path().unlink(missing_ok=True)
+        super().delete_queryset(request, queryset)
+
     @admin.display(description="status", ordering="status")
     def status_badge(self, obj):
         return _job_status_badge(obj.status)
+
+    @admin.display(description="model")
+    def model_display(self, obj):
+        """The trained model's name, or the exported artifact's path."""
+        if obj.model_source == InferenceJob.EXPORTED:
+            return format_html('<span title="exported artifact">{}</span>',
+                               obj.artifact_path or "—")
+        if not obj.trained_model_id:
+            return "—"
+        url = reverse("admin:training_trainedmodel_change", args=[obj.trained_model_id])
+        return format_html('<a href="{}">{}</a>', url, obj.trained_model.name)
 
     @admin.display(description="")
     def play_link(self, obj):

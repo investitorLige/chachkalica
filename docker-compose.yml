@@ -82,19 +82,31 @@ services:
 
   web:
     <<: *app
+    # Threaded workers are not optional: the camera MJPEG endpoints hold a
+    # response open for as long as the operator watches, so a sync worker would
+    # be parked for the whole stream and the rest of the admin would hang until
+    # gunicorn's timeout killed it. Keep the gunicorn args on ONE line — a
+    # folded YAML scalar (>) preserves the newline before a *more indented*
+    # line, which would silently split the command and drop every flag after
+    # the break, leaving the defaults (1 sync worker, 30 s timeout).
     command: >
       sh -c "python manage.py migrate &&
              python manage.py collectstatic --noinput &&
-             gunicorn fleetsite.wsgi:application --bind 0.0.0.0:9000
-             --workers 2 --worker-class gthread --threads 8 --timeout 120"
+             gunicorn fleetsite.wsgi:application --bind 0.0.0.0:9000 --workers 2 --worker-class gthread --threads 8 --timeout 120"
     # Published on 9000 so it inherits the webhook's host port: Label Studio
     # containers keep hitting http://host.docker.internal:9000/hook.
     ports:
       - "9000:9000"
 
+  # Multiple replicas so a long-running job (e.g. a training/eval poll job,
+  # see training/jobs.py JOB_TIMEOUT) can't starve short jobs like annotator
+  # provisioning — RQ workers pull jobs off "default" one at a time each, so
+  # one busy worker no longer blocks the rest.
   worker:
     <<: *app
     command: python manage.py rqworker default
+    deploy:
+      replicas: ${RQ_WORKER_REPLICAS:-3}
 
   # Holds the RTSP connections for registered cameras and refreshes their
   # latest frame in Redis (see chachkalica/cameras/management/commands/
@@ -112,6 +124,39 @@ services:
       REDIS_URL: redis://redis:6379/0
     command: python manage.py stream_cameras
     restart: unless-stopped
+    # Lets a camera's rtsp_url point at host.docker.internal to reach a
+    # stream that's only tunneled/reachable from the host itself (e.g. an
+    # SSH -L port forward), the same way web/worker/trainer already can.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # Runs each camera's configured model over the frames camera-workers cached
+  # (see chachkalica/cameras/management/commands/infer_cameras.py and
+  # chachkalica/docs/camera-live-inference.md). Separate from camera-workers
+  # because it needs things that one deliberately does without: the shared
+  # data/ mount (each frame is handed to the trainer as a PATH — see the SHARED
+  # FILESYSTEM note above) and the trainer URL. It still needs no RTSP access,
+  # no docker socket, and no GPU of its own — the trainer owns the GPU.
+  camera-inference:
+    build: ./chachkalica
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: fleet
+      POSTGRES_USER: fleet
+      POSTGRES_PASSWORD: fleet
+      REDIS_URL: redis://redis:6379/0
+      TRAINING_SERVICE_URL: http://trainer:8200
+    volumes:
+      - ./chachkalica/data:/app/data
+    command: python manage.py infer_cameras
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy

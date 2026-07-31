@@ -5,10 +5,16 @@ output dir. Promoting copies its checkpoint reference, architecture, class space
 (read from the train dataset's classes.txt — the model's class order), and a
 metrics snapshot into a durable :class:`~training.models.TrainedModel` that can
 be evaluated independently later.
+
+The pipeline the run was trained through is frozen in at the same moment (see
+:mod:`training.services.pipeline_meta`): a promoted model has to keep describing
+the geometry it was trained with even after its experiment is retuned or
+deleted, which is what lets every later action — eval, export, video inference,
+camera inference — prefill itself instead of asking for those parameters again.
 """
 
 from training.models import RunResult, TrainedModel
-from training.services import config_gen
+from training.services import config_gen, pipeline_meta
 
 
 def promote_run_result(
@@ -35,5 +41,8 @@ def promote_run_result(
         num_classes=len(classes) or None,
         classes=classes,
         metrics=run_result.primary_metrics,
+        pipeline_metadata=pipeline_meta.from_experiment(
+            getattr(run_result.run, "experiment", None)
+        ),
         source_run_result=run_result,
     )

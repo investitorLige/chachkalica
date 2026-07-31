@@ -75,10 +75,12 @@ class PipelineRequestTests(PipelineEvalSetup):
         self.assertNotIn("detector", req)
         self.assertNotIn("tiling", req)
 
-    def test_detector_pipeline_requires_checkpoint(self):
+    def test_detector_pipeline_falls_back_to_default_checkpoint(self):
         pe = self._make(pipeline=PipelineEvalRun.PEOPLE_DETECT_FIRST)
-        with self.assertRaises(ValueError):
-            config_gen.build_pipeline_request(pe, "/out/pipeline-2")
+        req = config_gen.build_pipeline_request(pe, "/out/pipeline-2")
+        self.assertTrue(
+            req["detector"]["checkpoint"].endswith("models/people/best_ckpt.engine")
+        )
 
     def test_detector_and_tiling_emitted(self):
         pe = self._make(
@@ -104,6 +106,44 @@ class PipelineRequestTests(PipelineEvalSetup):
         )
         req = config_gen.build_pipeline_request(pe, "/out/pipeline-5")
         self.assertEqual(req["detector"]["expand_ratio"], 0.2)
+
+    def test_tile_size_px_overrides_the_percentages(self):
+        pe = self._make(
+            pipeline=PipelineEvalRun.BATCH_DETECT, tile_size_px=640, overlap=0.2)
+        req = config_gen.build_pipeline_request(pe, "/out/pipeline-6")
+        self.assertEqual(req["tiling"], {"tile_size_px": 640, "overlap": 0.2})
+
+    def test_min_box_size_emitted_for_people_detect_first_only(self):
+        # Scoped like pipeline_block: batch_people's crops come from fixed-size
+        # tiles and can't shrink to the sizes this floor exists to catch.
+        cropped = self._make(
+            pipeline=PipelineEvalRun.PEOPLE_DETECT_FIRST,
+            detector_checkpoint="/models/person.pt", detector_min_box_size=96,
+        )
+        self.assertEqual(
+            config_gen.build_pipeline_request(cropped, "/out/p")["detector"]["min_box_size"],
+            96,
+        )
+
+        tiled = self._make(
+            pipeline=PipelineEvalRun.BATCH_PEOPLE,
+            detector_checkpoint="/models/person.pt", detector_min_box_size=96,
+        )
+        self.assertNotIn(
+            "min_box_size",
+            config_gen.build_pipeline_request(tiled, "/out/p")["detector"],
+        )
+
+    def test_merge_nms_iou_emitted_only_when_set(self):
+        # chachak parses it with an unconditional float(), so an explicit null
+        # would crash rather than fall through to the default.
+        blank = self._make(pipeline=PipelineEvalRun.BATCH_DETECT)
+        self.assertNotIn(
+            "merge_nms_iou", config_gen.build_pipeline_request(blank, "/out/p"))
+
+        pe = self._make(pipeline=PipelineEvalRun.BATCH_DETECT, merge_nms_iou=0.55)
+        self.assertEqual(
+            config_gen.build_pipeline_request(pe, "/out/p")["merge_nms_iou"], 0.55)
 
     def test_chain_pipeline_carries_children(self):
         pe = self._make(

@@ -164,7 +164,11 @@ def test_yolox_parity(yolox_engine):
 def rtdetr_engine(tmp_path_factory):
     pytest.importorskip("transformers")
     torch.manual_seed(0)
-    adapter = build_model("rtdetr", num_classes=3, weights=None)
+    # The adapter stretches every image onto a square input_max_size canvas, so
+    # the engine's static profile has to be that canvas — pin it to 512 (rather
+    # than the 640 default) and feed a 512 image, which keeps the resize a no-op
+    # on both sides and the engine small.
+    adapter = build_model("rtdetr", num_classes=3, weights=None, input_max_size=512)
     inner = adapter.model.model
     torch.nn.init.normal_(inner.enc_score_head.weight, mean=0.0, std=0.2)
     torch.nn.init.constant_(inner.enc_score_head.bias, 0.0)

@@ -43,6 +43,51 @@ from chachak import load_pipeline_config, run_pipeline
 run_pipeline(load_pipeline_config("chachak/configs/batch_people.yaml"))
 ```
 
+## Ship a pipeline to someone else
+
+`friendy_chachkalica/ml/onnx_export` makes one *model* portable. `bundle_export`
+makes the whole *pipeline* portable — the geometry that lives only in the config
+here (tiling, person-crop expansion, merge NMS) plus every checkpoint the config
+names:
+
+```bash
+# from the repo root
+python -m chachak.bundle_export.cli chachak/configs/people_detect_first.yaml \
+    -o dist/ppe --conf 0.4
+```
+
+The recipient gets a directory needing nothing from this repo — no architecture
+packages, no `friendy_chachkalica` — and one command:
+
+```bash
+pip install -r requirements.txt
+python infer.py path/to/images --conf 0.4     # --conf is the only routine knob
+```
+
+It writes `results/detections.json` (pixel + normalized boxes per image), and
+annotated copies with `--save-images`.
+
+| in the bundle | what it is |
+| --- | --- |
+| `pipeline.json` | Contract C: every non-path field of the request, the artifact paths, the confidence defaults, and the source provenance |
+| `models/` | each checkpoint exported to `.onnx` + its `meta.json` (Contract B) |
+| `runtime/` | `chachak` + `onnx_infer`, **copied verbatim at export time** so a bundle can't drift from the pipeline that produced it |
+| `infer.py`, `README.md` | entrypoint, and docs generated from the manifest |
+
+Notes:
+
+- `--format engine` also compiles TensorRT engines and prefers them; `models/` still
+  gets the ONNX files copied in (they only load on the GPU model + TensorRT version
+  they were built for), but `pipeline.json` points `infer.py` at the `.engine`
+  paths, so there is no automatic ONNX fallback at run time.
+- Only two runtime files are generated rather than copied — `chachak/__init__.py`
+  (drops `run.py`, whose batch eval needs the Friendy dataloader) and
+  `chachak/_friendy.py` (re-exports the pure helpers from vendored copies and
+  stubs the training-only names). Everything else is byte-identical, enforced by
+  `tests/test_bundle_export.py`.
+- A `score_threshold` under 0.01 is a metric-sweep setting, not a deployment one;
+  the exporter warns if you ship one as the default. Pass `--conf`.
+
 ## Tests
 
 Tests use stub model/detector adapters (a duck-typed `.predict`), so no
@@ -58,7 +103,9 @@ docker compose run --rm -v "$PWD:/work" -w /work/chachak trainer \
 Coverage: `test_boxes.py` (tiling/crop/remap/merge geometry), `test_pipelines.py`
 (all three pipelines + chain + the `run()` loop writing `predictions.pt`/metrics),
 `test_config.py` (loader parsing + validation), `test_registry.py`
-(`build_pipeline` + `Detector` person-class filtering).
+(`build_pipeline` + `Detector` person-class filtering),
+`test_bundle_export.py` (the `pipeline.json` round trip, and that every vendored
+runtime module imports with only stdlib + torch on the path).
 
 ## Adding a pipeline
 
@@ -77,4 +124,6 @@ Coverage: `test_boxes.py` (tiling/crop/remap/merge geometry), `test_pipelines.py
 - `infer.py` — checkpoint loading + threshold-tolerant, chunked adapter inference.
 - `detector.py` — person-detector wrapper.
 - `pipeline.py` — base + the three pipelines + `ChainedPipeline`.
+- `bundle_export/` — export a whole pipeline as a self-contained runnable bundle
+  (`manifest.py` is the `pipeline.json` contract, shared by exporter and bundle).
 - `config.py`, `registry.py`, `run.py` — config loader, builder, CLI.

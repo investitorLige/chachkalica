@@ -84,7 +84,7 @@ def build_pipeline_runtime(config, device):
             person_class_name=config.detector.person_class_name,
             person_class_id=config.detector.person_class_id,
             score_threshold=config.detector.score_threshold,
-            batch_size=config.infer_batch_size,
+            batch_size=config.detector.batch_size,
         )
 
     pipeline = build_pipeline(config, model_adapter, device, detector)
@@ -201,7 +201,7 @@ def run_combined_pipeline(config) -> Dict[str, Any]:
                 person_class_name=config.detector.person_class_name,
                 person_class_id=config.detector.person_class_id,
                 score_threshold=config.detector.score_threshold,
-                batch_size=config.infer_batch_size,
+                batch_size=config.detector.batch_size,
             )
         pipeline = build_pipeline(config, model_adapter, device, detector)
         train_classes = info["train_classes"]

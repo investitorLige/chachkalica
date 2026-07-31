@@ -6,18 +6,59 @@
   #cl-stage img { width: 100%; height: auto; border-radius: 6px; background: #000; }
   #cl-meta { margin: 8px 0; color: #666; }
   #cl-error { color: #ba2121; margin: 8px 0; }
+  #cl-infer { margin: 8px 0; color: #666; }
+  #cl-boxes { margin: 8px 0 0; padding-left: 18px; color: #666; font-size: 12px; }
 </style>
 
 <div id="cl-stage">
   <img src="{{ mjpeg_url }}" alt="Live view of {{ camera.name }}">
   <p id="cl-meta"><strong>{{ camera.name }}</strong>
+    · {% if annotated %}annotated{% else %}raw{% endif %}
     · status: {{ camera.status }}
     {% if camera.last_checked_at %}· last checked {{ camera.last_checked_at }}{% endif %}
   </p>
   {% if camera.last_error %}
     <p id="cl-error">{{ camera.last_error }}</p>
   {% endif %}
+
+  {% if inference and inference.enabled %}
+    <p id="cl-infer">
+      model: <strong>{{ inference.model_label }}</strong> [{{ inference.pipeline }}]
+      · inference: {{ inference.status }}
+      {% if inference.last_latency_ms %}· {{ inference.last_latency_ms }} ms/inference{% endif %}
+      {% if inference.last_inference_at %}· last run {{ inference.last_inference_at }}{% endif %}
+      · boxes refresh at up to {{ inference.target_fps }} fps
+      {% if annotated %}(video itself stays at the camera's preview rate){% endif %}
+    </p>
+    {% if inference.last_error %}
+      <p id="cl-error">{{ inference.last_error }}</p>
+    {% endif %}
+    {% if annotated %}
+      {% if boxes %}
+        {# Snapshot at page load, not live — the stream itself carries the boxes. #}
+        <ul id="cl-boxes">
+          {% for box in boxes %}
+            <li>{{ box.class_name|default:"?" }} — {{ box.confidence|floatformat:2 }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p id="cl-infer">No detections cached yet.</p>
+      {% endif %}
+    {% endif %}
+  {% elif annotated %}
+    <p id="cl-error">
+      Live inference is not enabled for this camera — the annotated stream will
+      stay blank. Enable it on the camera's change page.
+    </p>
+  {% endif %}
 </div>
 
-<p style="margin-top:12px"><a href="../" class="button cancel-link">Back to cameras</a></p>
+<p style="margin-top:12px">
+  <a href="../" class="button cancel-link">Back to cameras</a>
+  {% if toggle_url %}
+    <a href="{{ toggle_url }}" class="button" style="margin-left:6px">
+      {% if annotated %}Show raw stream{% else %}Show annotated stream{% endif %}
+    </a>
+  {% endif %}
+</p>
 {% endblock %}

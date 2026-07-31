@@ -47,13 +47,20 @@ trainer's exact GPU + TensorRT version (not portable to other hardware).</p>
   <div class="form-row">
     <label for="input_size">Input size (static):</label>
     <input type="text" name="input_size" id="input_size" size="16"
-           placeholder="e.g. 640 or 640x640">
-    <p class="help">Optional. Leave blank for the default dynamic profile (variable input
-    size). Enter a single number (square) or <code>HxW</code> to pin a <strong>static</strong>
-    input size (min = opt = max). <strong>Faster R-CNN needs this to build FP16</strong> — its
-    graph only compiles FP16 at a fixed size; with a dynamic profile the FP16 build fails and
-    silently falls back to FP32. RT-DETR and the others build FP16 fine without it. The
-    resulting engine accepts only this exact size (images are resized to it).</p>
+           value="{{ default_input_size }}" placeholder="e.g. 640 or 640x640">
+    {% if default_input_size %}
+      <p class="help">Auto-filled with the size this checkpoint was trained at — still
+      editable. Enter a single number (square) or <code>HxW</code> to pin a different
+      <strong>static</strong> input size (min = opt = max), or clear the field for the
+      default dynamic profile.</p>
+    {% else %}
+      <p class="help">Optional. This architecture trains at variable input size, so there's
+      no trained size to auto-fill. Leave blank for the default dynamic profile, or enter a
+      single number (square) or <code>HxW</code> to pin a <strong>static</strong> input size
+      (min = opt = max). <strong>Faster R-CNN needs this to build FP16</strong> — its graph
+      only compiles FP16 at a fixed size; with a dynamic profile the FP16 build fails and
+      silently falls back to FP32.</p>
+    {% endif %}
   </div>
 
   <div class="submit-row">

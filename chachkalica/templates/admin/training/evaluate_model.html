@@ -82,6 +82,15 @@ only that pipeline's fields are shown.</p>
     exactly). Set this to the value the model was trained with.</p>
   </div>
 
+  <div class="form-row" data-pipelines="{{ detector_pipelines }} {{ chain_pipelines }}">
+    <label for="detector_min_box_size">Person-crop minimum size (px):</label>
+    <input type="number" name="detector_min_box_size" id="detector_min_box_size"
+           min="0" step="1"
+           value="{{ pipeline_defaults.detector_min_box_size|default:'' }}">
+    <p class="help">Grow person crops smaller than this instead of dropping them. Only used
+    by <code>people_detect_first</code>. Blank uses chachak's default.</p>
+  </div>
+
   <div class="form-row" data-pipelines="{{ chain_pipelines }}">
     <label for="chain">Chain:</label>
     <input type="text" name="chain" id="chain" size="60"
@@ -89,6 +98,14 @@ only that pipeline's fields are shown.</p>
            value="{{ pipeline_defaults.chain|default:'' }}">
     <p class="help">Ordered, comma-separated pipeline names to run in sequence and merge
     the results of, e.g. <code>batch_detect, people_detect_first</code>.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ tiling_pipelines }}">
+    <label for="tile_size_px">Tile size (px):</label>
+    <input type="number" name="tile_size_px" id="tile_size_px" min="1" step="1"
+           value="{{ pipeline_defaults.tile_size_px|default:'' }}">
+    <p class="help">Fixed square tile size — overrides the two percentages below. Set to the
+    resolution the model was trained at to preserve its native pixel scale.</p>
   </div>
 
   <div class="form-row" data-pipelines="{{ tiling_pipelines }}">
@@ -114,6 +131,15 @@ only that pipeline's fields are shown.</p>
            value="{{ pipeline_defaults.overlap|default:'' }}">
     <p class="help">Fraction (0–1) by which adjacent tiles overlap, so objects on a tile
     seam aren't cut in half and missed. Leave blank for the default.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ merging_pipelines }}">
+    <label for="merge_nms_iou">Merge NMS IoU:</label>
+    <input type="number" name="merge_nms_iou" id="merge_nms_iou"
+           min="0" max="1" step="0.05"
+           value="{{ pipeline_defaults.merge_nms_iou|default:'' }}">
+    <p class="help">Class-aware NMS IoU used to merge the predictions made across tiles /
+    person crops back into one set of boxes. Blank uses chachak's default.</p>
   </div>
 
   <div class="form-row">

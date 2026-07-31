@@ -1,13 +1,13 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
 
 try:
-    from ...formats import xyxy_prediction_to_friendy, xyxy_to_xywhn
+    from ...formats import clip_xyxy, xyxy_prediction_to_friendy, xyxy_to_xywhn
 except ImportError:
-    from formats import xyxy_prediction_to_friendy, xyxy_to_xywhn
+    from formats import clip_xyxy, xyxy_prediction_to_friendy, xyxy_to_xywhn
 
 
 DEFAULT_RTDETR_WEIGHTS = "PekingU/rtdetr_r50vd"
@@ -48,7 +48,7 @@ class RTDETRAdapter:
         self.model.train()
         images, targets = self._resize_training_inputs(images, targets)
         batch = self._prepare_batch(images)
-        labels = self._prepare_labels(targets, images)
+        labels = self._prepare_labels(targets, batch["pixel_values"].shape[-2:])
         outputs = self.model(**batch, labels=labels)
         losses = (
             dict(outputs.loss_dict)
@@ -63,7 +63,7 @@ class RTDETRAdapter:
         try:
             images, targets = self._resize_training_inputs(images, targets)
             batch = self._prepare_batch(images)
-            labels = self._prepare_labels(targets, images)
+            labels = self._prepare_labels(targets, batch["pixel_values"].shape[-2:])
             outputs = self.model(**batch, labels=labels)
             losses = (
                 dict(outputs.loss_dict)
@@ -77,10 +77,26 @@ class RTDETRAdapter:
     @torch.no_grad()
     def predict(self, images, score_threshold: Optional[float] = None):
         self.model.eval()
-        batch = self._prepare_batch([self._resize_image(image) for image in images])
+        resized_images = []
+        scales = []
+        for image in images:
+            resized_image, scale_y, scale_x = self._resize_image_with_scale(image)
+            resized_images.append(resized_image)
+            scales.append((scale_y, scale_x))
+        batch = self._prepare_batch(resized_images)
         outputs = self.model(**batch)
+        # post_process_object_detection multiplies the normalized boxes by
+        # target_sizes with no pad offset, so hand it the model input's own
+        # HxW to get model-input pixels, then undo the per-axis resize to land
+        # back in original-image pixels. On the normal (stretched, unpadded)
+        # path that is exactly `normalized * original size` — which is what
+        # keeps the exported graph's ``box_coords: "input_normalized"``
+        # contract true — while the resize-disabled path, whose input is padded
+        # up to input_size_multiple, stays correct instead of reading the pad
+        # as image content.
+        input_height, input_width = batch["pixel_values"].shape[-2:]
         target_sizes = torch.tensor(
-            [[image.shape[-2], image.shape[-1]] for image in images],
+            [[input_height, input_width]] * len(images),
             dtype=torch.long,
             device=batch["pixel_values"].device,
         )
@@ -90,12 +106,39 @@ class RTDETRAdapter:
             target_sizes=target_sizes,
             use_focal_loss=getattr(self.model.config, "use_focal_loss", True),
         )
-        return [
-            rtdetr_prediction_to_friendy(prediction, image)
-            for prediction, image in zip(predictions, images)
-        ]
+        results = []
+        for prediction, image, (scale_y, scale_x) in zip(predictions, images, scales):
+            boxes = prediction["boxes"].clone()
+            boxes[:, [0, 2]] /= scale_x
+            boxes[:, [1, 3]] /= scale_y
+            image_height, image_width = image.shape[-2:]
+            # On the resize-disabled path the boxes are still in the *padded*
+            # frame, so anything the model scored in the pad margin (which it
+            # can: see _fixed_canvas_size on RT-DETR not masking padding) would
+            # normalize past 1.0 against this image's own size. Clip to bounds,
+            # matching RFDETRAdapter.predict and the exported graph's
+            # clip_boxes. A no-op on the stretched path, where there is no pad.
+            boxes = clip_xyxy(boxes, image_width=image_width, image_height=image_height)
+            results.append(
+                xyxy_prediction_to_friendy(
+                    boxes,
+                    prediction["scores"],
+                    prediction["labels"],
+                    image_width=image_width,
+                    image_height=image_height,
+                )
+            )
+        return results
 
     def _prepare_batch(self, images):
+        """Normalize and batch already-resized images.
+
+        With resizing enabled every image arrives at exactly the square canvas,
+        so the pad below is a no-op and the model input is all real content. It
+        only does work on the resize-disabled path (``input_max_size=None``),
+        where the batch's own max HxW is rounded up to ``input_size_multiple``
+        because RT-DETR rejects non-multiple-of-32 inputs.
+        """
         device = next(self.model.parameters()).device
         image_mean = torch.tensor(self.image_mean, device=device).view(3, 1, 1)
         image_std = torch.tensor(self.image_std, device=device).view(3, 1, 1)
@@ -131,24 +174,21 @@ class RTDETRAdapter:
         }
 
     def _fixed_canvas_size(self) -> Optional[int]:
-        """Square token-grid side every batch pads/letterboxes to, or ``None``
-        to fall back to the old batch-derived size (only when resizing is
-        disabled via ``input_max_size``).
+        """Square input side every image is resized to, or ``None`` to fall back
+        to the batch-derived padded size (only when resizing is disabled via
+        ``input_max_size``).
 
         HF's RT-DETR never applies ``pixel_mask`` to encoder attention or to
         the two-stage anchor/topk selection (confirmed against
         ``transformers.models.rt_detr.modeling_rt_detr``: the mask is
         downsampled in the backbone and then discarded, and the anchor
         ``valid_mask`` used at the topk step is purely geometric) — padding is
-        scored identically to real content. Deriving the canvas from the
-        actual images in a batch therefore let the real-content-vs-padding
-        token ratio (and even the raw token count relative to
-        ``num_queries``) swing with whatever crops happened to land in the
-        same micro-batch — most visible with the person crops
-        ``people_detect_first`` produces, whose aspect ratios vary far more
-        than tiles/full frames. A canvas fixed to ``input_max_size`` makes the
-        token count, and so the topk selection's real-vs-padding odds, depend
-        only on that setting, never on batch composition.
+        scored identically to real content, and the decoder's reference points
+        can walk straight into it. That is why images are stretched to fill
+        this canvas exactly (see ``_resize_image_with_scale``) rather than
+        aspect-preserved and padded: with no padding, the token count and the
+        topk selection's odds depend only on ``input_max_size``, never on
+        aspect ratio or batch composition.
         """
         if self.input_max_size is None or self.input_max_size <= 0:
             return None
@@ -169,47 +209,59 @@ class RTDETRAdapter:
             resized_targets.append(resized_target)
         return resized_images, resized_targets
 
-    def _resize_image(self, image):
-        resized_image, _, _ = self._resize_image_with_scale(image)
-        return resized_image
-
     def _resize_image_with_scale(self, image):
-        """Aspect-preserving scale to land the longest side on ``input_max_size``.
+        """Stretch the image onto the square ``_fixed_canvas_size`` canvas.
 
-        Always scales — up as well as down. A crop smaller than
-        ``input_max_size`` (e.g. a person_detect_first crop grown only to
-        ``detector_min_box_size``) is bilinearly upscaled to fill more of the
-        fixed canvas ``_fixed_canvas_size`` pads to, instead of being left at
-        native resolution and mostly zero-padded: the backbone's fixed stride
-        (32px of input per token) means a small subject spans more tokens
-        after upscaling, giving the encoder/decoder actual spatial resolution
-        to separate it (and anything on it) from its neighbors, at the cost of
-        interpolation blur rather than any new captured detail.
+        Per-axis scaling, aspect ratio *not* preserved — this is upstream
+        RT-DETR's own preprocessing (a plain ``Resize((640, 640))``), and it is
+        what keeps this adapter's geometry self-consistent: the canvas is
+        entirely real content, so a box normalized over the image is identical
+        to the same box normalized over the model input. Labels
+        (``_prepare_labels``) and ``post_process_object_detection`` both work in
+        image-normalized coordinates, so both are then correct by construction.
+
+        Aspect-preserving letterboxing was the alternative, and it silently
+        broke training: targets normalized over the un-padded image told the
+        decoder to place boxes in the zero-padded margin, where deformable
+        attention samples nothing, and classification confidence collapsed
+        (mAP survived because post-processing scaled the boxes back out).
+        Always scales — up as well as down, so a crop smaller than the canvas
+        (e.g. a people_detect_first crop grown only to
+        ``detector_min_box_size``) is upscaled to span more of the backbone's
+        fixed 32px-per-token stride, buying the encoder/decoder spatial
+        resolution to separate a subject from its neighbours at the cost of
+        interpolation blur.
         """
-        if self.input_max_size is None or self.input_max_size <= 0:
+        canvas_size = self._fixed_canvas_size()
+        if canvas_size is None:
             return image, 1.0, 1.0
 
         height, width = image.shape[-2:]
-        longest_side = max(height, width)
-        if longest_side == self.input_max_size:
+        if height == canvas_size and width == canvas_size:
             return image, 1.0, 1.0
 
-        scale = self.input_max_size / float(longest_side)
-        resized_height = max(1, round(height * scale))
-        resized_width = max(1, round(width * scale))
         resized = F.interpolate(
             image.unsqueeze(0),
-            size=(resized_height, resized_width),
+            size=(canvas_size, canvas_size),
             mode="bilinear",
             align_corners=False,
         ).squeeze(0)
-        return resized, resized_height / float(height), resized_width / float(width)
+        return resized, canvas_size / float(height), canvas_size / float(width)
 
-    def _prepare_labels(self, targets, images):
+    def _prepare_labels(self, targets, input_size):
+        """Normalize resized-pixel target boxes over the *model input* size.
+
+        ``input_size`` is the batched ``pixel_values`` HxW, padding included —
+        not the image's own extent. The model's predictions (and the reference
+        points deformable attention samples at) are normalized over the input
+        tensor, so any padding the targets are not normalized against shifts
+        every box the decoder is asked to produce off the content it has to
+        classify.
+        """
         device = next(self.model.parameters()).device
+        image_height, image_width = int(input_size[0]), int(input_size[1])
         labels = []
-        for target, image in zip(targets, images):
-            image_height, image_width = image.shape[-2:]
+        for target in targets:
             boxes = target["boxes"].to(device).float()
             labels.append(
                 {
@@ -335,19 +387,6 @@ def _ceil_to_multiple(value: int, multiple: int) -> int:
     if multiple <= 1:
         return value
     return ((value + multiple - 1) // multiple) * multiple
-
-
-def rtdetr_prediction_to_friendy(
-    prediction: Dict[str, torch.Tensor], image: torch.Tensor
-) -> torch.Tensor:
-    image_height, image_width = image.shape[-2:]
-    return xyxy_prediction_to_friendy(
-        prediction["boxes"],
-        prediction["scores"],
-        prediction["labels"],
-        image_width=image_width,
-        image_height=image_height,
-    )
 
 
 def _is_rtdetr_v2(weights) -> bool:

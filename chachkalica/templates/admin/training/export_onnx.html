@@ -15,6 +15,12 @@ project root.</p>
   {% endfor %}
 </ul>
 
+{% if trained_size_hint %}
+  <p class="help">Will export at its trained input size: <strong>{{ trained_size_hint }}</strong>.</p>
+{% else %}
+  <p class="help">This architecture trains at variable input size — no fixed input to report.</p>
+{% endif %}
+
 <form action="" method="post">
   {% csrf_token %}
   {% for pk in selected %}

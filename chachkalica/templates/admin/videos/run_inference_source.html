@@ -1,0 +1,42 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Run a model frame-by-frame over <strong>{{ video.name }}</strong> and burn the detected
+boxes onto an annotated copy.</p>
+<p class="help">First, pick where the model comes from — the next page shows the matching
+model list plus the pipeline the frames are run through.</p>
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="configure" value="1">
+
+  <div class="form-row">
+    <label>Model type:</label>
+    {% for value, label in model_source_choices %}
+      <div>
+        <label style="font-weight:normal">
+          <input type="radio" name="model_source" value="{{ value }}"
+                 {% if value == default_model_source %}checked{% endif %}>
+          {{ label }}
+        </label>
+      </div>
+    {% endfor %}
+    <p class="help">
+      <strong>Trained models</strong> are the catalogued <code>.pt</code> checkpoints in the
+      Models tab. <strong>Exported artifacts</strong> are the <code>.onnx</code> /
+      <code>.engine</code> files under the export output directory
+      (<code>{{ exports_root }}</code>) — {{ artifact_count }} found. Change that directory in
+      Training settings if your exports live elsewhere.
+    </p>
+  </div>
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Continue">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+{% endblock %}

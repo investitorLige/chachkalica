@@ -13,9 +13,11 @@ from django.contrib.admin.helpers import ACTION_CHECKBOX_NAME
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.test import TestCase
+from django.urls import reverse
 
 from fleet.models import Annotator, Dataset, FleetSettings
 from training import admin as training_admin
+from training import jobs
 from training import model_specs
 from training import pipelines
 from training.forms import ExperimentModelForm
@@ -24,10 +26,20 @@ from training.models import (
     Experiment,
     ExperimentDataset,
     ExperimentModel,
+    ExportRun,
+    RunResult,
     TrainedModel,
+    TrainingRun,
     TrainingSettings,
 )
-from training.services import combine, config_gen
+from training.services import (
+    combine,
+    config_gen,
+    exports,
+    pipeline_meta,
+    promote,
+    runner,
+)
 
 
 def _make_dataset_on_disk(source_root: Path, name: str, classes: list[str]) -> None:
@@ -203,10 +215,11 @@ class ConfigGenTests(TestCase):
         self.exp.detector_checkpoint = "/ckpts/person.pt"
         self.exp.save()
         data = config_gen.build_experiment_dict(self.exp, "/out/exp1")
-        # expand_ratio rides along with the detector block (default 0.10).
+        # expand_ratio and min_box_size (people_detect_first only) ride along
+        # with the detector block — 0.10 and 224.0 are the field defaults.
         self.assertEqual(
             data["pipeline"]["detector"],
-            {"checkpoint": "/ckpts/person.pt", "expand_ratio": 0.10},
+            {"checkpoint": "/ckpts/person.pt", "expand_ratio": 0.10, "min_box_size": 224.0},
         )
 
     def test_custom_detector_expand_ratio_emitted(self):
@@ -748,3 +761,525 @@ class CombinedEvalTests(TestCase):
         self.assertEqual(list(eval_run.combined_models.all()), [self.model_b])
         self.assertEqual(eval_run.status, EvalRun.QUEUED)
         self.assertTrue(eval_run.request_yaml_path)
+
+
+class PipelineMetadataTests(TestCase):
+    """The frozen pipeline record: one schema, every model, every export format.
+
+    Covers what used to be three hand-copied field lists (``videos.admin``,
+    ``cameras.admin``, the export sidecar writer) and the resolution order that
+    keeps a promoted model describing the run it came from.
+    """
+
+    def _experiment(self, **overrides) -> Experiment:
+        fields = {
+            "name": "exp-pipeline",
+            "pipeline": pipelines.PEOPLE_DETECT_FIRST,
+            "detector_checkpoint": "/models/person.pt",
+            "detector_expand_ratio": 0.15,
+            "detector_min_box_size": 96.0,
+            "merge_nms_iou": 0.55,
+            "eval_score_threshold": 0.3,
+        }
+        fields.update(overrides)
+        return Experiment.objects.create(**fields)
+
+    def _promoted(self, experiment) -> TrainedModel:
+        run = TrainingRun.objects.create(experiment=experiment)
+        result = RunResult.objects.create(
+            run=run, run_name="r0", model_arch=ExperimentModel.YOLOX,
+            best_checkpoint="/runs/r0/best.pt",
+        )
+        return promote.promote_run_result(result)
+
+    def test_normalize_fills_missing_keys_from_a_partial_sidecar(self):
+        # A sidecar written before a field existed omits it; that means "chachak's
+        # default", so it must read back as the default rather than KeyError.
+        blob = pipeline_meta.normalize({"pipeline": pipelines.BATCH_DETECT,
+                                        "tile_size_px": 640})
+        self.assertEqual(blob["pipeline"], pipelines.BATCH_DETECT)
+        self.assertEqual(blob["tile_size_px"], 640)
+        self.assertIsNone(blob["merge_nms_iou"])
+        self.assertEqual(blob["chain"], [])
+        self.assertEqual(blob["detector_checkpoint"], "")
+        self.assertEqual(blob["schema_version"], pipeline_meta.SCHEMA_VERSION)
+
+    def test_normalize_survives_junk(self):
+        self.assertEqual(pipeline_meta.normalize(None), pipeline_meta.raw())
+        self.assertEqual(pipeline_meta.normalize({"chain": "nope"})["chain"], [])
+
+    def test_blank_experiment_pipeline_is_recorded_as_raw(self):
+        blob = pipeline_meta.from_experiment(self._experiment(pipeline=""))
+        self.assertEqual(blob["pipeline"], pipeline_meta.RAW)
+
+    def test_promotion_freezes_the_experiment_pipeline(self):
+        model = self._promoted(self._experiment())
+
+        self.assertEqual(model.pipeline_metadata["pipeline"], pipelines.PEOPLE_DETECT_FIRST)
+        self.assertEqual(model.pipeline_metadata["detector_expand_ratio"], 0.15)
+        self.assertEqual(model.pipeline_metadata["detector_min_box_size"], 96.0)
+        self.assertEqual(model.pipeline_metadata["merge_nms_iou"], 0.55)
+        self.assertEqual(model.pipeline_metadata["score_threshold"], 0.3)
+
+    def test_frozen_record_survives_the_experiment_changing(self):
+        experiment = self._experiment()
+        model = self._promoted(experiment)
+
+        experiment.pipeline = pipelines.BATCH_DETECT
+        experiment.detector_expand_ratio = 0.99
+        experiment.save()
+
+        blob = pipeline_meta.for_trained_model(TrainedModel.objects.get(pk=model.pk))
+        self.assertEqual(blob["pipeline"], pipelines.PEOPLE_DETECT_FIRST)
+        self.assertEqual(blob["detector_expand_ratio"], 0.15)
+
+    def test_frozen_record_survives_the_experiment_being_deleted(self):
+        experiment = self._experiment()
+        model = self._promoted(experiment)
+        experiment.delete()
+
+        blob = pipeline_meta.for_trained_model(TrainedModel.objects.get(pk=model.pk))
+        self.assertEqual(blob["pipeline"], pipelines.PEOPLE_DETECT_FIRST)
+
+    def test_model_with_no_frozen_record_falls_back_to_its_experiment(self):
+        # Covers a row created outside promote_run_result (a fixture, or a promotion
+        # that predates the field and escaped the backfill migration).
+        experiment = self._experiment()
+        model = self._promoted(experiment)
+        TrainedModel.objects.filter(pk=model.pk).update(pipeline_metadata={})
+
+        blob = pipeline_meta.for_trained_model(TrainedModel.objects.get(pk=model.pk))
+        self.assertEqual(blob["pipeline"], pipelines.PEOPLE_DETECT_FIRST)
+
+    def test_model_with_no_experiment_at_all_reads_as_raw(self):
+        model = TrainedModel.objects.create(
+            name="hand-registered", arch=ExperimentModel.YOLOX,
+            checkpoint_path="/models/best.pt",
+        )
+        self.assertEqual(
+            pipeline_meta.for_trained_model(model)["pipeline"], pipeline_meta.RAW)
+
+
+class ExportPipelineMetadataTests(TestCase):
+    """Exported ``.onnx``/``.engine`` artifacts carry the same record as the ``.pt``."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+        ts = TrainingSettings.load()
+        ts.exports_root = str(self.root)
+        ts.save()
+
+        experiment = Experiment.objects.create(
+            name="exp-export", pipeline=pipelines.BATCH_DETECT,
+            tile_size_px=640, overlap=0.2, eval_score_threshold=0.35,
+        )
+        run = TrainingRun.objects.create(experiment=experiment)
+        result = RunResult.objects.create(
+            run=run, run_name="r0", model_arch=ExperimentModel.YOLOX,
+            best_checkpoint="/runs/r0/best.pt",
+        )
+        self.model = promote.promote_run_result(result, name="exp-export")
+
+    def _artifact(self, name: str) -> Path:
+        path = self.root / name
+        path.write_bytes(b"")
+        return path
+
+    def test_sidecar_carries_the_models_frozen_record(self):
+        artifact = self._artifact("exp-export-best.onnx")
+        exports.export_pipeline_sidecar(self.model, artifact)
+
+        blob = exports.read_pipeline_defaults("exp-export-best.onnx")
+        self.assertEqual(blob["pipeline"], pipelines.BATCH_DETECT)
+        self.assertEqual(blob["tile_size_px"], 640)
+        self.assertEqual(blob["overlap"], 0.2)
+        self.assertEqual(blob["score_threshold"], 0.35)
+
+    def test_sidecar_is_written_even_for_a_full_frame_model(self):
+        # "raw" on record is prefillable; a missing sidecar is indistinguishable
+        # from an export made before sidecars existed, and sends the operator back
+        # to filling the form by hand.
+        raw_model = TrainedModel.objects.create(
+            name="raw-model", arch=ExperimentModel.YOLOX,
+            checkpoint_path="/models/best.pt",
+        )
+        artifact = self._artifact("raw-model-best.onnx")
+        exports.export_pipeline_sidecar(raw_model, artifact)
+
+        blob = exports.read_pipeline_defaults("raw-model-best.onnx")
+        self.assertIsNotNone(blob)
+        self.assertEqual(blob["pipeline"], pipeline_meta.RAW)
+
+    def test_sidecarless_artifact_falls_back_to_the_catalogued_model(self):
+        # Everything exported before sidecars were written — matched by the
+        # "<model name>-best" / "-last" stem the export actions produce.
+        self._artifact("exp-export-last.engine")
+
+        blob = exports.read_pipeline_defaults("exp-export-last.engine")
+        self.assertIsNotNone(blob)
+        self.assertEqual(blob["pipeline"], pipelines.BATCH_DETECT)
+        self.assertEqual(blob["tile_size_px"], 640)
+
+    def test_unknown_artifact_has_nothing_on_record(self):
+        self._artifact("something-nobody-catalogued.onnx")
+        self.assertIsNone(
+            exports.read_pipeline_defaults("something-nobody-catalogued.onnx"))
+
+    def test_bundle_request_is_built_from_the_frozen_record(self):
+        artifact = self._artifact("exp-export-best.onnx")
+        self.model.classes = ["helmet", "head"]
+        self.model.save()
+
+        request = exports.build_bundle_request(self.model, artifact)
+        self.assertEqual(request["pipeline"], pipelines.BATCH_DETECT)
+        self.assertEqual(request["tiling"], {"tile_size_px": 640, "overlap": 0.2})
+        self.assertEqual(request["score_threshold"], 0.35)
+
+    def test_bundle_request_still_builds_after_the_experiment_is_gone(self):
+        artifact = self._artifact("exp-export-best.onnx")
+        self.model.classes = ["helmet"]
+        self.model.save()
+        Experiment.objects.all().delete()
+
+        request = exports.build_bundle_request(
+            TrainedModel.objects.get(pk=self.model.pk), artifact)
+        self.assertIsNotNone(request)
+        self.assertEqual(request["pipeline"], pipelines.BATCH_DETECT)
+
+
+class ModelActionPrefillTests(TestCase):
+    """The eval and preview forms prefill from the same frozen record.
+
+    Both used to derive their defaults independently — the eval action by walking
+    back to the experiment, the preview action not at all — so the same model gave
+    three different answers depending on which action you opened.
+    """
+
+    def setUp(self):
+        User.objects.create_superuser("admin", "a@b.co", "pw")
+        self.client.login(username="admin", password="pw")
+        self.url = reverse("admin:training_trainedmodel_changelist")
+
+        self.model = TrainedModel.objects.create(
+            name="cropped", arch=ExperimentModel.YOLOX,
+            checkpoint_path="/runs/best.pt",
+            pipeline_metadata=pipeline_meta.normalize({
+                "pipeline": pipelines.PEOPLE_DETECT_FIRST,
+                "detector_checkpoint": "/models/person.engine",
+                "detector_expand_ratio": 0.18,
+                "detector_min_box_size": 128,
+                "merge_nms_iou": 0.55,
+                "score_threshold": 0.4,
+            }),
+        )
+
+    def _open(self, action):
+        return self.client.post(self.url, {
+            "action": action,
+            ACTION_CHECKBOX_NAME: [str(self.model.pk)],
+        }, follow=True)
+
+    def test_preview_form_defaults_to_the_trained_pipeline(self):
+        resp = self._open("preview_on_dataset")
+        self.assertContains(resp, 'value="people_detect_first" selected')
+        self.assertContains(resp, 'value="/models/person.engine"')
+        self.assertContains(resp, 'value="0.18"')
+        # tile_size_px and detector_min_box_size are new inputs on this form; both
+        # are knobs /predict_image already accepted but the page never offered.
+        self.assertContains(resp, 'name="detector_min_box_size"')
+        self.assertContains(resp, 'value="128"')
+        self.assertContains(resp, 'name="tile_size_px"')
+
+    def test_evaluate_form_defaults_to_the_trained_pipeline(self):
+        resp = self._open("evaluate")
+        self.assertContains(resp, 'value="people_detect_first" selected')
+        self.assertContains(resp, 'value="/models/person.engine"')
+        self.assertContains(resp, 'value="0.18"')
+
+    def test_both_forms_prefill_merge_nms_iou(self):
+        # Recorded all along, but neither form could act on it until
+        # PipelineEvalRun and /predict_image gained the field.
+        for action in ("preview_on_dataset", "evaluate"):
+            with self.subTest(action=action):
+                resp = self._open(action)
+                self.assertContains(resp, 'name="merge_nms_iou"')
+                self.assertContains(resp, 'step="0.05"\n           value="0.55"')
+
+    def test_full_frame_model_leaves_both_forms_on_no_pipeline(self):
+        plain = TrainedModel.objects.create(
+            name="plain", arch=ExperimentModel.YOLOX, checkpoint_path="/runs/p.pt")
+        for action in ("preview_on_dataset", "evaluate"):
+            resp = self.client.post(self.url, {
+                "action": action,
+                ACTION_CHECKBOX_NAME: [str(plain.pk)],
+            }, follow=True)
+            self.assertNotContains(resp, 'value="people_detect_first" selected')
+
+
+class ExportActionsQueueJobsTests(TestCase):
+    """export_onnx/export_trt create ExportRun rows and enqueue jobs instead of
+    blocking the admin request on the trainer service (see training.jobs)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+        ts = TrainingSettings.load()
+        ts.exports_root = str(self.root / "exports")
+        ts.save()
+
+        self.model = TrainedModel.objects.create(
+            name="export-me", arch=ExperimentModel.YOLOX, checkpoint_path="/ckpts/best.pt",
+        )
+
+        self.admin_user = User.objects.create_superuser("admin", "admin@example.com", "pw")
+        self.client.force_login(self.admin_user)
+
+    def _post(self, action, **extra):
+        return self.client.post(
+            "/admin/training/trainedmodel/",
+            {
+                "action": action,
+                ACTION_CHECKBOX_NAME: [str(self.model.pk)],
+                "index": "0",
+                **extra,
+            },
+        )
+
+    def test_export_onnx_queues_one_job_and_creates_a_queued_row(self):
+        with mock.patch.object(training_admin, "_queue") as queue:
+            resp = self._post("export_onnx", apply="1", output_dir=str(self.root / "out"))
+
+        self.assertEqual(resp.status_code, 302)
+        queue.return_value.enqueue.assert_called_once()
+        args, kwargs = queue.return_value.enqueue.call_args
+        self.assertEqual(args[0], jobs.run_export_onnx)
+        self.assertEqual(kwargs.get("job_timeout"), jobs.EXPORT_ONNX_JOB_TIMEOUT)
+
+        export_run = ExportRun.objects.get()
+        self.assertEqual(export_run.model, self.model)
+        self.assertEqual(export_run.kind, ExportRun.ONNX)
+        self.assertEqual(export_run.checkpoint_label, "best")
+        self.assertEqual(export_run.checkpoint_path, "/ckpts/best.pt")
+        self.assertEqual(export_run.status, ExportRun.QUEUED)
+        self.assertTrue(export_run.output_path.endswith("export-me-best.onnx"))
+
+    def test_export_trt_queues_with_precision_and_parsed_input_size(self):
+        with mock.patch.object(training_admin, "_queue") as queue:
+            resp = self._post(
+                "export_trt", apply="1", output_dir=str(self.root / "out"),
+                precision="fp32", input_size="640x480",
+            )
+
+        self.assertEqual(resp.status_code, 302)
+        queue.return_value.enqueue.assert_called_once()
+        args, kwargs = queue.return_value.enqueue.call_args
+        self.assertEqual(args[0], jobs.run_export_trt)
+        self.assertEqual(kwargs.get("job_timeout"), jobs.EXPORT_TRT_JOB_TIMEOUT)
+
+        export_run = ExportRun.objects.get()
+        self.assertEqual(export_run.kind, ExportRun.TRT)
+        self.assertEqual(export_run.precision, "fp32")
+        self.assertEqual(export_run.input_hw, [640, 480])
+        self.assertEqual(export_run.status, ExportRun.QUEUED)
+
+    def test_export_trt_rejects_invalid_input_size_without_queuing(self):
+        from django.contrib.messages import get_messages
+
+        with mock.patch.object(training_admin, "_queue") as queue:
+            resp = self._post(
+                "export_trt", apply="1", output_dir=str(self.root / "out"),
+                input_size="not-a-size",
+            )
+
+        self.assertEqual(resp.status_code, 302)  # returns None -> redirects to the changelist
+        queue.return_value.enqueue.assert_not_called()
+        self.assertEqual(ExportRun.objects.count(), 0)
+        messages = [str(m) for m in get_messages(resp.wsgi_request)]
+        self.assertTrue(any("Invalid input size" in m for m in messages))
+
+    def test_export_onnx_form_shows_the_trained_size_it_will_export_at(self):
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint",
+            return_value={"arch": "yolox", "trained_size": [640, 640]},
+        ):
+            resp = self._post("export_onnx")
+        self.assertContains(resp, "640×640")
+
+    def test_export_trt_form_prefills_input_size_from_the_trained_checkpoint(self):
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint",
+            return_value={"arch": "yolox", "trained_size": [640, 640]},
+        ):
+            resp = self._post("export_trt")
+        self.assertContains(resp, 'value="640x640"')
+
+    def test_export_trt_form_leaves_input_size_blank_for_a_variable_size_arch(self):
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint",
+            return_value={"arch": "fasterrcnn", "trained_size": None},
+        ):
+            resp = self._post("export_trt")
+        self.assertContains(resp, 'value=""')
+
+    def test_export_trt_form_survives_a_trainer_service_hiccup(self):
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint",
+            side_effect=RuntimeError("trainer unreachable"),
+        ):
+            resp = self._post("export_trt")
+        self.assertEqual(resp.status_code, 200)
+
+
+class ExportJobsTests(TestCase):
+    """training.jobs.run_export_onnx/run_export_trt: export -> sidecar -> bundle,
+    with a non-fatal bundle step, run on the django_rq worker."""
+
+    def setUp(self):
+        self.model = TrainedModel.objects.create(
+            name="export-me", arch=ExperimentModel.YOLOX, checkpoint_path="/ckpts/best.pt",
+        )
+
+    def _export_run(self, **overrides) -> ExportRun:
+        fields = dict(
+            model=self.model, kind=ExportRun.ONNX, checkpoint_label="best",
+            checkpoint_path="/ckpts/best.pt", output_path="/out/export-me-best.onnx",
+        )
+        fields.update(overrides)
+        return ExportRun.objects.create(**fields)
+
+    def test_run_export_onnx_success_populates_result_and_bundle(self):
+        run = self._export_run()
+        onnx_result = {"onnx_path": run.output_path, "meta_path": run.output_path + ".meta.json"}
+        with mock.patch(
+            "training.jobs.runner.export_onnx", return_value=onnx_result,
+        ) as export_onnx, mock.patch(
+            "training.jobs.exports.export_pipeline_sidecar",
+        ) as sidecar, mock.patch(
+            "training.jobs.exports.build_bundle_request", return_value={"pipeline": "raw"},
+        ), mock.patch(
+            "training.jobs.runner.export_bundle", return_value={"bundle_dir": "/out/bundle"},
+        ) as export_bundle:
+            result = jobs.run_export_onnx(run.pk)
+
+        export_onnx.assert_called_once_with(run.checkpoint_path, run.output_path)
+        sidecar.assert_called_once_with(self.model, Path(run.output_path))
+        export_bundle.assert_called_once()
+        self.assertEqual(result, onnx_result)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, ExportRun.OK)
+        self.assertEqual(run.result, onnx_result)
+        self.assertEqual(run.bundle_dir, "/out/bundle")
+        self.assertEqual(run.bundle_error, "")
+        self.assertIsNotNone(run.started_at)
+        self.assertIsNotNone(run.finished_at)
+
+    def test_run_export_onnx_primary_failure_marks_error_and_reraises(self):
+        run = self._export_run()
+        with mock.patch(
+            "training.jobs.runner.export_onnx", side_effect=RuntimeError("trainer down"),
+        ):
+            with self.assertRaises(RuntimeError):
+                jobs.run_export_onnx(run.pk)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, ExportRun.ERROR)
+        self.assertIn("trainer down", run.last_error)
+        self.assertIsNone(run.result)
+
+    def test_run_export_onnx_bundle_failure_is_non_fatal(self):
+        run = self._export_run()
+        with mock.patch(
+            "training.jobs.runner.export_onnx", return_value={"onnx_path": run.output_path},
+        ), mock.patch(
+            "training.jobs.exports.export_pipeline_sidecar",
+        ), mock.patch(
+            "training.jobs.exports.build_bundle_request", return_value={"pipeline": "raw"},
+        ), mock.patch(
+            "training.jobs.runner.export_bundle", side_effect=RuntimeError("bundle broke"),
+        ):
+            jobs.run_export_onnx(run.pk)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, ExportRun.OK)
+        self.assertEqual(run.bundle_dir, "")
+        self.assertIn("bundle broke", run.bundle_error)
+
+    def test_run_export_onnx_skips_bundle_when_theres_nothing_to_bundle(self):
+        run = self._export_run()
+        with mock.patch(
+            "training.jobs.runner.export_onnx", return_value={"onnx_path": run.output_path},
+        ), mock.patch(
+            "training.jobs.exports.export_pipeline_sidecar",
+        ), mock.patch(
+            "training.jobs.exports.build_bundle_request", return_value=None,
+        ), mock.patch("training.jobs.runner.export_bundle") as export_bundle:
+            jobs.run_export_onnx(run.pk)
+
+        export_bundle.assert_not_called()
+        run.refresh_from_db()
+        self.assertEqual(run.status, ExportRun.OK)
+        self.assertEqual(run.bundle_dir, "")
+
+    def test_run_export_trt_passes_precision_and_input_hw_through(self):
+        run = self._export_run(
+            kind=ExportRun.TRT, output_path="/out/export-me-best.engine",
+            precision="fp16", input_hw=[640, 640],
+        )
+        with mock.patch(
+            "training.jobs.runner.export_trt",
+            return_value={"engine_path": run.output_path, "precision": "fp16"},
+        ) as export_trt, mock.patch(
+            "training.jobs.exports.export_pipeline_sidecar",
+        ), mock.patch(
+            "training.jobs.exports.build_bundle_request", return_value=None,
+        ):
+            jobs.run_export_trt(run.pk)
+
+        export_trt.assert_called_once_with(
+            run.checkpoint_path, run.output_path, precision="fp16", input_hw=(640, 640))
+        run.refresh_from_db()
+        self.assertEqual(run.status, ExportRun.OK)
+
+    def test_run_export_trt_dynamic_profile_passes_none_input_hw(self):
+        run = self._export_run(kind=ExportRun.TRT, output_path="/out/export-me-best.engine",
+                                precision="fp32", input_hw=None)
+        with mock.patch(
+            "training.jobs.runner.export_trt",
+            return_value={"engine_path": run.output_path, "precision": "fp32"},
+        ) as export_trt, mock.patch(
+            "training.jobs.exports.export_pipeline_sidecar",
+        ), mock.patch(
+            "training.jobs.exports.build_bundle_request", return_value=None,
+        ):
+            jobs.run_export_trt(run.pk)
+
+        export_trt.assert_called_once_with(
+            run.checkpoint_path, run.output_path, precision="fp32", input_hw=None)
+
+
+class RunnerInspectCheckpointTests(TestCase):
+    """training.services.runner.inspect_checkpoint against a stubbed trainer response."""
+
+    def test_returns_the_trainer_services_json_body(self):
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"arch": "rfdetr", "trained_size": [560, 560]}
+        with mock.patch("training.services.runner.requests.post", return_value=response) as post:
+            info = runner.inspect_checkpoint("/ckpts/best.pt")
+
+        self.assertEqual(info, {"arch": "rfdetr", "trained_size": [560, 560]})
+        args, kwargs = post.call_args
+        self.assertTrue(args[0].endswith("/checkpoint_info"))
+        self.assertEqual(kwargs["json"], {"checkpoint_path": "/ckpts/best.pt"})
+
+    def test_raises_runtimeerror_with_the_trainers_detail_on_http_error(self):
+        response = mock.Mock(status_code=400, text="bad request")
+        response.json.return_value = {"detail": "checkpoint not found: /ckpts/missing.pt"}
+        with mock.patch("training.services.runner.requests.post", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "checkpoint not found"):
+                runner.inspect_checkpoint("/ckpts/missing.pt")

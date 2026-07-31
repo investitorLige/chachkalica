@@ -13,10 +13,11 @@ So the export wrapper bakes exactly the sigmoid + top-k selection and emits the
 boxes in normalized ``[0,1]`` xyxy (``box_coords: "input_normalized"``). No NMS
 (RT-DETR is NMS-free), no threshold in the graph (the service applies it, mirroring
 post_process filtering after top-k). The service replicates the adapter's input
-pipeline — longest-side resize to ``input_max_size``, ImageNet normalize, pad to a
-multiple of 32 — which is mandatory: RT-DETR is *not* padding-invariant and rejects
-non-multiple-of-32 inputs (verified). ``pixel_mask`` is omitted: it provably does
-not change the output.
+pipeline — stretch-resize to a square ``input_max_size`` canvas (aspect ratio not
+preserved, matching upstream RT-DETR and ``RTDETRAdapter._resize_image_with_scale``)
+plus ImageNet normalize. No padding: the square side is already a multiple of 32,
+which RT-DETR requires, and a padded input would put the decoder's reference points
+on dead pixels. ``pixel_mask`` is omitted: it provably does not change the output.
 
 **float32 position embedding (export only).** HF's
 ``build_2d_sinusoidal_position_embedding`` does its sin/cos frequency arithmetic
@@ -101,8 +102,18 @@ def export_rtdetr(adapter, *, num_classes, params, class_map, onnx_path: str | P
     score_threshold = float(adapter.score_threshold)
     mean = [float(v) for v in adapter.image_mean]
     std = [float(v) for v in adapter.image_std]
-    max_size = int(adapter.input_max_size)
-    multiple = int(adapter.input_size_multiple)
+    # The adapter stretches every image onto this square canvas, so the service
+    # resizes the same way ("square") and the graph never sees padding. With
+    # resizing disabled the adapter has no fixed canvas at all (it pads to the
+    # batch max), which a static ONNX graph cannot express.
+    canvas_size = adapter._fixed_canvas_size()
+    if canvas_size is None:
+        raise ValueError(
+            "ONNX export needs a fixed input size, but this pipeline disables "
+            "resizing (input_max_size is unset or <= 0). Set input_max_size to "
+            "the square canvas the exported model should run at."
+        )
+    canvas_size = int(canvas_size)
 
     class RTDetrExport(nn.Module):
         def __init__(self, model: nn.Module) -> None:
@@ -134,9 +145,9 @@ def export_rtdetr(adapter, *, num_classes, params, class_map, onnx_path: str | P
         num_classes=num_classes,
         class_map=class_map,
         score_threshold=score_threshold,
-        resize_mode="longest_side",
-        max_size=max_size,
-        multiple=multiple,
+        resize_mode="square",
+        size=canvas_size,
+        multiple=0,
         pad_value=0.0,
         input_scale="unit",
         normalize={"mean": mean, "std": std},

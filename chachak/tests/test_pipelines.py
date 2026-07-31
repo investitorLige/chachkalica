@@ -17,6 +17,7 @@ if str(_CHACHAK_DIR) not in sys.path:
 
 import torch  # noqa: E402
 
+import boxes  # noqa: E402
 from config import DetectorConfig, PipelineConfig, TilingConfig  # noqa: E402
 from infer import infer_in_chunks  # noqa: E402
 from pipeline import (  # noqa: E402
@@ -161,7 +162,7 @@ class CropRegionsMinBoxSizeTest(unittest.TestCase):
         self.assertGreaterEqual(h, 224)
         self.assertEqual(tuple(crop.shape), (3, h, w))
 
-    def test_frame_smaller_than_floor_is_zero_padded(self):
+    def test_frame_smaller_than_floor_is_upscaled_not_padded(self):
         class TinyPersonDetector:
             def predict(self, images):
                 return [torch.tensor([[0.5, 0.5, 10 / 100, 10 / 100, 0.99, 1.0]]) for _ in images]
@@ -177,12 +178,35 @@ class CropRegionsMinBoxSizeTest(unittest.TestCase):
         regions = pipeline.crop_regions([image])
 
         self.assertEqual(len(regions[0]), 1)
-        crop, _, (w, h) = regions[0][0]
-        self.assertEqual((w, h), (224, 224))
-        # Real frame content fills the top-left; the rest is zero-padding.
-        self.assertTrue(torch.equal(crop[:, :100, :100], image))
-        self.assertEqual(float(crop[:, 100:, :].sum()), 0.0)
-        self.assertEqual(float(crop[:, :, 100:].sum()), 0.0)
+        crop, offset, (w, h) = regions[0][0]
+        # The whole 100x100 frame is the region, upscaled to clear the floor
+        # with real (interpolated) pixels rather than padded with blanks.
+        self.assertEqual(tuple(crop.shape), (3, 224, 224))
+        self.assertEqual(float(crop.min()), 1.0)
+        # ...but the reported geometry stays in frame pixels, or remapping this
+        # crop's boxes back onto the frame would inflate them 2.24x.
+        self.assertEqual((offset, w, h), ((0, 0), 100, 100))
+
+    def test_upscaled_crop_geometry_round_trips_back_to_the_frame(self):
+        class TinyPersonDetector:
+            def predict(self, images):
+                return [torch.tensor([[0.5, 0.5, 10 / 100, 10 / 100, 0.99, 1.0]]) for _ in images]
+
+        config = make_config(
+            "people_detect_first",
+            detector=DetectorConfig(score_threshold=0.0, expand_ratio=0.0, nms_iou=0.5, min_box_size=224.0),
+        )
+        pipeline = PeopleDetectFirstPipeline(
+            model_adapter=None, device=DEVICE, config=config, detector=TinyPersonDetector()
+        )
+        regions = pipeline.crop_regions([torch.ones(3, 100, 100)])
+        _, offset, (w, h) = regions[0][0]
+
+        # A box on the middle of the crop must land on the middle of the frame,
+        # at the same normalized size — the upscale must not leak into geometry.
+        preds = torch.tensor([[0.5, 0.5, 0.2, 0.2, 0.9, 0.0]])
+        remapped = boxes.remap_local_preds_to_frame(preds, offset, w, h, 100, 100)
+        self.assertTrue(torch.allclose(remapped[0, :4], preds[0, :4], atol=1e-6))
 
 
 class ProcessBatchTest(unittest.TestCase):

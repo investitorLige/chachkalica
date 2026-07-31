@@ -1,0 +1,18 @@
+# Runtime dependencies for this bundle. None of the training stack is needed:
+# the models are exported graphs, run through the vendored onnx_infer/trt_infer.
+#
+# torch is used for tensor geometry (tiling, cropping, box remapping, NMS) and by
+# the model adapters at their boundary. The CPU build is enough for ONNX on CPU:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch
+numpy
+pillow
+pyyaml
+
+# CPU inference. For GPU, install onnxruntime-gpu instead (matched to your CUDA
+# version) and pass `--device cuda`.
+onnxruntime
+
+# Only needed to run this bundle's .engine artifacts, if it has any. The version
+# must match the one the engines were built with — see pipeline.json provenance.
+# tensorrt

@@ -93,6 +93,21 @@ class PipelineEvalRun(models.Model):
                   "exactly). Match the value the model was trained with. Only used by "
                   "people_detect_first / batch_people.",
     )
+    detector_min_box_size = models.FloatField(
+        null=True, blank=True,
+        verbose_name="Person-crop minimum size (px)",
+        help_text="Grow person crops smaller than this many pixels rather than "
+                  "dropping them. Blank = chachak's default. Only used by "
+                  "people_detect_first. Match what the model was trained with.",
+    )
+    tile_size_px = models.PositiveIntegerField(
+        null=True, blank=True,
+        verbose_name="Tile size (pixels)",
+        help_text="Fixed square tile size; overrides the tile width/height "
+                  "percentages. Blank = percentage tiling. Set this to the "
+                  "resolution the model was trained at to preserve its native "
+                  "pixel scale.",
+    )
     tile_width_pct = models.FloatField(
         null=True, blank=True,
         help_text="Tile width as a percent (0–100] of each image's width.",
@@ -102,6 +117,12 @@ class PipelineEvalRun(models.Model):
         help_text="Tile height as a percent (0–100] of each image's height.",
     )
     overlap = models.FloatField(null=True, blank=True)
+    merge_nms_iou = models.FloatField(
+        verbose_name="merge_nms_iou_threshold",
+        null=True, blank=True,
+        help_text="Class-aware NMS IoU used to merge predictions across tiles/crops. "
+                  "Blank = chachak's default.",
+    )
     chain = models.JSONField(
         default=list, blank=True,
         help_text="Ordered pipeline names for the 'chain' pipeline.",

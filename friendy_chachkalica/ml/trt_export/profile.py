@@ -5,10 +5,10 @@ axes.
 
 Per ``resize_mode``:
 
-- ``square``       (RF-DETR): one static shape, ``size × size`` — the ONNX graph
-  has fixed H/W, so min == opt == max.
-- ``longest_side`` (RT-DETR): bounded above by ``max_size`` (the service never
-  feeds a larger input); min side is one ``multiple``.
+- ``square``       (RF-DETR, RT-DETR): one static shape, ``size × size`` — the
+  service stretches every input onto that canvas, so min == opt == max.
+- ``longest_side``: bounded above by ``max_size`` (the service never feeds a
+  larger input); min side is one ``multiple``. No arch currently exports this.
 - ``none``         (RetinaNet, YOLOX): the service passes the image through
   unchanged (only padded up to ``multiple``), so the input size is genuinely
   open-ended. We pick a sensible default range and let the caller override it —

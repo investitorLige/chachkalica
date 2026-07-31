@@ -108,17 +108,15 @@ def augmentation_entry(exp_dataset: ExperimentDataset) -> dict:
 
 # rtdetr's encoder runs topk(num_queries) over its feature-pyramid tokens, so
 # num_queries must not exceed that token count or the forward pass crashes
-# ("selected index k out of range"). The adapter now upscales every crop and
-# pads it to a square canvas fixed by input_max_size (not one derived from the
-# batch's own crops — see RTDETRAdapter._fixed_canvas_size), so the crash floor
-# is now a function of input_max_size, NOT the raw crop size: model_entry below
+# ("selected index k out of range"). The adapter stretches every crop onto a
+# square canvas fixed by input_max_size (see
+# RTDETRAdapter._resize_image_with_scale), so the crash floor is a function of
+# input_max_size, NOT the raw crop size: model_entry below
 # enforces input_max_size >= input_size_multiple * ceil(sqrt(num_queries)), which
 # makes the coarsest (stride input_size_multiple) level alone clear num_queries
 # with margin. 25 is kept low anyway — HF's own default (300) assumes near-full-
 # frame subjects with many objects, whereas 25 comfortably covers the handful of
-# PPE items on one person crop, and a smaller query budget wastes fewer queries
-# on the fixed canvas's padding (HF never masks padding out of topk — see
-# _fixed_canvas_size). This replaces the old coupling to detector_min_box_size,
+# PPE items on one person crop. This replaces the old coupling to detector_min_box_size,
 # which floored the *crop* size back when crops were fed at native resolution.
 # Only injected for people_detect_first (see model_entry) — other pipelines
 # don't hit this mismatch (batch_people's tiles are already sized generously;
@@ -190,8 +188,9 @@ def pipeline_block(experiment: Experiment) -> dict | None:
     """The ``pipeline`` block for the experiment YAML, or ``None`` when unset.
 
     Emits only non-blank knobs so chachak's own defaults apply where the operator
-    left a field empty. Raises ``ValueError`` when a detector-requiring pipeline
-    has no detector checkpoint (mirrors ``build_pipeline_request``).
+    left a field empty — except the detector checkpoint on a detector-requiring
+    pipeline, which falls back to ``DEFAULT_PERSON_DETECTOR_CHECKPOINT`` instead
+    of being left unset (mirrors ``build_pipeline_request``).
 
     ``detector.min_box_size`` (from ``experiment.detector_min_box_size``) is only
     emitted for people_detect_first, not batch_people — see
@@ -212,11 +211,13 @@ def pipeline_block(experiment: Experiment) -> dict | None:
         name == pipelines.CHAIN
         and any(c in pipelines.DETECTOR_PIPELINES for c in (experiment.chain or []))
     )
-    # Existing experiments may have saved an explicit blank before the bundled
-    # person engine became the default. Use it for detector-required pipelines,
-    # while leaving ordinary tiling pipelines detector-free.
-    checkpoint = experiment.detector_checkpoint or (
-        DEFAULT_PERSON_DETECTOR_CHECKPOINT if needs_detector else ""
+    # Gated on needs_detector, not just "is the field non-blank": the field
+    # carries a non-blank default (the bundled person engine) so it's never
+    # actually empty, which would otherwise leak a detector block into
+    # ordinary tiling/raw pipelines that don't use one.
+    checkpoint = (
+        (experiment.detector_checkpoint or DEFAULT_PERSON_DETECTOR_CHECKPOINT)
+        if needs_detector else ""
     )
     if checkpoint:
         # Experiment paths are relative to the Django project root, while the
@@ -429,11 +430,18 @@ def build_pipeline_request(pe, output_dir: Path | str, ts: TrainingSettings | No
     ``classes`` is the *eval dataset's* class space (the target labels); the
     model's own train-class space is read from the checkpoint by chachak. Only
     non-default detector/tiling knobs are emitted so chachak's own defaults apply
-    when the operator left a field blank. Raises ``ValueError`` when a
-    detector-requiring pipeline has no detector checkpoint (mirrors
-    ``chachak/config.py``'s own validation, but caught before we enqueue). When
-    ``pe`` combines 2+ models, ``extra_checkpoints`` carries the others' paths
-    and chachak merges every model's predictions into one result.
+    when the operator left a field blank — except the detector checkpoint on a
+    detector-requiring pipeline, which falls back to
+    ``DEFAULT_PERSON_DETECTOR_CHECKPOINT`` rather than being left unset (mirrors
+    ``pipeline_block``). When ``pe`` combines 2+ models, ``extra_checkpoints``
+    carries the others' paths and chachak merges every model's predictions into
+    one result.
+
+    Carries the same pipeline vocabulary as the training YAML
+    (:func:`pipeline_block`) and the single-image predict payload
+    (:func:`build_predict_request`), so a model can be evaluated through exactly
+    the geometry it was trained with — see
+    ``chachkalica/docs/pipeline-metadata.md``.
     """
     ts = ts or TrainingSettings.load()
     tm = pe.trained_model
@@ -467,16 +475,26 @@ def build_pipeline_request(pe, output_dir: Path | str, ts: TrainingSettings | No
         pe.pipeline == PipelineEvalRun.CHAIN
         and any(c in PipelineEvalRun.DETECTOR_PIPELINES for c in (pe.chain or []))
     )
-    if pe.detector_checkpoint:
-        detector: dict = {"checkpoint": pe.detector_checkpoint}
+    # Mirrors pipeline_block's fallback and its needs_detector gating — see
+    # that function for why checking "is the field non-blank" alone isn't safe.
+    checkpoint = (
+        (pe.detector_checkpoint or DEFAULT_PERSON_DETECTOR_CHECKPOINT)
+        if needs_detector else ""
+    )
+    if checkpoint:
+        detector: dict = {"checkpoint": str(_resolve(checkpoint))}
         if pe.detector_expand_ratio is not None:
             detector["expand_ratio"] = pe.detector_expand_ratio
+        # Scoped to people_detect_first for the same reason as pipeline_block —
+        # batch_people's crops come from fixed-size tiles and can't shrink to the
+        # degenerate sizes this floor exists to catch.
+        if pe.pipeline == PipelineEvalRun.PEOPLE_DETECT_FIRST and pe.detector_min_box_size:
+            detector["min_box_size"] = pe.detector_min_box_size
         data["detector"] = detector
-    elif needs_detector:
-        raise ValueError(
-            f"pipeline '{pe.pipeline}' requires a detector checkpoint.")
 
     tiling = {}
+    if pe.tile_size_px:
+        tiling["tile_size_px"] = pe.tile_size_px
     if pe.tile_width_pct:
         tiling["tile_width_pct"] = pe.tile_width_pct
     if pe.tile_height_pct:
@@ -485,6 +503,8 @@ def build_pipeline_request(pe, output_dir: Path | str, ts: TrainingSettings | No
         tiling["overlap"] = pe.overlap
     if tiling:
         data["tiling"] = tiling
+    if pe.merge_nms_iou is not None:
+        data["merge_nms_iou"] = pe.merge_nms_iou
 
     extra_checkpoints = combined_checkpoints(pe)
     if extra_checkpoints:
@@ -563,38 +583,52 @@ def build_promote_payload(eval_obj, kind: str, score_threshold: float) -> dict:
     return payload
 
 
-def build_preview_request(
-    tm,
+def build_predict_request(
+    model_checkpoint: str,
     pipeline: str,
     image_path: str,
     *,
     detector_checkpoint: str = "",
+    detector_expand_ratio: float | None = None,
+    detector_min_box_size: float | None = None,
+    tile_size_px: int | None = None,
     tile_width_pct: float | None = None,
     tile_height_pct: float | None = None,
     overlap: float | None = None,
+    merge_nms_iou: float | None = None,
     chain: list[str] | None = None,
     score_threshold: float = 0.05,
     ts: TrainingSettings | None = None,
 ) -> dict:
-    """Assemble the ``POST /predict_image`` payload for one preview image.
+    """Assemble the ``POST /predict_image`` payload for one image.
 
-    Slim sibling of :func:`build_pipeline_request`: no labels/output_dir (preview
-    reads GT locally and persists nothing) and no dataset ``classes`` (prediction
+    Slim sibling of :func:`build_pipeline_request`: no labels/output_dir (the
+    single-image path persists nothing) and no dataset ``classes`` (prediction
     class names come from the checkpoint). ``pipeline`` may be ``"raw"`` (run the
-    model directly) or any chachak pipeline name.
+    model directly) or any chachak pipeline name; ``model_checkpoint`` may be a
+    ``.pt`` or an exported ``.onnx`` / ``.engine`` (chachak's
+    ``load_checkpoint_adapter`` dispatches on the suffix).
+
+    Only non-default detector/tiling knobs are emitted, so chachak's own defaults
+    apply wherever the caller passed nothing — same contract as
+    :func:`build_pipeline_request`.
     """
     ts = ts or TrainingSettings.load()
-    if not tm.checkpoint_path:
-        raise ValueError(f"{tm.name}: no checkpoint path to preview.")
+    model_checkpoint = (model_checkpoint or "").strip()
+    if not model_checkpoint:
+        raise ValueError("No model checkpoint to run.")
     from eval_pipelines.models import PipelineEvalRun
 
     valid_pipelines = {"raw", *(value for value, _label in PipelineEvalRun.PIPELINE_CHOICES)}
     if pipeline not in valid_pipelines:
-        raise ValueError(f"Unknown preview pipeline: {pipeline!r}.")
+        raise ValueError(f"Unknown pipeline: {pipeline!r}.")
 
     chain = list(chain or [])
     if pipeline == PipelineEvalRun.CHAIN and not chain:
         raise ValueError("pipeline 'chain' requires at least one chain member.")
+    unknown_chain = [c for c in chain if c not in valid_pipelines or c == "raw"]
+    if unknown_chain:
+        raise ValueError(f"Unknown chain member(s): {', '.join(unknown_chain)}.")
 
     needs_detector = pipeline in PipelineEvalRun.DETECTOR_PIPELINES or (
         pipeline == PipelineEvalRun.CHAIN
@@ -604,23 +638,51 @@ def build_preview_request(
         raise ValueError(f"pipeline '{pipeline}' requires a detector checkpoint.")
 
     payload = {
-        "model_checkpoint": tm.checkpoint_path,
+        "model_checkpoint": model_checkpoint,
         "image_path": image_path,
         "pipeline": pipeline,
         "score_threshold": score_threshold,
         "device": ts.default_device,
     }
-    if detector_checkpoint:
+    # Gated on needs_detector (not "is detector_checkpoint non-blank"): a caller
+    # may pass a non-blank checkpoint for a pipeline that doesn't use one (e.g.
+    # a CameraInference row whose field carries its non-blank default while set
+    # to "raw" or "batch_detect") — needs_detector already raised above if a
+    # detector-requiring pipeline got here without one, so this is always safe.
+    if needs_detector:
         payload["detector_checkpoint"] = detector_checkpoint
+        if detector_expand_ratio is not None:
+            payload["detector_expand_ratio"] = detector_expand_ratio
+        if detector_min_box_size:
+            payload["detector_min_box_size"] = detector_min_box_size
+    if tile_size_px:
+        payload["tile_size_px"] = tile_size_px
     if tile_width_pct:
         payload["tile_width_pct"] = tile_width_pct
     if tile_height_pct:
         payload["tile_height_pct"] = tile_height_pct
     if overlap is not None:
         payload["overlap"] = overlap
+    # Only when set: the trainer service forwards this into chachak's
+    # `merge_nms_iou`, which is parsed with an unconditional float() and would
+    # crash on an explicit null rather than falling through to the default.
+    if merge_nms_iou is not None:
+        payload["merge_nms_iou"] = merge_nms_iou
     if chain:
         payload["chain"] = chain
     return payload
+
+
+def build_preview_request(
+    tm,
+    pipeline: str,
+    image_path: str,
+    **kwargs,
+) -> dict:
+    """:func:`build_predict_request` for a :class:`TrainedModel`'s checkpoint."""
+    if not tm.checkpoint_path:
+        raise ValueError(f"{tm.name}: no checkpoint path to preview.")
+    return build_predict_request(tm.checkpoint_path, pipeline, image_path, **kwargs)
 
 
 def write_config(experiment: Experiment, run) -> tuple[Path, str]:

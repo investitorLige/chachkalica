@@ -22,6 +22,7 @@ Endpoints:
     POST /pipeline            -> {pipeline_id, status, pid} (body: {pipeline_id, request_path})
     GET  /pipelines/{id}      -> {pipeline_id, status, returncode, started_at, finished_at, log_tail}
     POST /predict_image       -> {boxes, classes}          (synchronous 1-image inference; warm model)
+    POST /checkpoint_info     -> {arch, trained_size}      (synchronous, cheap: no export)
     POST /export_onnx         -> {onnx_path, meta_path}    (synchronous ONNX export of one checkpoint)
     POST /promote_labels      -> {labels_written, ...}     (synchronous: write a run's predictions as source labels)
 
@@ -160,6 +161,12 @@ class PipelineRequest(BaseModel):
     request_path: str
 
 
+class CheckpointInfoRequest(BaseModel):
+    """Inspect a ``.pt`` checkpoint without exporting anything."""
+
+    checkpoint_path: str
+
+
 class ExportOnnxRequest(BaseModel):
     """Export one ``.pt`` checkpoint to ``<onnx_path>`` + ``<onnx_path>.meta.json``."""
 
@@ -181,6 +188,27 @@ class ExportTrtRequest(BaseModel):
     # profile min==opt==max==(H,W). Required to get FP16 on Faster R-CNN, whose graph
     # only compiles FP16 at a static size (a dynamic profile falls back to FP32).
     input_hw: Optional[List[int]] = None
+
+
+class ExportBundleRequest(BaseModel):
+    """Bundle an already-exported model (+ detector, if the pipeline needs one)
+    as a self-contained, runnable ``chachak.bundle_export`` pipeline.
+
+    ``request`` is a chachak pipeline request in dict form — same shape as a
+    request YAML (``pipeline``, ``model_checkpoint``, ``classes``, ``tiling``,
+    ``detector``, ``chain``, ``merge_nms_iou``, ...) — with ``model_checkpoint``
+    already pointing at the artifact this call bundles, not the original ``.pt``.
+    ``detector.checkpoint``, if present, may still be a raw ``.pt``: this export
+    it fresh, since the admin export actions never export the detector on their
+    own.
+    """
+
+    request: dict
+    output_dir: str
+    fmt: str = "onnx"
+    conf: Optional[float] = None
+    precision: str = "auto"
+    overwrite: bool = True
 
 
 class PromoteLabelsRequest(BaseModel):
@@ -212,9 +240,17 @@ class PredictImageRequest(BaseModel):
     image_path: str
     pipeline: str = "raw"  # "raw" (adapter only) or a chachak PIPELINE_NAMES value
     detector_checkpoint: Optional[str] = None
+    detector_expand_ratio: Optional[float] = None
+    detector_min_box_size: Optional[float] = None
+    tile_size_px: Optional[int] = None
     tile_width_pct: Optional[float] = None
     tile_height_pct: Optional[float] = None
     overlap: Optional[float] = None
+    # Class-aware NMS IoU used to merge predictions across tiles/crops. None leaves
+    # chachak's own default (PipelineConfig.merge_nms_iou) in place — the field is
+    # parsed with an unconditional float(), so it must be omitted rather than sent
+    # as null.
+    merge_nms_iou: Optional[float] = None
     chain: Optional[list[str]] = None
     score_threshold: Optional[float] = 0.05
     device: str = "auto"
@@ -492,10 +528,14 @@ def _predict_key(req: "PredictImageRequest") -> tuple:
     return (
         req.model_checkpoint,
         req.detector_checkpoint or "",
+        req.detector_expand_ratio,
+        req.detector_min_box_size,
         req.pipeline,
+        req.tile_size_px,
         req.tile_width_pct,
         req.tile_height_pct,
         req.overlap,
+        req.merge_nms_iou,
         tuple(req.chain or []),
         req.score_threshold,
         req.device,
@@ -527,8 +567,15 @@ def _build_predict_runtime(req: "PredictImageRequest", device) -> dict:
     if req.score_threshold is not None:
         raw["score_threshold"] = req.score_threshold
     if req.detector_checkpoint:
-        raw["detector"] = {"checkpoint": req.detector_checkpoint}
+        detector: dict = {"checkpoint": req.detector_checkpoint}
+        if req.detector_expand_ratio is not None:
+            detector["expand_ratio"] = req.detector_expand_ratio
+        if req.detector_min_box_size is not None:
+            detector["min_box_size"] = req.detector_min_box_size
+        raw["detector"] = detector
     tiling: dict = {}
+    if req.tile_size_px:
+        tiling["tile_size_px"] = req.tile_size_px
     if req.tile_width_pct:
         tiling["tile_width_pct"] = req.tile_width_pct
     if req.tile_height_pct:
@@ -537,6 +584,8 @@ def _build_predict_runtime(req: "PredictImageRequest", device) -> dict:
         tiling["overlap"] = req.overlap
     if tiling:
         raw["tiling"] = tiling
+    if req.merge_nms_iou is not None:
+        raw["merge_nms_iou"] = req.merge_nms_iou
     if req.chain:
         raw["chain"] = list(req.chain)
 
@@ -612,6 +661,29 @@ def predict_image(req: PredictImageRequest):
             raise HTTPException(status_code=500, detail=f"predict failed: {exc}")
 
     return {"boxes": boxes, "classes": entry["info"].get("train_classes", {})}
+
+
+@app.post("/checkpoint_info")
+def checkpoint_info(req: CheckpointInfoRequest):
+    """Inspect a checkpoint's arch + trained input size, without exporting anything.
+
+    Used to prefill the ONNX/TensorRT export forms' static input size — cheap
+    (``torch.load`` only, see ``ml/checkpoint_info.py``), so it's safe to call
+    synchronously while rendering a form. No lock: read-only and CPU-only.
+    """
+    log = _service_log()
+    checkpoint = Path(req.checkpoint_path)
+    if not checkpoint.exists():
+        log.error("checkpoint_info rejected: checkpoint not found: %s", checkpoint)
+        raise HTTPException(status_code=400, detail=f"checkpoint not found: {checkpoint}")
+
+    try:
+        from ml.checkpoint_info import inspect_checkpoint
+
+        return inspect_checkpoint(checkpoint)
+    except Exception as exc:  # noqa: BLE001 - surface inspection failures to the caller
+        log.exception("checkpoint_info failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"checkpoint_info failed: {exc}")
 
 
 @app.post("/export_onnx")
@@ -721,6 +793,51 @@ def export_trt(req: ExportTrtRequest):
         "provenance_path": str(provenance_path),
         "precision": built_precision,
     }
+
+
+@app.post("/export_bundle")
+def export_bundle(req: ExportBundleRequest):
+    """Assemble a self-contained inference bundle synchronously.
+
+    Runs in this env (not Django's) because it can compile a TensorRT engine for
+    the person detector and, for an engine bundle, reads back an engine's batch
+    profile — both need the GPU/TensorRT this service owns. Serialized behind
+    ``_trt_build_lock`` for an engine bundle, ``_export_lock`` otherwise, same as
+    ``/export_trt`` / ``/export_onnx``.
+    """
+    log = _service_log()
+    if req.fmt not in ("onnx", "engine"):
+        raise HTTPException(status_code=400, detail=f"fmt must be onnx or engine, got {req.fmt!r}")
+
+    _ensure_chachak_importable()
+    lock = _trt_build_lock if req.fmt == "engine" else _export_lock
+    with lock:
+        try:
+            from chachak.bundle_export.cli import export_bundle_for_config
+            from chachak.config import pipeline_config_from_dict
+
+            config = pipeline_config_from_dict(dict(req.request), HERE.parent)
+            bundle_dir = export_bundle_for_config(
+                config, req.output_dir, fmt=req.fmt, conf=req.conf,
+                precision=req.precision, overwrite=req.overwrite,
+            )
+        except HTTPException:
+            raise
+        except (ValueError, SystemExit) as exc:
+            log.warning("bundle export rejected: %s", exc)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except ModuleNotFoundError as exc:  # tensorrt not installed in this env
+            log.error("bundle export unavailable: %s", exc)
+            raise HTTPException(
+                status_code=501,
+                detail=f"TensorRT not available in the trainer env: {exc}",
+            )
+        except Exception as exc:  # noqa: BLE001 - surface bundling failures to the caller
+            log.exception("bundle export failed: %s", exc)
+            raise HTTPException(status_code=500, detail=f"bundle export failed: {exc}")
+
+    log.info("bundled %s -> %s", config.model_checkpoint, bundle_dir)
+    return {"bundle_dir": str(bundle_dir)}
 
 
 @app.post("/promote_labels")

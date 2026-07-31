@@ -156,6 +156,36 @@ def promote_labels(payload: dict, ts: TrainingSettings | None = None) -> dict:
     return resp.json()
 
 
+# A checkpoint_info call only torch.loads the checkpoint (no model build, no
+# export) — cheap, but still a shared-filesystem read, so give it a bit more
+# than the short module TIMEOUT rather than reusing EXPORT_TIMEOUT.
+INSPECT_TIMEOUT = 60
+
+
+def inspect_checkpoint(checkpoint_path, ts: TrainingSettings | None = None) -> dict:
+    """``{"arch", "trained_size"}`` for a checkpoint, without exporting anything.
+
+    ``trained_size`` is ``[H, W]`` or ``None`` (Faster R-CNN/RetinaNet train at
+    variable input size, so there is no single size to report). Used to prefill
+    the export forms' static input size.
+    """
+    payload = {"checkpoint_path": str(checkpoint_path)}
+    resp = requests.post(
+        f"{base_url(ts)}/checkpoint_info", json=payload, timeout=INSPECT_TIMEOUT)
+    if resp.status_code >= 400:
+        detail = resp.text
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and body.get("detail"):
+            detail = str(body["detail"])
+        raise RuntimeError(
+            f"trainer /checkpoint_info returned HTTP {resp.status_code}: {detail}"
+        )
+    return resp.json()
+
+
 # ONNX export rebuilds the model and traces it — well past the short module
 # TIMEOUT, especially for the DETR-family archs.
 EXPORT_TIMEOUT = 600
@@ -225,5 +255,48 @@ def export_trt(
             detail = str(body["detail"])
         raise RuntimeError(
             f"trainer /export_trt returned HTTP {resp.status_code}: {detail}"
+        )
+    return resp.json()
+
+
+# Bundling can export the person detector from scratch (an ONNX trace, maybe
+# also a TRT build) on top of assembling the manifest/runtime/infer.py, so it
+# gets the wider of the two export timeouts.
+BUNDLE_TIMEOUT = TRT_BUILD_TIMEOUT
+
+
+def export_bundle(
+    request: dict, output_dir, *,
+    fmt: str = "onnx", conf: float | None = None, precision: str = "auto",
+    overwrite: bool = True, ts: TrainingSettings | None = None,
+) -> dict:
+    """Bundle an already-exported artifact as a self-contained pipeline.
+
+    ``request`` is a chachak pipeline request dict (see
+    ``chachak.bundle_export.cli.ExportBundleRequest``'s docstring in the
+    trainer service) with ``model_checkpoint`` pointing at the artifact just
+    exported by :func:`export_onnx` / :func:`export_trt`. Returns
+    ``{"bundle_dir": ...}``. Synchronous, like the other export calls.
+    """
+    payload = {
+        "request": request,
+        "output_dir": str(output_dir),
+        "fmt": fmt,
+        "conf": conf,
+        "precision": precision,
+        "overwrite": overwrite,
+    }
+    resp = requests.post(
+        f"{base_url(ts)}/export_bundle", json=payload, timeout=BUNDLE_TIMEOUT)
+    if resp.status_code >= 400:
+        detail = resp.text
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and body.get("detail"):
+            detail = str(body["detail"])
+        raise RuntimeError(
+            f"trainer /export_bundle returned HTTP {resp.status_code}: {detail}"
         )
     return resp.json()

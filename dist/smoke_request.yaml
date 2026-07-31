@@ -1,0 +1,20 @@
+pipeline: batch_detect
+name: ppe_batch_detect_smoke_test
+
+model_checkpoint: /work/chachkalica/data/training/runs/PPE_v0.3_batch_detect_50-23/00-train_prototype_0-00-yolox-yolox-m/best.pt
+images: /work/dist/smoke_images
+labels: null
+classes: [helmet, vest, no_helmet, no_vest]
+output_dir: /work/dist/smoke_run_out
+
+device: auto
+infer_batch_size: 4
+num_workers: 2
+score_threshold: 0.001
+merge_nms_iou: 0.5
+
+tiling:
+  tile_width_pct: 50
+  tile_height_pct: 50
+  overlap: 0.2
+  nms_iou: 0.5

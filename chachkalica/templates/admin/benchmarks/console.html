@@ -162,22 +162,46 @@
   </section>
 
   <section>
-    <h2 class="section-head">Known limitations</h2>
+    <h2 class="section-head">Known limitations &amp; explained anomalies</h2>
+    <p class="section-sub">Odd-looking numbers in the tables above that are real and understood &mdash; none require a
+      re-run. Grouped by cause.</p>
     <ul class="limits">
-      <li><b>RF-DETR's exported formats fall off a cliff above ~640.</b> Its ONNX/ENGINE throughput craters (to ~16%
-        util) once the input grows past 640, while PT is unaffected &mdash; a kernel-fusion cliff at the larger token
-        grids, not a raw compute cost. It is resolution-driven, not a windowed-attention quirk: <code>large</code> is
-        architecturally identical to <code>medium</code> and still hits it at its larger size.</li>
-      <li><b>ONNX &Delta;mem is arena reservation, not working set</b> &mdash; onnxruntime grabs a large pool on first
-        Run() and reuses it, so ONNX cells read high and flat regardless of model size.</li>
-      <li><b>ENGINE &Delta;mem is coarse for small models</b> &mdash; per-pid NVML memory is attributed in blocks, so
-        the smallest engines round to flat values (e.g. rfdetr's shared ViT-S encoder dominates and reads ~90&nbsp;MB
-        across variants). Where footprints genuinely diverge (yolox, rtdetr, fasterrcnn backbones) they scale as
-        expected.</li>
-      <li><b>ONNX fp16 doesn't load for fasterrcnn/retinanet/yolox</b> &mdash; the shared graph-level fp16 cast makes a
-        graph TensorRT accepts but onnxruntime's session loader rejects; those cells fall back to fp32-on-GPU.</li>
-      <li><b>retinanet's engine stays fp32 on purpose</b> (dynamic-profile Myelin incompatibility, out of scope), which
-        is also why its engines need far more workspace memory than fasterrcnn's fixed-profile ones.</li>
+      <li><b>DETR exported formats crater at large token grids.</b> Both rfdetr and rtdetr (set-prediction decoders)
+        lose most of their ONNX/ENGINE throughput at high resolution while PT stays fine &mdash; the attention/decoder
+        ops export to launch-bound kernels that leave the GPU ~10&ndash;25% busy. At 960 rtdetr's <em>engine</em> even
+        drops below its own PT (e.g. r50vd ~50 vs ~79&nbsp;fps). PT eager fuses these, so PT is the fast path for a
+        DETR at large input sizes.</li>
+      <li><b>rfdetr <code>base</code> is the worst case, at every size.</b> base is the only variant with
+        <code>num_windows=4</code>/<code>patch_size=14</code> windowed attention (the rest are
+        <code>num_windows=2</code>/<code>patch_16</code>); its 16-way window partition exports to a swarm of tiny
+        kernels, so its ONNX/ENGINE degrade steadily (engine &asymp; 212 &rarr; 62 &rarr; 18&nbsp;fps at 320/640/960,
+        util down to 10%) while PT holds ~85&ndash;116&nbsp;fps. Prefer PT for base, or avoid base.</li>
+      <li><b>rfdetr <code>large</code> craters only at 704 (the 640 tab), not at 320/960.</b> large is architecturally
+        identical to <code>medium</code>; its slow 640-tab engine (~57&nbsp;fps) is a resolution-specific TensorRT
+        tactic cliff at the 44-patch grid (704&nbsp;=&nbsp;44&times;16, an awkward tile factor), not a size trend
+        &mdash; it is ~536&nbsp;fps at 320 and recovers to ~121 at 960. So the slowdown is base's windowing
+        <em>plus</em> specific bad resolutions, not simply "&gt;640".</li>
+      <li><b>PT throughput is overhead-bound at small sizes and doesn't track the page's image size for
+        fasterrcnn/retinanet/rtdetr.</b> Those three resize every input to a fixed internal size in their PT path, so
+        their PT fps is ~flat across the 320/640/960 tabs (only ONNX/ENGINE, exported at the page size, actually
+        scale). And at 320 the small/fast models finish faster than the host can feed them (yolox-nano PT ~14% util),
+        so PT there reflects Python/launch overhead, not compute. Compare PT-to-PT across archs, not PT-to-engine
+        within one size.</li>
+      <li><b>ONNX (fp32) often out-runs PT (fp16) on the small/fast nets</b> (yolox, mobilenet_v3_large_320, the DETRs
+        at 320). That is the same overhead effect plus onnxruntime's graph fusion &mdash; not a precision advantage;
+        the PT number carries eager dispatch overhead.</li>
+      <li><b>fp16 &rarr; fp32 fallbacks, by design (hover an amber <span class="pill fp32 pill--flagged">FP32</span>
+        badge):</b> fasterrcnn/retinanet/yolox ONNX (the shared fp16-cast graph is accepted by TensorRT but rejected
+        by onnxruntime's session loader &rarr; fp32-on-GPU), and rtdetr PT (its adapter sets
+        <code>supports_amp=False</code> for a documented decoder/GIoU fp16 overflow).</li>
+      <li><b>ONNX &Delta;mem is arena reservation, not working set</b> &mdash; onnxruntime grabs a pool on first Run()
+        and reuses it, so ONNX reads high and flat (~526&nbsp;MB floor at &le;640, up to 2&ndash;4&nbsp;GB for the
+        DETRs at 960 as feature maps grow). Compare ONNX-to-ONNX only.</li>
+      <li><b>ENGINE &Delta;mem is coarse for the smallest models</b> &mdash; per-pid NVML memory is attributed in
+        blocks, so e.g. rfdetr's shared ViT-S encoder makes several variants read the same ~90&nbsp;MB at 640. Where
+        footprints genuinely diverge (yolox, rtdetr, fasterrcnn backbones) they scale as expected.</li>
+      <li><b>Variant order is not speed order within an arch</b> &mdash; lighter backbones win, so listing order can
+        look "inverted" (fasterrcnn mobilenet &gt; resnet; yolox nano &asymp; tiny). Expected.</li>
       <li><b>Random-init weights throughout</b> &mdash; no checkpoint, no real images. Says nothing about accuracy.</li>
     </ul>
   </section>

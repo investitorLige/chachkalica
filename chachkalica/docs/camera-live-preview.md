@@ -30,13 +30,14 @@ Trade-off accepted: ~5-15fps JPEG refresh, not smooth 25-30fps video. Fine for
 ```
 cv2.VideoCapture (RTSP)  --every frame-->  stream_cameras worker (1 thread/camera)
                                               |
-                                   SETEX camera:<id>:frame (short TTL)
+                        SETEX camera:<id>:frame    (full res, for the model)
+                        SETEX camera:<id>:preview  (downscaled, for viewers)
                                               |
                                               v
                                             Redis
                                               ^
                                               |
-                                    GET camera:<id>:frame (poll)
+                                 GET camera:<id>:preview (poll)
                                               |
                        admin:cameras_camera_mjpeg  (custom admin URL)
                                               |
@@ -142,10 +143,46 @@ admin changes:
    `view_live_stream` action redirects to `.../live/?camera=2`; that page
    renders the camera's name and the correct mjpeg URL.
 
-## Known follow-up (not done, flagging rather than doing unprompted)
+## Follow-up: preview downscaling + duplicate suppression (done)
 
-Frames are pushed at full camera resolution/JPEG quality — a few chunks in
-verification totalled ~1.7MB/frame. Fine at the current scale, but if
-bandwidth becomes a concern with more simultaneous viewers or higher-res
-cameras, `cv2.imencode` in `stream_cameras.py` can take a quality parameter
-and/or the frame can be resized before encoding.
+The original version of this page flagged full-resolution streaming as a
+deferred concern. It stopped being theoretical once a 4K camera was attached:
+measured against the live showroom stream, a single viewer pulled **194 MB in
+12 s (~16 MB/s)** — full-resolution frames, re-sent every poll.
+
+Two changes, both in the producer rather than the viewer:
+
+- **`cameras/services/preview.py`** — `resize` (to `PREVIEW_MAX_WIDTH`, 1280,
+  `INTER_AREA`) + `encode` (quality 85). `stream_cameras` publishes
+  `camera:<id>:preview` beside the full-resolution `:frame`, and the compositor
+  publishes `:annotated` preview-sized outright, since a browser is its only
+  consumer. `:frame` deliberately stays untouched — `predict_frame` hands those
+  exact bytes to the trainer, and downscaling before inference would throw away
+  the detail small/distant detections depend on.
+- **`_mjpeg_frames` skips repeats.** The view polls faster than the worker
+  pushes (0.1 s vs 0.15 s) precisely so no frame is missed, which means the
+  same frame is regularly found twice; a stalled camera holds one frame for its
+  whole TTL. Frames are now digested (`blake2b`) and sent once, with a
+  `_MJPEG_KEEPALIVE_SECONDS` (5 s) re-send so a static scene can't leave the
+  connection silent long enough for an intermediary to time it out.
+
+The resize is paid once per frame in the worker that was already
+decoding/encoding, not once per frame per viewer in a web worker shared with
+the rest of the admin. Measured on the same 4K stream afterwards:
+
+| | before | after |
+|---|---|---|
+| per viewer | 16.2 MB/s | **0.58 MB/s** (28× less) |
+| per frame | ~1.6 MB (3840w) | ~124 KB (1280w) |
+| frames/s delivered | ~10 (about half duplicates) | 4.8 (every distinct frame, no repeats) |
+| producer cost | — | +3.7 ms/frame (2.2 resize + 1.5 encode) |
+
+The delivered frame rate matches the worker's measured 4.9 fps push rate — the
+drop from ~10 is duplicates no longer being sent, not frames being lost. That
+push rate is bounded by `FRAME_PUSH_INTERVAL_SECONDS` (150 ms) plus one 4K
+`capture.read()`, giving a ~219 ms median gap; the +3.7 ms of preview work is
+inside the noise of that.
+
+Cost of the fallback: `get_preview_frame` falls back to `:frame` when no
+preview exists (a cold cache right after a `camera-workers` restart), which
+streams 4K — a stopgap for a few seconds, not a mode to sit in.

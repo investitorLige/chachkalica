@@ -204,6 +204,31 @@ class _FixedRFPostprocess:
         }]
 
 
+class _ConfiguredDetector(_DummyDetector):
+    """A dummy whose ``.config`` RTDETRAdapter.predict reads for use_focal_loss."""
+
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(use_focal_loss=True)
+
+    def forward(self, **kwargs):
+        return {"batch": kwargs}
+
+
+class _FixedRTPostprocess:
+    """Stands in for the HF image processor: returns boxes in model-input pixels."""
+
+    def __init__(self, boxes):
+        self.boxes = boxes
+
+    def post_process_object_detection(self, outputs, threshold, target_sizes, use_focal_loss):
+        return [{
+            "boxes": self.boxes.to(target_sizes.device),
+            "scores": torch.tensor([0.9], device=target_sizes.device),
+            "labels": torch.tensor([0], device=target_sizes.device),
+        }]
+
+
 class AdapterResizeRoundTripTests(unittest.TestCase):
     IMAGE_H = 333
     IMAGE_W = 1000
@@ -227,13 +252,26 @@ class AdapterResizeRoundTripTests(unittest.TestCase):
         pred = yolox_detection_to_friendy(detection, image, scale_y, scale_x)
         self.assertTrue(torch.allclose(pred[0, :4], torch.tensor([0.3, 175.0 / 333.0, 0.4, 250.0 / 333.0])))
 
-    def test_rtdetr_uses_actual_rounded_resize_scales_for_loss_labels(self):
+    def test_rtdetr_stretches_to_a_square_canvas_with_no_padding(self):
+        adapter = RTDETRAdapter(
+            model=_DummyDetector(), image_processor=None, num_classes=1, input_max_size=640
+        )
+        image = torch.zeros(3, self.IMAGE_H, self.IMAGE_W)
+        resized, _targets = adapter._resize_training_inputs([image], [self._target()])
+        # No letterbox margin: the whole model input is real content, so nothing
+        # the decoder is trained to point at can land on padding.
+        self.assertEqual(tuple(resized[0].shape[-2:]), (640, 640))
+
+    def test_rtdetr_labels_normalize_over_the_model_input(self):
         adapter = RTDETRAdapter(
             model=_DummyDetector(), image_processor=None, num_classes=1, input_max_size=640
         )
         image = torch.zeros(3, self.IMAGE_H, self.IMAGE_W)
         resized, targets = adapter._resize_training_inputs([image], [self._target()])
-        labels = adapter._prepare_labels(targets, resized)
+        labels = adapter._prepare_labels(targets, resized[0].shape[-2:])
+        # Stretching to the square canvas leaves normalized coordinates equal to
+        # the original image's own fractions — which is what makes the exported
+        # graph's `box_coords: "input_normalized"` contract hold.
         self.assertTrue(torch.allclose(labels[0]["boxes"], torch.tensor([[0.3, 175.0 / 333.0, 0.4, 250.0 / 333.0]])))
 
     def test_rfdetr_round_trip_uses_actual_per_axis_scale_after_rounding(self):
@@ -266,6 +304,23 @@ class AdapterResizeRoundTripTests(unittest.TestCase):
         # The canvas box corresponds to [100, 50, 500, 300] using the actual
         # (rounded) resize dimensions: 640x213.
         self.assertTrue(torch.allclose(pred[0, :4], torch.tensor([0.3, 175.0 / 333.0, 0.4, 250.0 / 333.0])))
+
+    def test_rtdetr_pad_margin_prediction_stays_inside_the_image(self):
+        # Resize disabled: _prepare_batch pads 100x100 up to the 32-multiple
+        # 128x128, and RT-DETR can score a box in that margin. The result must
+        # still be normalized within [0, 1] against the real image.
+        adapter = RTDETRAdapter(
+            model=_ConfiguredDetector(),
+            image_processor=_FixedRTPostprocess(torch.tensor([[90.0, 90.0, 120.0, 120.0]])),
+            num_classes=1,
+            input_max_size=None,
+        )
+        pred = adapter.predict([torch.zeros(3, 100, 100)], score_threshold=0.0)[0]
+
+        cx, cy, w, h = pred[0, :4].tolist()
+        self.assertTrue(all(0.0 <= v <= 1.0 for v in (cx, cy, w, h)), pred[0, :4])
+        # Clipped to [90, 90, 100, 100] of a 100x100 image.
+        self.assertTrue(torch.allclose(pred[0, :4], torch.tensor([0.95, 0.95, 0.1, 0.1])))
 
 
 if __name__ == "__main__":

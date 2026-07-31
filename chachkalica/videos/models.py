@@ -3,6 +3,7 @@ from pathlib import Path
 from django.db import models
 
 from fleet.services.paths import videos_root
+from training import pipelines
 
 
 class Video(models.Model):
@@ -126,14 +127,28 @@ class FrameExtractionJob(models.Model):
 
 
 class InferenceJob(models.Model):
-    """One "Run model inference…" run: a trained model applied frame-by-frame
-    to a video, with detected boxes burned onto an annotated output video.
+    """One "Run model inference…" run: a model applied frame-by-frame to a video,
+    with detected boxes burned onto an annotated output video.
 
     Mirrors :class:`FrameExtractionJob` — a dedicated row per run (a video can
     reasonably be re-run against different models/thresholds), status lifecycle
     ``queued -> running -> ok``/``error``. The output video lives under
     ``<videos_root>/inferred/`` (see ``videos.services.inference.output_dir``),
     same "DB stores metadata, bytes stay on disk" convention as ``Video``.
+
+    The model to run comes from one of two places (``model_source``): a
+    catalogued :class:`training.TrainedModel` (its ``.pt`` checkpoint), or an
+    exported ``.onnx`` / ``.engine`` artifact sitting in the export output
+    directory, addressed by ``artifact_path`` relative to it (see
+    ``training.services.exports``). Exported artifacts have no DB row of their
+    own, hence ``trained_model`` is nullable.
+
+    The remaining fields describe *how* frames reach the model: ``pipeline`` is
+    ``"raw"`` (whole frame straight to the model) or a chachak pipeline that
+    tiles the frame and/or crops around detected people, with that pipeline's
+    detector/tiling knobs beside it. Mirrors
+    :class:`eval_pipelines.models.PipelineEvalRun`'s field set, minus the
+    dataset/metrics half.
     """
 
     QUEUED = "queued"
@@ -147,12 +162,93 @@ class InferenceJob(models.Model):
         (ERROR, "error"),
     ]
 
+    TRAINED = "trained"
+    EXPORTED = "exported"
+    MODEL_SOURCE_CHOICES = [
+        (TRAINED, "trained model (.pt checkpoint)"),
+        (EXPORTED, "exported artifact (ONNX / TensorRT)"),
+    ]
+
+    # "raw" is not a chachak pipeline — it means "no pipeline, feed the model the
+    # whole frame", which is what this action did before pipelines were offered.
+    RAW = "raw"
+    PIPELINE_CHOICES = [
+        (RAW, "raw — whole frame straight to the model"),
+        *pipelines.PIPELINE_CHOICES,
+    ]
+
     video = models.ForeignKey(Video, on_delete=models.CASCADE, related_name="inference_jobs")
+    model_source = models.CharField(
+        max_length=16, choices=MODEL_SOURCE_CHOICES, default=TRAINED,
+        help_text="Where the model comes from: the trained-models catalogue, or an "
+                  "exported artifact in the export output directory.",
+    )
     trained_model = models.ForeignKey(
-        "training.TrainedModel", on_delete=models.CASCADE, related_name="video_inference_jobs",
+        "training.TrainedModel", null=True, blank=True,
+        on_delete=models.CASCADE, related_name="video_inference_jobs",
+        help_text="Set when model_source is 'trained'.",
+    )
+    artifact_path = models.CharField(
+        max_length=1024, blank=True,
+        help_text="Path of the exported .onnx/.engine relative to the export output "
+                  "directory. Set when model_source is 'exported'.",
     )
     score_threshold = models.FloatField(
         default=0.5, help_text="Detections below this confidence are dropped.",
+    )
+
+    pipeline = models.CharField(
+        max_length=32, choices=PIPELINE_CHOICES, default=RAW,
+        help_text="How each frame is presented to the model: whole ('raw'), tiled, "
+                  "or cropped around detected people.",
+    )
+    detector_checkpoint = models.CharField(
+        max_length=1024, blank=True,
+        help_text="Person-detector checkpoint; required for people_detect_first / "
+                  "batch_people (and any chain including them).",
+    )
+    detector_expand_ratio = models.FloatField(
+        null=True, blank=True,
+        verbose_name="Person-box expand ratio",
+        help_text="Grow each detected person box by this fraction before cropping. "
+                  "Blank = chachak's default. Match what the model was trained with.",
+    )
+    detector_min_box_size = models.FloatField(
+        null=True, blank=True,
+        verbose_name="Person-crop minimum size (px)",
+        help_text="Grow person crops smaller than this many pixels rather than "
+                  "dropping them. Blank = chachak's default. Only used by "
+                  "people_detect_first.",
+    )
+    tile_size_px = models.PositiveIntegerField(
+        null=True, blank=True,
+        verbose_name="Tile size (pixels)",
+        help_text="Fixed square tile size for batch_detect; overrides the tile "
+                  "width/height percentages. Blank = percentage tiling.",
+    )
+    tile_width_pct = models.FloatField(
+        null=True, blank=True,
+        help_text="Tile width as a percent (0–100] of each frame's width. "
+                  "Blank = chachak's default.",
+    )
+    tile_height_pct = models.FloatField(
+        null=True, blank=True,
+        help_text="Tile height as a percent (0–100] of each frame's height. "
+                  "Blank = chachak's default.",
+    )
+    overlap = models.FloatField(
+        null=True, blank=True,
+        help_text="Fraction (0–1) by which adjacent tiles overlap. Blank = default.",
+    )
+    merge_nms_iou = models.FloatField(
+        null=True, blank=True,
+        verbose_name="merge_nms_iou_threshold",
+        help_text="Class-aware NMS IoU used to merge predictions across tiles/crops. "
+                  "Blank = chachak's default. Match what the model was trained with.",
+    )
+    chain = models.JSONField(
+        default=list, blank=True,
+        help_text="Ordered pipeline names for the 'chain' pipeline.",
     )
     frame_stride = models.PositiveIntegerField(
         default=1,
@@ -181,7 +277,36 @@ class InferenceJob(models.Model):
         verbose_name_plural = "Inferred videos"
 
     def __str__(self) -> str:
-        return f"{self.video.name} → {self.trained_model.name}"
+        return f"{self.video.name} → {self.model_label()} [{self.pipeline}]"
+
+    def model_label(self) -> str:
+        """Human name of the model this job runs, whichever source it came from."""
+        if self.model_source == self.EXPORTED:
+            return self.artifact_path or "(no artifact)"
+        return self.trained_model.name if self.trained_model_id else "(deleted model)"
+
+    def model_checkpoint(self) -> str:
+        """Absolute path of the model artifact to run.
+
+        Trained models carry a checkpoint path that may be project-relative;
+        exported artifacts resolve against the export output directory (which also
+        rejects anything escaping it). Raises ``ValueError`` when the job's model
+        is missing or unusable.
+        """
+        from django.conf import settings
+
+        if self.model_source == self.EXPORTED:
+            from training.services import exports
+
+            return str(exports.resolve(self.artifact_path))
+
+        if not self.trained_model_id:
+            raise ValueError("Inference job has no trained model.")
+        raw = (self.trained_model.checkpoint_path or "").strip()
+        if not raw:
+            raise ValueError(f"{self.trained_model.name}: no checkpoint path to run.")
+        path = Path(raw)
+        return str(path if path.is_absolute() else Path(settings.BASE_DIR) / path)
 
     def output_path(self) -> Path:
         from videos.services.inference import output_dir

@@ -44,6 +44,15 @@ class TrainingSettings(models.Model):
         max_length=512, default="data/training/runs",
         help_text="Shared output root; each run's output_dir is runs_root/<name>-<id>.",
     )
+    exports_root = models.CharField(
+        max_length=512, default="data/training/runs/exports",
+        help_text="Where exported inference artifacts (.onnx / .engine) are written. "
+                  "Prefilled as the output directory by the ONNX/TensorRT export "
+                  "actions, and scanned recursively to offer exported models for "
+                  "video inference. Point this at an existing directory (e.g. "
+                  "data/training/runs) to pick up artifacts exported before this "
+                  "setting existed.",
+    )
     default_device = models.CharField(
         max_length=16,
         choices=[("auto", "auto"), ("cuda", "cuda"), ("cpu", "cpu")],
@@ -553,6 +562,15 @@ class TrainedModel(models.Model):
     metrics = models.JSONField(
         null=True, blank=True, help_text="Metrics snapshot at promotion time.",
     )
+    pipeline_metadata = models.JSONField(
+        default=dict, blank=True,
+        help_text="Frozen record of the chachak pipeline this model was trained "
+                  "through — the geometry it must be served with (see "
+                  "training.services.pipeline_meta). Written at promotion time and "
+                  "copied beside every ONNX/TensorRT export, so every action that "
+                  "runs this model prefills itself from one record instead of "
+                  "asking for the parameters again.",
+    )
 
     source_run_result = models.ForeignKey(
         RunResult, on_delete=models.SET_NULL, null=True, blank=True, related_name="trained_models",
@@ -566,6 +584,58 @@ class TrainedModel(models.Model):
 
     def __str__(self) -> str:
         return self.name
+
+
+class ExportRun(models.Model):
+    """One queued ONNX/TensorRT export of a single checkpoint (best or last).
+
+    Covers the whole per-checkpoint pipeline the admin export actions drive —
+    primary export, pipeline sidecar, and (best-effort) infer bundle — as one
+    row, so ``training.jobs.run_export_onnx``/``run_export_trt`` can run it on
+    the ``django_rq`` worker instead of blocking the admin request (see
+    ``TrainedModelAdmin.export_onnx``/``export_trt``).
+    """
+
+    ONNX = "onnx"
+    TRT = "trt"
+    KIND_CHOICES = [(ONNX, "onnx"), (TRT, "trt")]
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    OK = "ok"
+    ERROR = "error"
+    STATUS_CHOICES = [
+        (QUEUED, "queued"),
+        (RUNNING, "running"),
+        (OK, "ok"),
+        (ERROR, "error"),
+    ]
+
+    model = models.ForeignKey(TrainedModel, on_delete=models.CASCADE, related_name="export_runs")
+    kind = models.CharField(max_length=8, choices=KIND_CHOICES)
+    checkpoint_label = models.CharField(max_length=16)  # "best" / "last"
+    checkpoint_path = models.CharField(max_length=1024)
+    output_path = models.CharField(max_length=1024)  # planned onnx_path / engine_path
+
+    # TensorRT-only knobs (blank/null for an ONNX row).
+    precision = models.CharField(max_length=8, blank=True)
+    input_hw = models.JSONField(null=True, blank=True)  # [H, W] or null (dynamic profile)
+
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=QUEUED)
+    result = models.JSONField(null=True, blank=True)  # runner.export_onnx/export_trt's return dict
+    bundle_dir = models.CharField(max_length=1024, blank=True)
+    bundle_error = models.TextField(blank=True)  # a bundle failure doesn't fail the export
+    last_error = models.TextField(blank=True)
+
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.get_kind_display()} export #{self.pk} — {self.model.name}"
 
 
 class EvalRun(models.Model):

@@ -1,0 +1,99 @@
+{% extends "admin/base_site.html" %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  .ov-wrap { max-width: 1000px; }
+  .ov-pair { margin: 20px 0; border: 1px solid #1d2a20; border-radius: 8px; padding: 14px 18px; background: #0f1a12; }
+  .ov-pair h2 { margin: 0 0 8px; font-size: 16px; }
+  .ov-stats { color: #9bb7a6; font-size: 13px; margin-bottom: 10px; }
+  .ov-stats strong { color: #34d399; }
+  .ov-table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 12px; }
+  .ov-table th, .ov-table td { padding: 4px 8px; border-bottom: 1px solid #1d2a20; text-align: left; }
+  .ov-kind-exact { color: #34d399; }
+  .ov-kind-near { color: #e6c07a; }
+  .ov-note { color: #9bb7a6; font-size: 12px; margin-top: 6px; }
+  .ov-prune { margin-top: 24px; border-top: 1px solid #1d2a20; padding-top: 16px; }
+  .ov-prune label { display: block; margin: 4px 0; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="ov-wrap">
+
+{% if not reports %}
+  <p>No datasets to compare.</p>
+{% endif %}
+
+{% for report in reports %}
+  <div class="ov-pair">
+    <h2>{{ report.left.name }} ↔ {{ report.right.name }}</h2>
+    <div class="ov-stats">
+      {{ report.left.name }}: <strong>{{ report.left_count }}</strong> image{{ report.left_count|pluralize }} ·
+      {{ report.right.name }}: <strong>{{ report.right_count }}</strong> image{{ report.right_count|pluralize }} ·
+      <strong>{{ report.exact_count }}</strong> exact duplicate{{ report.exact_count|pluralize }} ·
+      <strong>{{ report.near_count }}</strong> near-duplicate{{ report.near_count|pluralize }} (re-encoded/resized)
+    </div>
+
+    {% if report.matches %}
+    <table class="ov-table">
+      <thead>
+        <tr>
+          <th>{{ report.left.name }}</th>
+          <th>{{ report.right.name }}</th>
+          <th>match</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for m in report.matches|slice:":200" %}
+        <tr>
+          <td>{{ m.left.name }}</td>
+          <td>{{ m.right.name }}</td>
+          <td class="{% if m.kind == 'exact' %}ov-kind-exact{% else %}ov-kind-near{% endif %}">{{ m.kind }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if report.matches|length > 200 %}
+      <p class="ov-note">Showing first 200 of {{ report.matches|length }} matches.</p>
+    {% endif %}
+    {% else %}
+      <p class="ov-note">No overlapping images found between these two.</p>
+    {% endif %}
+  </div>
+{% endfor %}
+
+{% if can_prune %}
+  {% with left=datasets.0 right=datasets.1 report=reports.0 %}
+  <div class="ov-prune">
+    {% if report.matches %}
+    <p>
+      Prune the {{ report.matches|length }} overlapping image{{ report.matches|length|pluralize }} found above.
+      Deleted images and their label files are backed up first (under
+      <code>.overlap_prune_backups/</code> in the source root) before removal.
+    </p>
+    <form action="" method="post">
+      {% csrf_token %}
+      {% for pk in selected %}
+        <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+      {% endfor %}
+      <input type="hidden" name="action" value="{{ action }}">
+      <input type="hidden" name="apply" value="1">
+      <p>
+        <label><input type="checkbox" name="prune_left" value="1"> Prune duplicates from <strong>{{ left.name }}</strong></label>
+        <label><input type="checkbox" name="prune_right" value="1"> Prune duplicates from <strong>{{ right.name }}</strong></label>
+      </p>
+      <div class="submit-row">
+        <input type="submit" class="default" value="Prune overlapping images">
+        <a href="../" class="button cancel-link">Cancel</a>
+      </div>
+    </form>
+    {% else %}
+      <p class="ov-note">No overlaps found — nothing to prune.</p>
+    {% endif %}
+  </div>
+  {% endwith %}
+{% endif %}
+
+<p style="margin-top:2em;"><a href="../" class="button cancel-link">Back</a></p>
+</div>
+{% endblock %}

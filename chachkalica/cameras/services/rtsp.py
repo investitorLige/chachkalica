@@ -13,7 +13,13 @@ _TERMINATE_GRACE_SECONDS = 2
 
 
 def _probe(rtsp_url: str, timeout_ms: int, result_queue) -> None:
+    import os
+
     import cv2
+
+    # UDP media ports don't survive an SSH tunnel (or most VPNs/NATs) even
+    # when the RTSP control channel does, so pin FFmpeg to TCP transport.
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
     capture = cv2.VideoCapture()
     capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms)

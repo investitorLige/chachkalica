@@ -52,6 +52,9 @@ def run_container(*, annotator: Annotator, image_name: str, source_path: Path, t
     cmd = [
         "docker", "run", "-d",
         "--name", annotator.container_name,
+        # Self-heal from crashes (e.g. an LS segfault) without waiting for an
+        # operator to notice; does not kick in after an explicit `docker stop`.
+        "--restart", "unless-stopped",
         "-p", f"{annotator.port}:8080",
         # Reach the host-published webhook receiver from inside the container
         # (host.docker.internal does not resolve on Linux otherwise).

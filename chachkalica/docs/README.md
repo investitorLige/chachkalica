@@ -42,3 +42,6 @@ The cleanup command removes only the container. It does not delete the Docker vo
 - [Configuration](configuration.md)
 - [Commands](commands.md)
 - [Annotator Fleet](annotator-fleet.md)
+- [Camera Live Preview](camera-live-preview.md) — RTSP cameras + MJPEG preview via Redis
+- [Camera Live Inference](camera-live-inference.md) — running a model on a camera's live frames
+- [Pipeline Metadata](pipeline-metadata.md) — a model carries the pipeline it was trained through, in every format; every action prefills from it

@@ -50,19 +50,18 @@ METRIC_ROW_ORDER = [
 ]
 
 # Archs whose default TensorRT profile is dynamic (a wide min/opt/max range) --
-# fasterrcnn (resize_mode "none") and rtdetr (resize_mode "longest_side") both
-# get a wide, non-degenerate min!=max profile from profile.py unless overridden,
-# which is the one combination TensorRT's fp16 cast can't compile (a Myelin
-# dynamic-shape/fp16 type mismatch). A static profile (min==opt==max) builds
-# fp16 clean. Since every benchmark cell only ever times ONE fixed image_size
-# anyway, pinning the engine profile to it is strictly more representative of
-# what's timed -- not just a fp16 workaround.
+# fasterrcnn (resize_mode "none") gets a wide, non-degenerate min!=max profile
+# from profile.py unless overridden, which is the one combination TensorRT's
+# fp16 cast can't compile (a Myelin dynamic-shape/fp16 type mismatch). A static
+# profile (min==opt==max) builds fp16 clean. Since every benchmark cell only
+# ever times ONE fixed image_size anyway, pinning the engine profile to it is
+# strictly more representative of what's timed -- not just a fp16 workaround.
 #
-# rtdetr was added here after the sweep showed it falling back to fp32 on
-# EVERY variant despite trt_export/arch/__init__.py's UNTRUSTED_FP16 comment
-# claiming "rtdetr is unaffected (its longest_side profile builds fp16
-# as-is)" -- that comment is stale relative to observed behavior; verify here
-# whether pinning the profile actually fixes it.
+# rtdetr was added here after the sweep showed it falling back to fp32 on EVERY
+# variant, back when it exported resize_mode "longest_side" (dynamic profile).
+# It now exports "square", which profile.py already makes static, so the pin is
+# redundant -- kept because it also guarantees the profile tracks the cell's
+# image_size exactly.
 #
 # retinanet was added later for the same two payoffs: its default dynamic
 # 256-896² profile (a) stayed fp32 (same Myelin issue) and (b) can't run an

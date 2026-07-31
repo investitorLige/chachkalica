@@ -27,6 +27,7 @@ from fleet.services import data_quality_solve
 from fleet.services import datasets as datasets_svc
 from fleet.services import lsapi
 from fleet.services import merge as merge_svc
+from fleet.services import overlap as overlap_svc
 from fleet.services.paths import source_root
 
 _STATUS_COLORS = {
@@ -244,6 +245,7 @@ class DatasetAdmin(admin.ModelAdmin):
         "generate_grounding_sam_labels",
         "merge_selected",
         "analyze_selected",
+        "check_overlapping_images",
         "preview_labels",
     ]
 
@@ -514,6 +516,73 @@ class DatasetAdmin(admin.ModelAdmin):
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
         }
         return TemplateResponse(request, "admin/fleet/dataset_analytics.html", context)
+
+    @admin.action(description="Check for overlapping images…")
+    def check_overlapping_images(self, request, queryset):
+        """Find images duplicated across two or more datasets.
+
+        Every image is matched by file MD5 (byte-identical copies) and, failing
+        that, by an 8x8 difference hash (the same photo re-exported at a
+        different size/compression — the common case for datasets pulled
+        through Roboflow/Kaggle more than once). Runs synchronously like
+        ``analyze_selected`` — it's disk I/O, not model inference — so large
+        datasets can take a minute or two.
+
+        Pruning the duplicates found is only offered when exactly two datasets
+        are selected: with three or more it's ambiguous which side(s) an
+        operator means to keep. Pruning itself is enqueued as an rq job — it
+        re-hashes and then deletes on the worker — since a two-dataset prune
+        can run long enough to hit the request timeout.
+        """
+        datasets = sorted(queryset, key=lambda d: d.name)
+        if len(datasets) < 2:
+            self.message_user(request, "Select at least two datasets to check for overlaps.", level=messages.WARNING)
+            return None
+
+        cloud = [d.name for d in datasets if d.storage_type != Dataset.LOCAL]
+        if cloud:
+            self.message_user(
+                request,
+                "Overlap checking only supports local-storage datasets: " + ", ".join(cloud),
+                level=messages.ERROR,
+            )
+            return None
+
+        if request.POST.get("apply"):
+            if len(datasets) != 2:
+                self.message_user(request, "Pruning is only available for exactly two datasets.", level=messages.ERROR)
+                return None
+            prune_left = bool(request.POST.get("prune_left"))
+            prune_right = bool(request.POST.get("prune_right"))
+            if not prune_left and not prune_right:
+                self.message_user(request, "Select at least one dataset to prune from.", level=messages.WARNING)
+                return None
+            _queue().enqueue(
+                jobs.prune_overlaps,
+                datasets[0].id,
+                datasets[1].id,
+                prune_left=prune_left,
+                prune_right=prune_right,
+            )
+            self.message_user(
+                request,
+                "Prune queued — re-hashes both datasets and deletes duplicates on the worker; "
+                "check /django-rq/ for progress and the backup dir once it finishes.",
+            )
+            return None
+
+        reports = overlap_svc.find_overlaps(datasets)
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Overlapping images",
+            "datasets": datasets,
+            "reports": reports,
+            "can_prune": len(datasets) == 2,
+            "action": "check_overlapping_images",
+            "selected": [str(d.pk) for d in datasets],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+        }
+        return TemplateResponse(request, "admin/fleet/dataset_overlaps.html", context)
 
     # -------------------------------------------------------------- label preview
     @admin.action(description="Preview dataset labels…")

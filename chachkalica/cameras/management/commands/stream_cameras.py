@@ -17,15 +17,17 @@ session instead of leaking a connection nobody is tracking anymore.
 
 import logging
 import multiprocessing
+import os
 import signal
 import time
 
 import cv2
 from django.core.management.base import BaseCommand
+from django.db import connections
 from django.utils import timezone
 
 from cameras.models import Camera
-from cameras.services import frame_cache
+from cameras.services import frame_cache, preview
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +64,11 @@ class CameraWorker(multiprocessing.Process):
         # the DB connection inherited from the parent's fork.
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         signal.signal(signal.SIGINT, signal.SIG_DFL)
-        from django.db import connections
         connections.close_all()
+
+        # UDP media ports don't survive an SSH tunnel (or most VPNs/NATs) even
+        # when the RTSP control channel does, so pin FFmpeg to TCP transport.
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
         consecutive_failures = 0
         while not self._stop_event.is_set():
@@ -108,7 +113,18 @@ class CameraWorker(multiprocessing.Process):
             if now - last_push >= FRAME_PUSH_INTERVAL_SECONDS:
                 encoded, buf = cv2.imencode(".jpg", frame)
                 if encoded:
-                    frame_cache.set_frame(self.camera_id, buf.tobytes())
+                    full = buf.tobytes()
+                    frame_cache.set_frame(self.camera_id, full)
+                    # Publish a viewer-sized copy alongside it. Resizing here
+                    # costs one camera's worth of CPU; letting every open admin
+                    # tab pull the 4K frame instead costs a viewer's worth of
+                    # bandwidth each (see cameras.services.preview).
+                    small = preview.resize(frame)
+                    frame_cache.set_preview_frame(
+                        self.camera_id,
+                        # `resize` hands back the same object when the camera is
+                        # already narrow enough — nothing to re-encode then.
+                        full if small is frame else preview.encode(small))
                     self._record_status(Camera.ONLINE, "")
                 last_push = now
         return read_any_frame
@@ -159,7 +175,6 @@ class Command(BaseCommand):
                 self._reconcile(workers)
             except Exception:  # noqa: BLE001 - a transient DB/Redis blip must not kill the command
                 logger.exception("stream_cameras: reconcile failed, will retry next cycle")
-                from django.db import connections
                 connections.close_all()  # drop a broken connection so the next cycle reconnects
             shutdown.wait(RECONCILE_INTERVAL_SECONDS)
 
@@ -182,6 +197,11 @@ class Command(BaseCommand):
                 continue
             stop_event = multiprocessing.Event()
             worker = CameraWorker(camera_id, rtsp_url, stop_event)
+            # Hand the child no DB connection to inherit: fork duplicates our
+            # socket, and the child's own close_all() terminates the backend on
+            # the far end of it, breaking *our* connection too ("server closed
+            # the connection unexpectedly" on the next query). Reconnect lazily.
+            connections.close_all()
             worker.start()
             workers[camera_id] = (worker, stop_event, rtsp_url)
             self.stdout.write(f"stream_cameras: started worker for camera {camera_id}")

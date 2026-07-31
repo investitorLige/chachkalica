@@ -63,21 +63,35 @@ class GrowBoxToMinSizeTest(unittest.TestCase):
         self.assertEqual((box[0], box[2]), (0.0, 20.0))
 
 
-class PadCropToMinSizeTest(unittest.TestCase):
+class UpscaleCropToMinSizeTest(unittest.TestCase):
     def test_crop_already_large_enough_is_unchanged(self):
         crop = torch.ones((3, 40, 40))
-        padded, size = boxes.pad_crop_to_min_size(crop, 30)
-        self.assertIs(padded, crop)
-        self.assertEqual(size, (40, 40))
+        self.assertIs(boxes.upscale_crop_to_min_size(crop, 30), crop)
 
-    def test_undersized_crop_is_zero_padded_on_right_bottom(self):
-        crop = torch.ones((3, 10, 20))
-        padded, size = boxes.pad_crop_to_min_size(crop, 30)
-        self.assertEqual(size, (30, 30))
-        self.assertEqual(tuple(padded.shape), (3, 30, 30))
-        self.assertTrue(torch.equal(padded[:, :10, :20], crop))
-        self.assertEqual(float(padded[:, 10:, :].sum()), 0.0)
-        self.assertEqual(float(padded[:, :, 20:].sum()), 0.0)
+    def test_undersized_crop_is_upscaled_with_no_blank_pixels(self):
+        crop = torch.rand((3, 10, 20)) + 0.1
+        resized = boxes.upscale_crop_to_min_size(crop, 30)
+        self.assertGreaterEqual(resized.shape[1], 30)
+        self.assertGreaterEqual(resized.shape[2], 30)
+        self.assertGreater(float(resized.min()), 0.0)
+
+    def test_upscale_preserves_aspect_ratio(self):
+        # 10x20 (h x w) with a 30px floor: scaling to 30 on the short side by
+        # itself would need 3x, so the long side follows to 60 rather than being
+        # squashed to the floor.
+        resized = boxes.upscale_crop_to_min_size(torch.rand((3, 10, 20)), 30)
+        self.assertEqual(tuple(resized.shape), (3, 30, 60))
+
+    def test_upscale_leaves_content_in_place_proportionally(self):
+        # A single bright pixel a quarter of the way across stays a quarter of
+        # the way across after the resize — the invariant remap relies on.
+        crop = torch.zeros((3, 8, 8))
+        crop[:, 2, 2] = 1.0
+        resized = boxes.upscale_crop_to_min_size(crop, 32)
+        peak = int(resized[0].argmax())
+        peak_y, peak_x = divmod(peak, resized.shape[2])
+        self.assertAlmostEqual(peak_x / resized.shape[2], 2 / 8, delta=0.1)
+        self.assertAlmostEqual(peak_y / resized.shape[1], 2 / 8, delta=0.1)
 
     def test_tiles_cover_whole_frame_including_edges(self):
         image = torch.zeros((3, 100, 100))

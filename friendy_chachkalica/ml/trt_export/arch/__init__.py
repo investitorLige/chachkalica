@@ -88,7 +88,8 @@ ARCH_FP16_NODE_BLOCK = {
 # tactic for those shape ops and build_engine falls back to fp32 (a log, not an error).
 # fp16 builds cleanly at any FULLY-STATIC profile (min==opt==max, e.g. 320²/640² — both
 # verified). So to actually ship fasterrcnn fp16, pin the size (min_hw==opt_hw==max_hw).
-# rtdetr is unaffected (its longest_side profile builds fp16 as-is). TODO: consider a
+# rtdetr is unaffected: it exports ``resize_mode: square``, which profile.py already
+# turns into a fully-static min==opt==max profile. TODO: consider a
 # static/narrow fasterrcnn default in profile.py so auto-fp16 materializes unpinned.
 UNTRUSTED_FP16: set[str] = set()
 

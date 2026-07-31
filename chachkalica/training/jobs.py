@@ -7,11 +7,12 @@ terminates, then ingests the results from the shared output directory.
 """
 
 import time
+from pathlib import Path
 
 from django.utils import timezone
 
-from training.models import EvalRun, TrainingRun
-from training.services import autoeval, ingest, runner
+from training.models import EvalRun, ExportRun, TrainingRun
+from training.services import autoeval, exports, ingest, runner
 
 POLL_INTERVAL = 10       # seconds between status checks
 MAX_WAIT = 60 * 60 * 48  # give up after 48h
@@ -206,3 +207,73 @@ def finalize_pipeline_success(pe) -> dict:
     summary = ingest.ingest_pipeline_eval(pe)
     _mark_pipeline(pe, pe.OK, finished=True)
     return {"status": "ok", **summary}
+
+
+# Each export job runs the primary export (ONNX/TRT) then, best-effort, a bundle —
+# so its RQ job_timeout must cover both, not just runner.EXPORT_TIMEOUT/TRT_BUILD_TIMEOUT.
+EXPORT_ONNX_JOB_TIMEOUT = runner.EXPORT_TIMEOUT + runner.BUNDLE_TIMEOUT + 60
+EXPORT_TRT_JOB_TIMEOUT = runner.TRT_BUILD_TIMEOUT + runner.BUNDLE_TIMEOUT + 60
+
+
+def _bundle_after_export(run: ExportRun, artifact_path: Path, *, fmt: str, precision: str = "auto"):
+    """Best-effort infer bundle next to ``artifact_path``, mirroring what
+    ``TrainedModelAdmin._export_bundle`` used to do synchronously in the admin
+    request. A bundle failure is recorded on ``run.bundle_error`` but does not
+    fail the export itself — the primary artifact already exported fine.
+    """
+    bundle_request = exports.build_bundle_request(run.model, artifact_path)
+    if bundle_request is None:
+        return
+    bundle_dir = artifact_path.parent / f"{artifact_path.stem}-bundle"
+    try:
+        result = runner.export_bundle(bundle_request, bundle_dir, fmt=fmt, precision=precision)
+    except Exception as exc:  # noqa: BLE001 - non-fatal, recorded on the row
+        run.bundle_error = str(exc)
+        return
+    run.bundle_dir = result.get("bundle_dir", "")
+
+
+def run_export_onnx(export_id: int) -> dict:
+    """Export one checkpoint to ONNX, then sidecar + bundle it. See ``ExportRun``."""
+    run = ExportRun.objects.get(pk=export_id)
+    run.status, run.started_at = ExportRun.RUNNING, timezone.now()
+    run.save(update_fields=["status", "started_at"])
+
+    try:
+        result = runner.export_onnx(run.checkpoint_path, run.output_path)
+    except Exception as exc:  # noqa: BLE001 - surface service/network errors on the row
+        run.status, run.last_error, run.finished_at = ExportRun.ERROR, str(exc), timezone.now()
+        run.save(update_fields=["status", "last_error", "finished_at"])
+        raise
+
+    artifact_path = Path(run.output_path)
+    exports.export_pipeline_sidecar(run.model, artifact_path)
+    _bundle_after_export(run, artifact_path, fmt="onnx")
+
+    run.status, run.result, run.finished_at = ExportRun.OK, result, timezone.now()
+    run.save(update_fields=["status", "result", "bundle_dir", "bundle_error", "finished_at"])
+    return result
+
+
+def run_export_trt(export_id: int) -> dict:
+    """Build one checkpoint's TensorRT engine, then sidecar + bundle it. See ``ExportRun``."""
+    run = ExportRun.objects.get(pk=export_id)
+    run.status, run.started_at = ExportRun.RUNNING, timezone.now()
+    run.save(update_fields=["status", "started_at"])
+
+    input_hw = tuple(run.input_hw) if run.input_hw else None
+    try:
+        result = runner.export_trt(
+            run.checkpoint_path, run.output_path, precision=run.precision, input_hw=input_hw)
+    except Exception as exc:  # noqa: BLE001 - surface service/network errors on the row
+        run.status, run.last_error, run.finished_at = ExportRun.ERROR, str(exc), timezone.now()
+        run.save(update_fields=["status", "last_error", "finished_at"])
+        raise
+
+    artifact_path = Path(run.output_path)
+    exports.export_pipeline_sidecar(run.model, artifact_path)
+    _bundle_after_export(run, artifact_path, fmt="engine", precision=run.precision)
+
+    run.status, run.result, run.finished_at = ExportRun.OK, result, timezone.now()
+    run.save(update_fields=["status", "result", "bundle_dir", "bundle_error", "finished_at"])
+    return result

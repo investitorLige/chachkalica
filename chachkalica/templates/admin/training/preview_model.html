@@ -29,42 +29,84 @@ checkpoint; tiling fields are optional. Set a label source to overlay ground-tru
   <div class="form-row">
     <label for="pipeline">Pipeline:</label>
     <select name="pipeline" id="pipeline" required>
-      {% for value, label in pipeline_choices %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+      {% for value, label in pipeline_choices %}<option value="{{ value }}"{% if value == pipeline_defaults.pipeline %} selected{% endif %}>{{ label }}</option>{% endfor %}
     </select>
-    <p class="help">Pick raw model inference or a chachak pipeline — the fields below update to show only that pipeline's settings.</p>
+    <p class="help">Defaults to the pipeline this model was trained through (its recorded
+    pipeline metadata) — the fields below update to show only that pipeline's settings.
+    Override them to preview the model served a different way.</p>
   </div>
 
   <div class="form-row" data-pipelines="{{ detector_pipelines }} {{ chain_pipelines }}">
     <label for="detector_checkpoint">Detector checkpoint:</label>
-    <input type="text" name="detector_checkpoint" id="detector_checkpoint" size="60">
+    <input type="text" name="detector_checkpoint" id="detector_checkpoint" size="60"
+           value="{{ pipeline_defaults.detector_checkpoint|default:'' }}">
     <p class="help">Path to the person-detector checkpoint. Required for
     <code>people_detect_first</code> and <code>batch_people</code> (and any chain that
     includes them).</p>
   </div>
 
+  <div class="form-row" data-pipelines="{{ detector_pipelines }} {{ chain_pipelines }}">
+    <label for="detector_expand_ratio">Person-box expand ratio:</label>
+    <input type="number" name="detector_expand_ratio" id="detector_expand_ratio"
+           min="0" max="10" step="0.01"
+           value="{{ pipeline_defaults.detector_expand_ratio|default:'' }}">
+    <p class="help">Grow each detected person box by this fraction before cropping. Blank
+    uses chachak's default.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ detector_pipelines }} {{ chain_pipelines }}">
+    <label for="detector_min_box_size">Person-crop minimum size (px):</label>
+    <input type="number" name="detector_min_box_size" id="detector_min_box_size"
+           min="0" step="1"
+           value="{{ pipeline_defaults.detector_min_box_size|default:'' }}">
+    <p class="help">Grow person crops smaller than this instead of dropping them. Only used
+    by <code>people_detect_first</code>.</p>
+  </div>
+
   <div class="form-row" data-pipelines="{{ chain_pipelines }}">
     <label for="chain">Chain:</label>
     <input type="text" name="chain" id="chain" size="60"
-           placeholder="e.g. batch_detect, people_detect_first">
+           placeholder="e.g. batch_detect, people_detect_first"
+           value="{{ pipeline_defaults.chain|default:'' }}">
     <p class="help">Ordered, comma-separated pipeline names to run in sequence and merge.</p>
   </div>
 
   <div class="form-row" data-pipelines="{{ tiling_pipelines }}">
+    <label for="tile_size_px">Tile size (px):</label>
+    <input type="number" name="tile_size_px" id="tile_size_px" min="1" step="1"
+           value="{{ pipeline_defaults.tile_size_px|default:'' }}">
+    <p class="help">Fixed square tile size — overrides the two percentages below. Set to the
+    resolution the model was trained at to preserve its native pixel scale.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ tiling_pipelines }}">
     <label for="tile_width_pct">Tile width %:</label>
-    <input type="number" name="tile_width_pct" id="tile_width_pct" min="1" max="100" step="1">
+    <input type="number" name="tile_width_pct" id="tile_width_pct" min="1" max="100" step="1"
+           value="{{ pipeline_defaults.tile_width_pct|default:'' }}">
     <p class="help">Tile width as a percent (1–100) of each image's width. Leave blank to use chachak's default.</p>
   </div>
 
   <div class="form-row" data-pipelines="{{ tiling_pipelines }}">
     <label for="tile_height_pct">Tile height %:</label>
-    <input type="number" name="tile_height_pct" id="tile_height_pct" min="1" max="100" step="1">
+    <input type="number" name="tile_height_pct" id="tile_height_pct" min="1" max="100" step="1"
+           value="{{ pipeline_defaults.tile_height_pct|default:'' }}">
     <p class="help">Tile height as a percent (1–100) of each image's height. Leave blank to use chachak's default.</p>
   </div>
 
   <div class="form-row" data-pipelines="{{ tiling_pipelines }}">
     <label for="overlap">Tile overlap:</label>
-    <input type="number" name="overlap" id="overlap" min="0" max="0.99" step="0.05">
+    <input type="number" name="overlap" id="overlap" min="0" max="0.99" step="0.05"
+           value="{{ pipeline_defaults.overlap|default:'' }}">
     <p class="help">Fraction (0–1) by which adjacent tiles overlap. Leave blank for the default.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ merging_pipelines }}">
+    <label for="merge_nms_iou">Merge NMS IoU:</label>
+    <input type="number" name="merge_nms_iou" id="merge_nms_iou"
+           min="0" max="1" step="0.05"
+           value="{{ pipeline_defaults.merge_nms_iou|default:'' }}">
+    <p class="help">Class-aware NMS IoU used to merge the predictions made across tiles /
+    person crops back into one set of boxes. Blank uses chachak's default.</p>
   </div>
 
   <div class="form-row">

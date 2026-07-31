@@ -222,9 +222,9 @@ def rtdetr_export(tmp_path_factory):
 @pytest.mark.parametrize(
     "hw",
     [
-        (512, 512),   # <= max_size, multiple of 32: no resize, no pad (byte-identical input)
-        (480, 640),   # ditto
-        (704, 512),   # longest > 640: exercises longest-side resize + pad-to-32
+        (512, 512),   # square: uniform upscale to the 640 canvas
+        (480, 640),   # landscape: per-axis stretch (one axis already on the canvas)
+        (704, 512),   # both axes stretched, one down and one up
     ],
 )
 def test_rtdetr_parity(rtdetr_export, hw):
@@ -238,10 +238,10 @@ def test_rtdetr_parity(rtdetr_export, hw):
     torch_pred = adapter.predict([image], score_threshold=threshold)[0].detach().cpu().numpy()
     onnx_pred = onnx_adapter.predict([image], score_threshold=threshold)[0].detach().cpu().numpy()
 
-    # RT-DETR is NMS-free and returns normalized boxes; a resized case leans on the
-    # service's resize matching torch's F.interpolate, so allow a slightly looser tol.
-    atol = 1e-3 if hw[0] <= 640 and hw[1] <= 640 else 5e-3
-    _assert_parity(torch_pred, onnx_pred, min_dets=5, atol=atol)
+    # RT-DETR is NMS-free and returns normalized boxes. Every case stretches onto
+    # the square canvas, so all of them lean on the service's bilinear resize
+    # matching torch's F.interpolate — hence one uniformly looser tolerance.
+    _assert_parity(torch_pred, onnx_pred, min_dets=5, atol=5e-3)
 
 
 # --------------------------------------------------------------------------- RF-DETR
