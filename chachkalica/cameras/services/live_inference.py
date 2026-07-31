@@ -86,8 +86,9 @@ def build_predict_payload(config) -> dict:
     """The ``/predict_image`` payload for ``config``, minus the per-frame path.
 
     Mirrors :func:`videos.services.inference.build_predict_payload` — resolves
-    the model (trained checkpoint or exported artifact) and the pipeline knobs
-    once, so the per-frame work is just swapping ``image_path``. Raises
+    the model (trained checkpoint, exported artifact, or the model inside a
+    bundle) and the pipeline knobs once, so the per-frame work is just swapping
+    ``image_path``. Raises
     ``RuntimeError`` for an unusable model or an inconsistent pipeline config.
     """
     from pathlib import Path

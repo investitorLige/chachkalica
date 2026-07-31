@@ -28,6 +28,7 @@ if str(_CHACHAK_DIR) not in sys.path:
 
 import yaml  # noqa: E402
 
+from chachak.bundle_export import cli  # noqa: E402  (pulls chachak.pipeline -> torch)
 from chachak.bundle_export import manifest as contract  # noqa: E402
 from chachak.bundle_export import vendor  # noqa: E402
 from config import PipelineConfig, load_pipeline_config  # noqa: E402
@@ -299,6 +300,76 @@ class FormatSelectionTest(unittest.TestCase):
             contract.resolve_format(self._both(), "onnx")
         with self.assertRaises(contract.ManifestError):
             contract.resolve_format(_manifest(), "engine")
+
+
+class RoleFormatSelectionTest(unittest.TestCase):
+    """Which format each role's artifact is carried as (``cli._role_formats``).
+
+    Roles are resolved independently. Requiring one format for every role made the
+    normal person-crop bundle impossible: the shipped detector is a prebuilt
+    ``.engine``, which cannot be turned back into ONNX, so ``--format onnx`` aborted
+    with "No single format is available for every role" every time — and the
+    operator had no ``.pt`` to point at instead.
+    """
+
+    def _exported(self, **roles):
+        # Mirrors _export_role's return shape, paths only.
+        return {
+            role: {"paths": {fmt: Path(f"/b/models/{role}.{fmt}") for fmt in formats}}
+            for role, formats in roles.items()
+        }
+
+    def test_onnx_request_with_all_onnx_roles(self):
+        exported = self._exported(model=["onnx"], detector=["onnx"])
+        self.assertEqual(
+            cli._role_formats(exported, want_engine=False),
+            {"model": "onnx", "detector": "onnx"},
+        )
+
+    def test_onnx_request_keeps_a_prebuilt_engine_detector(self):
+        exported = self._exported(model=["onnx"], detector=["engine"])
+        self.assertEqual(
+            cli._role_formats(exported, want_engine=False),
+            {"model": "onnx", "detector": "engine"},
+        )
+
+    def test_engine_request_prefers_engine_everywhere_it_exists(self):
+        exported = self._exported(model=["onnx", "engine"], detector=["onnx", "engine"])
+        self.assertEqual(
+            cli._role_formats(exported, want_engine=True),
+            {"model": "engine", "detector": "engine"},
+        )
+
+    def test_engine_request_keeps_an_onnx_only_role(self):
+        exported = self._exported(model=["onnx", "engine"], detector=["onnx"])
+        self.assertEqual(
+            cli._role_formats(exported, want_engine=True),
+            {"model": "engine", "detector": "onnx"},
+        )
+
+    def test_extra_models_are_resolved_too(self):
+        exported = self._exported(
+            model=["onnx"], extra_1=["onnx"], detector=["engine"])
+        self.assertEqual(
+            cli._role_formats(exported, want_engine=False),
+            {"model": "onnx", "extra_1": "onnx", "detector": "engine"},
+        )
+
+    def test_a_mixed_bundle_reports_the_models_format(self):
+        # The manifest carries one flat artifact set and resolve_format reads the
+        # model artifact's extension, so a mixed bundle is an "onnx" bundle that
+        # happens to run its detector on an engine.
+        mixed = _manifest(artifacts={
+            "onnx": {
+                "model": "models/model.onnx",
+                "extra_models": [],
+                "detector": "models/detector.engine",
+                "max_batch": {"model": None, "detector": 1},
+            }
+        })
+        self.assertEqual(contract.resolve_format(mixed), "onnx")
+        self.assertEqual(mixed["artifacts"]["detector"], "models/detector.engine")
+        self.assertEqual(contract.batch_caps(mixed)["detector"], 1)
 
 
 class SchemaGuardTest(unittest.TestCase):

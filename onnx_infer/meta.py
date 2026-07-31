@@ -77,14 +77,15 @@ class ModelMeta:
     layout: str = "rgb"
     box_coords: str = "input_pixels"
     # Clip boxes to the original image bounds after the coordinate inverse.
-    # Matches archs whose torch path clips (YOLOX's clip_xyxy); a no-op for archs
-    # that already emit in-bounds boxes (RetinaNet clips internally); must stay
-    # False for archs whose torch path does not clip (RT-DETR) so the service
-    # doesn't diverge from them. RF-DETR is an exception: under "letterbox"
-    # resize_mode its canvas includes real padding, so predictions can land in
-    # the pad margin and need clipping on both the torch and exported paths —
-    # RF-DETR sets this True (see friendy_chachkalica/ml/adapters/rfdetr.py predict()
-    # and onnx_export/arch/rfdetr.py's build_meta call, which must agree).
+    # The rule is parity, not padding: this must be True for exactly the archs
+    # whose torch path clips, so the service can't diverge from the adapter it was
+    # exported from. True for YOLOX (clip_xyxy), RF-DETR (letterbox padding means
+    # predictions land in the pad margin) and RT-DETR (its decoder emits normalized
+    # boxes that can extend past the canvas with no padding involved); a no-op for
+    # archs that already emit in-bounds boxes (RetinaNet clips internally). Each
+    # arch's adapter ``predict()`` and its ``onnx_export/arch/*.py`` build_meta call
+    # have to agree — an unclipped export scores lower mAP than its own torch path
+    # on edge-touching objects, which reads as an export regression.
     clip_boxes: bool = False
     schema_version: int = SCHEMA_VERSION
 

@@ -179,14 +179,21 @@ that's safe, and it's unlinked on worker exit.
 
 - **`cameras/admin.py`** — `CameraInferenceInline` (StackedInline) on
   `CameraAdmin`, with the pipeline knobs in a collapsed fieldset and the worker
-  status read-only. `CameraInferenceForm` turns `artifact_path` into a dropdown
-  of what's actually in the export root (same source as the video-inference
-  page, keeping a since-deleted saved value selectable so an unrelated edit
-  can't silently blank the model), and on **enable** builds the exact
+  status read-only. `CameraInferenceForm` turns `artifact_path` and
+  `bundle_path` into dropdowns of what's actually in the export root and the
+  bundle root (same sources as the video-inference page, keeping a
+  since-deleted saved value selectable so an unrelated edit can't silently blank
+  the model), and on **enable** builds the exact
   `/predict_image` payload the worker would build — so a missing checkpoint or a
   pipeline missing its detector is a form error on save, not a `status=error`
   row discovered later. A disabled config skips that probe, so a half-finished
   config still saves.
+  A **bundle** source is validated differently: its pipeline fields are filled
+  and locked by the "Sync bundle" button and re-derived from the manifest on
+  save, so the bundle is the record of what runs — see
+  [Infer Bundles](infer-bundles.md). The load test that button offers is opt-in
+  precisely because of the single-entry model cache described above: it would
+  evict whatever this camera is currently running.
   `mjpeg_view`/`live_view` grew an `?annotated=1` switch rather than new URLs;
   the change page's inline preview and the action's link both default to the
   annotated stream once inference is on, since that's what the operator just

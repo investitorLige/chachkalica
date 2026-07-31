@@ -112,12 +112,14 @@ class RTDETRAdapter:
             boxes[:, [0, 2]] /= scale_x
             boxes[:, [1, 3]] /= scale_y
             image_height, image_width = image.shape[-2:]
-            # On the resize-disabled path the boxes are still in the *padded*
-            # frame, so anything the model scored in the pad margin (which it
-            # can: see _fixed_canvas_size on RT-DETR not masking padding) would
-            # normalize past 1.0 against this image's own size. Clip to bounds,
-            # matching RFDETRAdapter.predict and the exported graph's
-            # clip_boxes. A no-op on the stretched path, where there is no pad.
+            # Clip to bounds, matching RFDETRAdapter.predict and the exported
+            # graph's clip_boxes (onnx_export/arch/rtdetr.py, which must keep
+            # agreeing with this line). Not only a padding correction: the decoder
+            # predicts normalized cxcywh, so a box centred near an edge extends
+            # past the frame on the stretched path too, and would normalize past
+            # 1.0 against this image's own size. On the resize-disabled path it
+            # also catches whatever the model scored in the pad margin, which it
+            # can — see _fixed_canvas_size on RT-DETR not masking padding.
             boxes = clip_xyxy(boxes, image_width=image_width, image_height=image_height)
             results.append(
                 xyxy_prediction_to_friendy(

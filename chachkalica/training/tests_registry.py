@@ -190,6 +190,98 @@ class AutoEvalTests(TestCase):
         self.assertTrue(ev.explicit_labels_path.endswith("test_ds/labels"))
 
 
+class AutoEvalPipelineGeometryTests(TestCase):
+    """The automatic test eval runs the geometry the model was *trained* with.
+
+    An experiment with a pipeline gets PipelineEvalRuns instead of EvalRuns, and
+    those rows have to carry every knob the training YAML did. This scheduler used
+    to copy seven of the eleven by hand, so `tile_size_px`, `detector_min_box_size`,
+    `detector_expand_ratio` and `merge_nms_iou` silently fell back to defaults —
+    person crops with no size floor, percentage tiling for a model trained on
+    fixed-pixel tiles — and the automatic number disagreed with the one the manual
+    admin action produced for the same model.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.source = root / "source"
+        self.source.mkdir()
+        fs = FleetSettings.load()
+        fs.source_dir = str(self.source)
+        fs.target_dir = str(root / "target")
+        fs.save()
+
+        ts = TrainingSettings.load()
+        ts.configs_root = str(root / "configs")
+        ts.runs_root = str(root / "runs")
+        ts.save()
+
+        _make_dataset_on_disk(self.source, "train_ds", ["helmet"])
+        _make_dataset_on_disk(self.source, "test_ds", ["helmet"])
+        self.train_ds = Dataset.objects.create(name="train_ds")
+        self.test_ds = Dataset.objects.create(name="test_ds")
+
+    def _run_with(self, **experiment_fields):
+        from training import pipelines
+
+        exp = Experiment.objects.create(
+            name="exp-geo", pipeline=pipelines.PEOPLE_DETECT_FIRST, **experiment_fields)
+        ExperimentDataset.objects.create(
+            experiment=exp, dataset=self.train_ds, role=ExperimentDataset.TRAIN)
+        ExperimentDataset.objects.create(
+            experiment=exp, dataset=self.test_ds, role=ExperimentDataset.TEST)
+        run = TrainingRun.objects.create(experiment=exp, output_dir=str(Path(self._tmp.name) / "out"))
+        RunResult.objects.create(
+            run=run, run_name="00-train_ds-00-yolox", model_arch="yolox",
+            train_dataset_name="train_ds",
+            best_checkpoint=str(Path(self._tmp.name) / "out/0/best.pt"),
+        )
+        with mock.patch.object(autoeval, "_queue"):
+            autoeval.schedule_test_evals(run)
+        from eval_pipelines.models import PipelineEvalRun
+
+        return PipelineEvalRun.objects.get()
+
+    def test_every_pipeline_knob_reaches_the_eval_row(self):
+        pe = self._run_with(
+            detector_expand_ratio=0.3,
+            detector_min_box_size=320.0,
+            merge_nms_iou=0.7,
+            eval_score_threshold=0.4,
+        )
+        self.assertEqual(pe.detector_expand_ratio, 0.3)
+        self.assertEqual(pe.detector_min_box_size, 320.0)
+        self.assertEqual(pe.merge_nms_iou, 0.7)
+        self.assertEqual(pe.score_threshold, 0.4)
+        self.assertEqual(pe.pipeline, "people_detect_first")
+
+    def test_the_min_box_size_floor_is_not_silently_dropped(self):
+        # The Experiment default is 224 while the eval row's is blank ("chachak's
+        # default", i.e. no floor at all), so the two disagree unless it's copied.
+        pe = self._run_with()
+        self.assertEqual(pe.detector_min_box_size, 224.0)
+
+    def test_fixed_pixel_tiling_survives(self):
+        from training import pipelines
+
+        pe = self._run_with(tile_size_px=640, overlap=0.25)
+        self.assertEqual(pe.tile_size_px, 640)
+        self.assertEqual(pe.overlap, 0.25)
+        # Percentage tiling stays unset, so it can't override the pixel size.
+        self.assertIsNone(pe.tile_width_pct)
+        self.assertEqual(pe.pipeline, pipelines.PEOPLE_DETECT_FIRST)
+
+    def test_the_request_yaml_carries_the_trained_geometry(self):
+        # The row is only a means to an end: what the eval actually runs is the
+        # generated chachak request.
+        pe = self._run_with(detector_min_box_size=320.0, merge_nms_iou=0.7)
+        request = config_gen.build_pipeline_request(pe, Path(self._tmp.name) / "o")
+        self.assertEqual(request["detector"]["min_box_size"], 320.0)
+        self.assertEqual(request["merge_nms_iou"], 0.7)
+
+
 class EvalCompareTests(TestCase):
     """The EvalRun analyze/compare action's underlying reshape."""
 

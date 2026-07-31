@@ -104,16 +104,23 @@ def _mjpeg_frames(camera_id, annotated=False):
 class CameraInferenceForm(forms.ModelForm):
     """Inline form for a camera's live-inference config.
 
-    ``artifact_path`` becomes a dropdown of what's actually in the export output
-    directory (same source as the video-inference page), and enabling the config
-    is validated *here* by building the exact ``/predict_image`` payload the
-    worker would build — so a missing checkpoint or an inconsistent pipeline is
-    a form error on save rather than a ``status=error`` row discovered later.
+    ``artifact_path`` and ``bundle_path`` become dropdowns of what's actually in
+    the export output directory and the bundle root (same sources as the
+    video-inference page), and enabling the config is validated *here* by building
+    the exact ``/predict_image`` payload the worker would build — so a missing
+    checkpoint or an inconsistent pipeline is a form error on save rather than a
+    ``status=error`` row discovered later.
 
     ``trained_model`` also carries a ``data-pipeline-defaults`` JSON attribute
     (one entry per offered model) so ``camera_inference_form.js`` can prefill the
     Pipeline section when the operator picks a model — same "serve it the way
     it was trained" behaviour as the video-inference page.
+
+    A bundle is the one source whose pipeline fields the operator does *not*
+    choose: :meth:`clean` re-derives them from the bundle's manifest, discarding
+    whatever was posted, because a bundle ships the geometry its weights were
+    tuned with. The admin renders them locked to say so (see
+    ``training/bundle_sync.js``); this is what makes that true.
     """
 
     class Meta:
@@ -160,6 +167,8 @@ class CameraInferenceForm(forms.ModelForm):
         self.fields["artifact_path"].widget.attrs["data-pipeline-defaults"] = json.dumps(
             artifact_defaults)
 
+        self._add_bundle_field()
+
         trained_field = self.fields.get("trained_model")
         if trained_field is not None:
             trained_models = trained_field.queryset.select_related(
@@ -169,6 +178,72 @@ class CameraInferenceForm(forms.ModelForm):
                 tm.pk: pipeline_meta.for_trained_model(tm) for tm in trained_models
             }
             trained_field.widget.attrs["data-pipeline-defaults"] = json.dumps(defaults)
+
+    def _add_bundle_field(self):
+        """Turn ``bundle_path`` into a dropdown of the bundles on disk.
+
+        Same shape as the ``artifact_path`` field above — including keeping a
+        saved-but-since-moved bundle selectable — but with no
+        ``data-pipeline-defaults`` map: a bundle's geometry is applied by the
+        explicit "Sync bundle" button, which also reports whether the bundle is
+        actually loadable, rather than silently on change. A bundle can arrive
+        from another machine, so "it parses" and "it runs here" are different
+        questions, and the second one is worth asking out loud.
+        """
+        from training.services import bundles
+
+        try:
+            found = bundles.list_bundles()
+        except Exception:  # noqa: BLE001 - a misconfigured root must not break the page
+            found = []
+        current = (self.instance.bundle_path or "").strip()
+        choices = [("", "———")] + [
+            (b["relpath"],
+             f"{b['relpath']} ({b['pipeline'] or 'unknown pipeline'}, {b['kind']}"
+             f"{'' if b['ok'] else ', BROKEN'})")
+            for b in found
+        ]
+        if current and not any(c[0] == current for c in choices):
+            choices.append((current, f"{current} (missing)"))
+        self.fields["bundle_path"] = forms.ChoiceField(
+            choices=choices, required=False,
+            label="Infer bundle",
+            help_text=self.Meta.model._meta.get_field("bundle_path").help_text,
+        )
+        # How bundle_sync.js finds this select from the "Sync bundle" block, which
+        # the admin renders as a separate row rather than around the field.
+        self.fields["bundle_path"].widget.attrs["data-bundle-select"] = "1"
+
+    def _clean_bundle(self, cleaned):
+        """Validate the chosen bundle, and take its geometry over the form's.
+
+        The structural half of :func:`training.services.bundles.validate` only —
+        never the load test. Saving this form must not take the trainer's GPU lock
+        (it would evict whatever model a camera is currently running); proving the
+        artifacts load is what the operator presses "Sync bundle" for, before
+        saving.
+
+        On success the bundle's pipeline fields replace whatever was posted, which
+        is the server-side half of the read-only fields: a stale page, a
+        hand-edited POST or a bundle that changed on disk since the sync all end up
+        running the bundle as it is now, or failing here.
+        """
+        from training.services import bundles
+
+        relpath = (cleaned.get("bundle_path") or "").strip()
+        if not relpath:
+            self.add_error("bundle_path", "Required when the source is a bundle.")
+            return
+
+        result = bundles.validate(relpath)
+        if not result["ok"]:
+            failures = "; ".join(
+                f"{c['label']}: {c['detail']}"
+                for c in result["checks"] if c["status"] == "fail"
+            )
+            self.add_error("bundle_path", f"{relpath} is not usable — {failures}")
+            return
+        cleaned.update(bundles.geometry(result["defaults"]))
 
     def clean(self):
         cleaned = super().clean()
@@ -180,6 +255,8 @@ class CameraInferenceForm(forms.ModelForm):
             self.add_error("trained_model", "Required when the source is a trained model.")
         if model_source == CameraInference.EXPORTED and not (cleaned.get("artifact_path") or "").strip():
             self.add_error("artifact_path", "Required when the source is an exported artifact.")
+        if model_source == CameraInference.BUNDLE:
+            self._clean_bundle(cleaned)
 
         if not cleaned.get("enabled") or self.errors:
             return cleaned
@@ -190,7 +267,8 @@ class CameraInferenceForm(forms.ModelForm):
 
         probe = CameraInference(**{
             f: cleaned.get(f) for f in (
-                "model_source", "trained_model", "artifact_path", "score_threshold",
+                "model_source", "trained_model", "artifact_path", "bundle_path",
+                "score_threshold",
                 "pipeline", "detector_checkpoint", "detector_expand_ratio",
                 "detector_min_box_size", "tile_size_px", "tile_width_pct",
                 "tile_height_pct", "overlap", "merge_nms_iou", "chain",
@@ -212,18 +290,20 @@ class CameraInferenceInline(admin.StackedInline):
     # is not saved, so the add page is unaffected.
     extra = 1
     verbose_name_plural = "Live inference (run a model on this camera's frames)"
-    readonly_fields = ["status_badge", "last_error", "last_inference_at",
-                       "last_latency_ms", "last_box_count"]
+    readonly_fields = ["bundle_tools", "status_badge", "last_error",
+                       "last_inference_at", "last_latency_ms", "last_box_count"]
     fieldsets = [
         (None, {
             "fields": ["enabled", "target_fps",
                        ("model_source", "trained_model", "artifact_path"),
+                       "bundle_path", "bundle_tools",
                        "score_threshold"],
         }),
         ("Pipeline", {
             "classes": ["collapse"],
             "description": "How each frame is presented to the model. Leave as "
-                           "'raw' to feed the whole frame straight in.",
+                           "'raw' to feed the whole frame straight in. A bundle "
+                           "fills these in itself — see “Sync bundle” above.",
             "fields": ["pipeline", "detector_checkpoint", "detector_expand_ratio",
                        "detector_min_box_size", "tile_size_px", "tile_width_pct",
                        "tile_height_pct", "overlap", "merge_nms_iou", "chain"],
@@ -238,11 +318,52 @@ class CameraInferenceInline(admin.StackedInline):
     def status_badge(self, obj):
         return _status_badge(obj.status if obj and obj.pk else "")
 
+    @admin.display(description="Bundle")
+    def bundle_tools(self, obj):
+        """The "Sync bundle" control block, as a read-only field.
+
+        A readonly_field rather than a template override: this is the only custom
+        markup the inline needs, and rendering it here keeps the camera page on
+        the stock admin inline template. The markup is only the *contract*
+        ``training/bundle_sync.js`` looks for — the behaviour is all in that file,
+        shared with the video-inference page.
+
+        ``data-bundle-scope`` is the inline row, not the page: a select named
+        ``inference-0-pipeline`` must be found from within its own row, the same
+        id-suffix scoping the rest of ``camera_inference_form.js`` uses.
+        """
+        from training.services import bundles
+
+        try:
+            root = bundles.bundles_root()
+            count = len(bundles.list_bundles())
+        except Exception as exc:  # noqa: BLE001 - a misconfigured root must not break the page
+            return format_html("Bundle root unreadable: {}", str(exc))
+
+        return format_html(
+            '<div data-bundle-sync="{}" data-bundle-scope=".inline-related">'
+            '  <input type="button" class="button" value="Sync bundle" data-bundle-button>'
+            '  <label style="font-weight:normal;margin-left:10px">'
+            '    <input type="checkbox" data-bundle-load-test checked> '
+            '    load the model on the GPU to prove it runs here'
+            '  </label>'
+            '  <div data-bundle-report style="margin-top:8px;font-family:monospace;'
+            'font-size:11px;line-height:1.6"></div>'
+            '  <p class="help">Reads the selected bundle\'s <code>pipeline.json</code>, '
+            'checks its model / detector / classes, then fills the Pipeline section '
+            'from it and locks it — a bundle ships the geometry its weights were '
+            'tuned with. The load test proves the artifacts load <em>on this '
+            'machine</em>, which is the check a copied TensorRT engine most needs; '
+            'it briefly takes the GPU and evicts the trainer\'s warm model. '
+            '{} bundle(s) under <code>{}</code>.</p>'
+            '</div>',
+            reverse("bundle-sync"), count, str(root),
+        )
+
     class Media:
-        # Shows only the Pipeline-section fields the selected pipeline uses, and
-        # prefills them from the picked model's training config — see the file
-        # for both behaviours.
-        js = ("cameras/camera_inference_form.js",)
+        # bundle_sync.js first: camera_inference_form.js calls into
+        # window.BundleSync (to drop the bundle locks when the source changes).
+        js = ("training/bundle_sync.js", "cameras/camera_inference_form.js")
 
 
 @admin.register(Camera)

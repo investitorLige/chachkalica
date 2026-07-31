@@ -950,6 +950,125 @@ class ExportPipelineMetadataTests(TestCase):
         self.assertEqual(request["pipeline"], pipelines.BATCH_DETECT)
 
 
+class ExportedDetectorCopyTests(TestCase):
+    """A person-crop export carries its detector as a loadable, non-selectable copy.
+
+    Two things have to hold at once: the copy must be complete enough to load
+    (chachak resolves an artifact's ``.meta.json`` by name, so the pair travels
+    together), and it must not show up as a model an operator can pick — it is a
+    single-class person detector, not this export.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.exports_dir = self.root / "exports"
+        self.exports_dir.mkdir()
+        self.detectors = self.root / "detectors"
+        self.detectors.mkdir()
+
+        ts = TrainingSettings.load()
+        ts.exports_root = str(self.exports_dir)
+        ts.save()
+
+        experiment = Experiment.objects.create(
+            name="ppe", pipeline=pipelines.PEOPLE_DETECT_FIRST,
+            detector_checkpoint="", eval_score_threshold=0.4,
+        )
+        run = TrainingRun.objects.create(experiment=experiment)
+        result = RunResult.objects.create(
+            run=run, run_name="r0", model_arch=ExperimentModel.YOLOX,
+            best_checkpoint="/runs/r0/best.pt",
+        )
+        self.model = promote.promote_run_result(result, name="ppe")
+        self.artifact = self.exports_dir / "ppe-best.onnx"
+        self.artifact.write_bytes(b"")
+
+    def _detector(self, name: str, *, meta: bool = True) -> Path:
+        path = self.detectors / name
+        path.write_bytes(b"")
+        if meta:
+            path.with_suffix(".meta.json").write_text('{"arch": "yolox"}')
+        return path
+
+    def _sidecar(self, detector: Path) -> dict:
+        # The experiment leaves detector_checkpoint blank, so the copy is driven by
+        # DEFAULT_PERSON_DETECTOR_CHECKPOINT — patched to the fixture detector.
+        with mock.patch(
+            "training.services.exports.DEFAULT_PERSON_DETECTOR_CHECKPOINT", str(detector)
+        ):
+            return exports.export_pipeline_sidecar(self.model, self.artifact)
+
+    def _pin_detector(self, path: Path) -> None:
+        """Freeze an explicit detector path on the row, as an experiment that set
+        one does — a blank field means "whatever the default is" and stays blank."""
+        meta = dict(self.model.pipeline_metadata)
+        meta["detector_checkpoint"] = str(path)
+        self.model.pipeline_metadata = meta
+        self.model.save(update_fields=["pipeline_metadata"])
+
+    def test_engine_detector_is_copied_with_the_sidecar_its_loader_needs(self):
+        defaults = self._sidecar(self._detector("person.engine"))
+
+        copy = Path(defaults["detector_checkpoint"])
+        self.assertEqual(copy, self.exports_dir / "ppe-best.detector.engine")
+        self.assertTrue(copy.is_file())
+        # trt_infer/onnx_infer resolve the meta as artifact.with_suffix(".meta.json"),
+        # so this exact name is what the copy will be loaded through.
+        self.assertTrue(copy.with_suffix(".meta.json").is_file())
+
+    def test_detector_without_a_sidecar_leaves_the_record_on_the_original(self):
+        # Copying it would replace a path that loads with one that raises.
+        detector = self._detector("person.engine", meta=False)
+        self._pin_detector(detector)
+
+        defaults = exports.export_pipeline_sidecar(self.model, self.artifact)
+
+        self.assertEqual(defaults["detector_checkpoint"], str(detector))
+        self.assertFalse((self.exports_dir / "ppe-best.detector.engine").exists())
+
+    def test_pt_detector_carries_the_onnx_chachak_would_have_preferred(self):
+        detector = self._detector("person.pt", meta=False)
+        self._detector("person.onnx")  # sibling chachak loads instead of the .pt
+
+        copy = Path(self._sidecar(detector)["detector_checkpoint"])
+        self.assertEqual(copy, self.exports_dir / "ppe-best.detector.pt")
+        self.assertTrue(copy.with_suffix(".onnx").is_file())
+        self.assertTrue(copy.with_suffix(".meta.json").is_file())
+
+    def test_missing_detector_leaves_the_record_alone(self):
+        gone = self.detectors / "nope.engine"
+        self._pin_detector(gone)
+
+        defaults = exports.export_pipeline_sidecar(self.model, self.artifact)
+
+        self.assertEqual(defaults["detector_checkpoint"], str(gone))
+        self.assertEqual(list(self.exports_dir.glob("*.detector.*")), [])
+
+    def test_the_copy_is_not_offered_as_an_exported_model(self):
+        self._sidecar(self._detector("person.engine"))
+
+        self.assertEqual(
+            [a["relpath"] for a in exports.list_artifacts()], ["ppe-best.onnx"])
+        with self.assertRaises(ValueError):
+            exports.resolve("ppe-best.detector.engine")
+
+    def test_a_full_frame_export_copies_no_detector(self):
+        raw = TrainedModel.objects.create(
+            name="raw", arch=ExperimentModel.YOLOX, checkpoint_path="/models/best.pt")
+        artifact = self.exports_dir / "raw-best.onnx"
+        artifact.write_bytes(b"")
+        detector = self._detector("person.engine")
+
+        with mock.patch(
+            "training.services.exports.DEFAULT_PERSON_DETECTOR_CHECKPOINT", str(detector)
+        ):
+            exports.export_pipeline_sidecar(raw, artifact)
+
+        self.assertEqual(list(self.exports_dir.glob("*.detector.*")), [])
+
+
 class ModelActionPrefillTests(TestCase):
     """The eval and preview forms prefill from the same frozen record.
 
@@ -1209,6 +1328,63 @@ class ExportJobsTests(TestCase):
         self.assertEqual(run.status, ExportRun.OK)
         self.assertEqual(run.bundle_dir, "")
         self.assertIn("bundle broke", run.bundle_error)
+
+    def test_run_export_onnx_sidecar_failure_does_not_strand_the_row(self):
+        # The artifact is already on disk by this point, so the row must reach a
+        # terminal state carrying the reason — it used to be left RUNNING with an
+        # empty last_error, and nothing reconciles ExportRun.
+        run = self._export_run()
+        with mock.patch(
+            "training.jobs.runner.export_onnx", return_value={"onnx_path": run.output_path},
+        ), mock.patch(
+            "training.jobs.exports.export_pipeline_sidecar",
+            side_effect=OSError("no space left on device"),
+        ), mock.patch(
+            "training.jobs.exports.build_bundle_request", return_value=None,
+        ):
+            jobs.run_export_onnx(run.pk)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, ExportRun.OK)
+        self.assertIn("pipeline sidecar", run.bundle_error)
+        self.assertIn("no space left on device", run.bundle_error)
+        self.assertIsNotNone(run.finished_at)
+
+    def test_run_export_onnx_bundle_request_failure_does_not_strand_the_row(self):
+        # build_bundle_request resolves paths and reads sidecars, so it can raise
+        # for the same environmental reasons the bundle call can; it used to sit
+        # outside _bundle_after_export's guard.
+        run = self._export_run()
+        with mock.patch(
+            "training.jobs.runner.export_onnx", return_value={"onnx_path": run.output_path},
+        ), mock.patch(
+            "training.jobs.exports.export_pipeline_sidecar",
+        ), mock.patch(
+            "training.jobs.exports.build_bundle_request",
+            side_effect=ValueError("detector checkpoint is missing"),
+        ), mock.patch("training.jobs.runner.export_bundle") as export_bundle:
+            jobs.run_export_onnx(run.pk)
+
+        export_bundle.assert_not_called()
+        run.refresh_from_db()
+        self.assertEqual(run.status, ExportRun.OK)
+        self.assertIn("detector checkpoint is missing", run.bundle_error)
+        self.assertIsNotNone(run.finished_at)
+
+    def test_run_export_trt_sidecar_failure_does_not_strand_the_row(self):
+        run = self._export_run(kind=ExportRun.TRT, output_path="/out/export-me-best.engine")
+        with mock.patch(
+            "training.jobs.runner.export_trt", return_value={"engine_path": run.output_path},
+        ), mock.patch(
+            "training.jobs.exports.export_pipeline_sidecar", side_effect=OSError("disk"),
+        ), mock.patch(
+            "training.jobs.exports.build_bundle_request", return_value=None,
+        ):
+            jobs.run_export_trt(run.pk)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, ExportRun.OK)
+        self.assertIn("pipeline sidecar", run.bundle_error)
 
     def test_run_export_onnx_skips_bundle_when_theres_nothing_to_bundle(self):
         run = self._export_run()

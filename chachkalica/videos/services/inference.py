@@ -142,8 +142,9 @@ def draw_boxes(frame, boxes: list[dict]) -> None:
 def build_predict_payload(job) -> dict:
     """The ``/predict_image`` payload for ``job``, minus the per-frame image path.
 
-    Resolves the job's model (trained checkpoint or exported artifact) and its
-    pipeline/detector/tiling knobs into one payload, reused for every frame with
+    Resolves the job's model (trained checkpoint, exported artifact, or the model
+    inside a bundle) and its pipeline/detector/tiling knobs into one payload,
+    reused for every frame with
     only ``image_path`` swapped in. Raises ``RuntimeError`` for an unusable model
     or an inconsistent pipeline configuration.
     """

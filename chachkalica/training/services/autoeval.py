@@ -15,7 +15,7 @@ jobs by dotted path (``training.jobs.run_eval``) so this module need not import
 import django_rq
 
 from training.models import EvalRun, ExperimentDataset
-from training.services import config_gen, promote
+from training.services import config_gen, pipeline_meta, promote
 
 
 def _queue():
@@ -70,6 +70,42 @@ def schedule_test_evals(run) -> list[int]:
     return queued
 
 
+def _pipeline_geometry(trained_model, pipeline: str) -> dict:
+    """:class:`PipelineEvalRun` field values for ``trained_model``'s frozen pipeline.
+
+    Derived from :data:`training.services.pipeline_meta.FIELDS` — the whole
+    vocabulary — rather than a hand-listed subset. The subset is what went wrong
+    here before: this scheduler carried seven of the eleven knobs while the manual
+    admin action carried all of them, so the *automatic* post-training test eval
+    silently ran different geometry than the training YAML (crops with no
+    ``min_box_size`` floor, percentage tiling for a model trained on fixed-pixel
+    tiles). Reading the record keyed on ``FIELDS`` means a knob added there flows
+    in here too, instead of quietly defaulting.
+
+    ``None`` in the record means "chachak's own default"; for the columns that
+    aren't nullable that means the field's default instead (same rule as
+    ``TrainedModelAdmin.evaluate``). ``pipeline`` is taken from the caller, not the
+    record: this path is chosen *because* the experiment has a pipeline, and a
+    frozen blob that disagrees (a model promoted before the field existed falls
+    back to ``pipeline_meta.raw()``) would put an invalid choice on the row.
+    """
+    from eval_pipelines.models import PipelineEvalRun
+
+    meta = pipeline_meta.for_trained_model(trained_model)
+    columns = {f.name: f for f in PipelineEvalRun._meta.concrete_fields}
+    fields = {}
+    for name in pipeline_meta.FIELDS:
+        column = columns.get(name)
+        if column is None:
+            continue  # a knob the eval row doesn't carry; nothing to schedule with
+        value = meta.get(name)
+        if value is None and not column.null:
+            value = column.get_default()
+        fields[name] = value
+    fields["pipeline"] = pipeline
+    return fields
+
+
 def _schedule_pipeline_evals(run, experiment, test_ds) -> list[int]:
     """Enqueue a :class:`PipelineEvalRun` per trained model, using the
     experiment's saved pipeline config, so test results appear in the "Eval
@@ -90,13 +126,7 @@ def _schedule_pipeline_evals(run, experiment, test_ds) -> list[int]:
             label_source=test_ds.label_source,
             annotator=test_ds.annotator,
             explicit_labels_path=test_ds.explicit_labels_path,
-            score_threshold=experiment.eval_score_threshold,
-            pipeline=experiment.pipeline,
-            detector_checkpoint=experiment.detector_checkpoint,
-            tile_width_pct=experiment.tile_width_pct,
-            tile_height_pct=experiment.tile_height_pct,
-            overlap=experiment.overlap,
-            chain=list(experiment.chain or []),
+            **_pipeline_geometry(trained_model, experiment.pipeline),
         )
         try:
             config_gen.write_pipeline_request(pe)

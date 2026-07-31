@@ -1,12 +1,18 @@
-"""Standalone admin pages that aren't tied to a single model.
+"""Standalone admin pages and endpoints that aren't tied to a single model.
 
-Currently just the TRT/ONNX/PT benchmark console: a read-only dark "instrument
-console" rendering the results of ``inferlica/benchmark`` (run in the trainer
-container). Data is NOT computed here -- each sweep drops one JSON file per
-image size into ``data/benchmarks/`` (which is bind-mounted into the web
-container at ``/app/data``), and this view just reads whichever sizes are
-present and hands the selected one to the template. Adding a new image-size run
-is therefore a pure data drop -- no code change and no redeploy.
+Two of them:
+
+- the TRT/ONNX/PT benchmark console: a read-only dark "instrument console"
+  rendering the results of ``inferlica/benchmark`` (run in the trainer
+  container). Data is NOT computed here -- each sweep drops one JSON file per
+  image size into ``data/benchmarks/`` (which is bind-mounted into the web
+  container at ``/app/data``), and this view just reads whichever sizes are
+  present and hands the selected one to the template. Adding a new image-size run
+  is therefore a pure data drop -- no code change and no redeploy.
+- :func:`bundle_sync_view`, the JSON endpoint behind every "Sync bundle" button.
+  It lives here rather than on a ModelAdmin because both inference surfaces (the
+  video "Run model inference..." wizard and the camera live-inference inline) call
+  the same one, and it belongs to neither.
 """
 
 from __future__ import annotations
@@ -16,8 +22,9 @@ from pathlib import Path
 
 from django.conf import settings
 from django.contrib import admin
-from django.http import Http404
+from django.http import Http404, JsonResponse
 from django.template.response import TemplateResponse
+from django.views.decorators.http import require_POST
 
 BENCH_DIR = Path(settings.BASE_DIR) / "data" / "benchmarks"
 
@@ -73,3 +80,35 @@ def benchmark_console_view(request):
         ],
     }
     return TemplateResponse(request, "admin/benchmarks/console.html", context)
+
+
+@require_POST
+def bundle_sync_view(request):
+    """Validate one infer bundle and return the form values it dictates.
+
+    The endpoint behind the "Sync bundle" button on both inference forms. POST
+    ``bundle`` (a path relative to the bundle root) and optionally
+    ``load_test=1``; the response is
+    :func:`training.services.bundles.validate` verbatim —
+    ``{ok, name, defaults, checks}`` — which the page renders as a checklist and
+    applies to its pipeline fields.
+
+    POST-only because the load test is expensive and side-effecting (it takes the
+    trainer's GPU lock and evicts its warm model), which is not something a URL
+    someone pasted should be able to trigger. Wrapped in ``admin_view`` at the
+    URLconf, so it is staff-only like the rest of the admin.
+    """
+    from training.services import bundles
+
+    bundle = (request.POST.get("bundle") or "").strip()
+    if not bundle:
+        return JsonResponse({"error": "No bundle selected."}, status=400)
+    load_test = request.POST.get("load_test") in ("1", "true", "on")
+
+    # bundles.validate never raises for a bad bundle -- it reports. Anything that
+    # escapes it is a bug or a broken trainer, and the button should say so rather
+    # than the fetch failing with an opaque 500.
+    try:
+        return JsonResponse(bundles.validate(bundle, load_test=load_test))
+    except Exception as exc:  # noqa: BLE001 - surfaced in the checklist
+        return JsonResponse({"error": f"{type(exc).__name__}: {exc}"}, status=500)

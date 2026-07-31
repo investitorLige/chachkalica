@@ -53,6 +53,14 @@ class TrainingSettings(models.Model):
                   "data/training/runs) to pick up artifacts exported before this "
                   "setting existed.",
     )
+    bundles_root = models.CharField(
+        max_length=512, default="data/bundles",
+        help_text="Where infer bundles live — the self-contained directories "
+                  "chachak's bundle export writes (pipeline.json + models/ + a "
+                  "vendored runtime). Scanned recursively to offer bundles for "
+                  "video and camera inference, so a bundle copied in from another "
+                  "machine shows up in those dropdowns.",
+    )
     default_device = models.CharField(
         max_length=16,
         choices=[("auto", "auto"), ("cuda", "cuda"), ("cpu", "cpu")],

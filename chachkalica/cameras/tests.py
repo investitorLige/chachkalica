@@ -1,3 +1,4 @@
+from pathlib import Path
 from unittest import mock
 
 from django.contrib.auth import get_user_model
@@ -836,3 +837,222 @@ class InferenceFormTests(TestCase):
         labels = dict(form.fields["artifact_path"].choices)
         self.assertIn("old/gone.engine", labels)
         self.assertIn("missing", labels["old/gone.engine"])
+
+    def test_bundle_choices_come_from_the_bundle_root(self):
+        from cameras.admin import CameraInferenceForm
+
+        found = [{"relpath": "site-a/ppe-bundle", "pipeline": "people_detect_first",
+                  "kind": "TensorRT", "ok": True}]
+        with mock.patch("training.services.bundles.list_bundles", return_value=found):
+            form = CameraInferenceForm()
+        labels = dict(form.fields["bundle_path"].choices)
+        self.assertIn("site-a/ppe-bundle", labels)
+        self.assertIn("people_detect_first", labels["site-a/ppe-bundle"])
+
+    def test_a_broken_bundle_is_offered_but_labelled(self):
+        # It is on disk; refusing to show it would just look like a bug.
+        from cameras.admin import CameraInferenceForm
+
+        found = [{"relpath": "half-copied", "pipeline": "", "kind": "unknown",
+                  "ok": False}]
+        with mock.patch("training.services.bundles.list_bundles", return_value=found):
+            form = CameraInferenceForm()
+        self.assertIn("BROKEN", dict(form.fields["bundle_path"].choices)["half-copied"])
+
+    def test_missing_saved_bundle_stays_selectable(self):
+        from cameras.admin import CameraInferenceForm
+
+        instance = CameraInference(camera=self.camera, bundle_path="old/gone-bundle")
+        with mock.patch("training.services.bundles.list_bundles", return_value=[]):
+            form = CameraInferenceForm(instance=instance)
+        labels = dict(form.fields["bundle_path"].choices)
+        self.assertIn("missing", labels["old/gone-bundle"])
+
+
+class BundleSourceTests(TestCase):
+    """A camera running a bundle: the bundle dictates the pipeline, not the form."""
+
+    def setUp(self):
+        import json
+        import tempfile
+
+        from training.models import TrainingSettings
+        from training.tests_bundles import MANIFEST
+
+        self.camera = Camera.objects.create(name="Lobby", rtsp_url=RTSP_URL)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+
+        self.bundle = root / "ppe-bundle"
+        (self.bundle / "models").mkdir(parents=True)
+        (self.bundle / "pipeline.json").write_text(json.dumps(MANIFEST))
+        (self.bundle / "models/model.engine").write_bytes(b"x")
+        (self.bundle / "models/detector.engine").write_bytes(b"x")
+        (self.bundle / "runtime").mkdir()
+        (self.bundle / "infer.py").write_text("")
+
+        ts = TrainingSettings.load()
+        ts.bundles_root = str(root)
+        ts.save()
+
+    def _form(self, **overrides):
+        from cameras.admin import CameraInferenceForm
+
+        data = {
+            "camera": self.camera.pk,
+            "enabled": "on",
+            "target_fps": "2",
+            "model_source": CameraInference.BUNDLE,
+            "trained_model": "",
+            "artifact_path": "",
+            "bundle_path": "ppe-bundle",
+            "score_threshold": "0.5",
+            # What the locked fields would post if the page were stale, or if
+            # someone edited the POST by hand.
+            "pipeline": CameraInference.RAW,
+            "detector_checkpoint": "/wrong/person.pt",
+            "detector_expand_ratio": "9",
+            "merge_nms_iou": "0.99",
+            "chain": "[]",
+        }
+        data.update(overrides)
+        return CameraInferenceForm(data=data)
+
+    def test_model_checkpoint_is_the_bundled_model(self):
+        config = CameraInference(camera=self.camera,
+                                 model_source=CameraInference.BUNDLE,
+                                 bundle_path="ppe-bundle")
+        self.assertEqual(config.model_checkpoint(),
+                         str(self.bundle / "models/model.engine"))
+
+    def test_bundle_source_without_a_bundle_raises(self):
+        config = CameraInference(camera=self.camera,
+                                 model_source=CameraInference.BUNDLE, bundle_path="")
+        with self.assertRaises(ValueError):
+            config.model_checkpoint()
+
+    def test_bundle_source_requires_a_selection(self):
+        form = self._form(bundle_path="")
+        self.assertFalse(form.is_valid())
+        self.assertIn("bundle_path", form.errors)
+
+    def test_the_manifest_overrides_what_the_form_posted(self):
+        with mock.patch("cameras.services.live_inference.build_predict_payload",
+                        return_value={}):
+            form = self._form()
+            self.assertTrue(form.is_valid(), form.errors)
+
+        self.assertEqual(form.cleaned_data["pipeline"], "people_detect_first")
+        self.assertEqual(form.cleaned_data["detector_expand_ratio"], 0.1)
+        self.assertEqual(form.cleaned_data["detector_min_box_size"], 224.0)
+        self.assertEqual(form.cleaned_data["merge_nms_iou"], 0.3)
+        self.assertEqual(form.cleaned_data["detector_checkpoint"],
+                         str(self.bundle / "models/detector.engine"))
+        # The threshold stays the operator's.
+        self.assertEqual(form.cleaned_data["score_threshold"], 0.5)
+
+    def test_the_geometry_reaches_the_saved_row(self):
+        with mock.patch("cameras.services.live_inference.build_predict_payload",
+                        return_value={}):
+            form = self._form()
+            self.assertTrue(form.is_valid(), form.errors)
+            config = form.save()
+
+        config.refresh_from_db()
+        self.assertEqual(config.pipeline, "people_detect_first")
+        self.assertEqual(config.detector_expand_ratio, 0.1)
+        self.assertEqual(config.merge_nms_iou, 0.3)
+
+    def test_a_broken_bundle_fails_the_form(self):
+        (self.bundle / "models/model.engine").unlink()
+
+        form = self._form()
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("is not usable", str(form.errors["bundle_path"]))
+
+    def test_saving_never_takes_the_gpu(self):
+        # The load test belongs to the "Sync bundle" button; a save that evicted
+        # the trainer's warm model would stall whatever camera is inferring.
+        with mock.patch("training.services.runner.predict_image") as predict, \
+             mock.patch("cameras.services.live_inference.build_predict_payload",
+                        return_value={}):
+            self.assertTrue(self._form().is_valid())
+        self.assertFalse(predict.called)
+
+    def test_the_change_page_renders_the_sync_block(self):
+        # The block is a readonly_field built with format_html, so a broken
+        # placeholder or a bad reverse() would only show up on render.
+        User = get_user_model()
+        User.objects.create_superuser("admin", "a@b.co", "pw")
+        self.client.login(username="admin", password="pw")
+
+        resp = self.client.get(
+            reverse("admin:cameras_camera_change", args=[self.camera.pk]))
+
+        # As markup, not as escaped text — a readonly_field that forgot
+        # format_html would render the whole block as visible HTML source.
+        self.assertContains(resp, '<input type="button" class="button" value="Sync bundle"')
+        self.assertContains(resp, "data-bundle-sync")
+        self.assertContains(resp, "data-bundle-load-test")
+        self.assertContains(resp, reverse("bundle-sync"))
+        # The bundle dropdown, and the script that drives the button.
+        self.assertContains(resp, 'name="inference-0-bundle_path"')
+        self.assertContains(resp, "ppe-bundle")
+        self.assertContains(resp, "training/bundle_sync.js")
+
+    def test_fingerprint_changes_with_the_bundle(self):
+        base = CameraInference(camera=self.camera,
+                               model_source=CameraInference.BUNDLE,
+                               bundle_path="ppe-bundle")
+        other = CameraInference(camera=self.camera,
+                                model_source=CameraInference.BUNDLE,
+                                bundle_path="other-bundle")
+        self.assertNotEqual(base.worker_fingerprint(), other.worker_fingerprint())
+
+
+class BundleSyncEndpointTests(TestCase):
+    """The JSON endpoint behind every "Sync bundle" button."""
+
+    def setUp(self):
+        User = get_user_model()
+        User.objects.create_superuser("admin", "a@b.co", "pw")
+        self.url = reverse("bundle-sync")
+
+    def test_requires_staff(self):
+        resp = self.client.post(self.url, {"bundle": "x"})
+        self.assertEqual(resp.status_code, 302)  # to the admin login
+        self.assertIn("login", resp["Location"])
+
+    def test_rejects_get(self):
+        # The load test is expensive and side-effecting; a pasted URL must not
+        # be able to trigger it.
+        self.client.login(username="admin", password="pw")
+        self.assertEqual(self.client.get(self.url).status_code, 405)
+
+    def test_blank_selection_is_a_400(self):
+        self.client.login(username="admin", password="pw")
+        resp = self.client.post(self.url, {"bundle": ""})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_returns_the_checklist(self):
+        self.client.login(username="admin", password="pw")
+        report = {"ok": True, "name": "ppe", "defaults": {"pipeline": "raw"},
+                  "checks": [{"label": "Manifest", "status": "ok", "detail": "v1"}]}
+        with mock.patch("training.services.bundles.validate",
+                        return_value=report) as validate:
+            resp = self.client.post(self.url, {"bundle": "ppe-bundle"})
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), report)
+        self.assertEqual(validate.call_args.kwargs["load_test"], False)
+
+    def test_load_test_is_opt_in(self):
+        self.client.login(username="admin", password="pw")
+        with mock.patch("training.services.bundles.validate",
+                        return_value={"ok": True, "name": "", "defaults": None,
+                                      "checks": []}) as validate:
+            self.client.post(self.url, {"bundle": "b", "load_test": "1"})
+
+        self.assertTrue(validate.call_args.kwargs["load_test"])

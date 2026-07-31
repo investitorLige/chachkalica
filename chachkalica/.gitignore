@@ -2,6 +2,14 @@
 configs/fleet.local.yaml
 configs/register.yaml
 data/*
+# ...except the bundle drop-box. Everything else under data/ is created by the
+# app at runtime, but this one is a place operators *put* things (scp a bundle
+# in and it shows up in the inference dropdowns), so a fresh clone should arrive
+# with the directory and the README that says so.
+!data/bundles/
+data/bundles/*
+!data/bundles/README.md
+
 # Python
 .venv/
 __pycache__/

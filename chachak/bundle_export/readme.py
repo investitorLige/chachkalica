@@ -8,6 +8,7 @@ has to translate.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict
 
 from .manifest import class_map
@@ -112,6 +113,23 @@ def render_readme(manifest: Dict[str, Any], exported: Dict[str, Dict[str, Any]])
         f"This bundle carries **{fmt}** artifacts; `infer.py` runs them by default.",
         "",
     ]
+    # A role whose artifact couldn't be produced in the bundle's own format (a
+    # prebuilt engine can't be turned back into ONNX) is carried in the format it
+    # exists in — each role loads by its own suffix. Say so, because it changes
+    # where the bundle can run: one `.engine` locks the whole pipeline to that GPU.
+    other_format = sorted(
+        f"`{role}` ({Path(str(path)).suffix.lstrip('.')})"
+        for role, path in role_files.items()
+        if path and not str(path).endswith(f".{fmt}")
+    )
+    if other_format:
+        lines += [
+            "Except " + ", ".join(other_format) + ": that artifact was supplied "
+            "prebuilt and cannot be converted, so this bundle is mixed-format. It runs "
+            "as-is, but anything carrying a `.engine` only runs on the GPU model and "
+            "TensorRT version that engine was built on.",
+            "",
+        ]
     if fmt == "engine":
         lines += [
             "The `.engine` files are TensorRT plans, tied to the exact GPU model and",

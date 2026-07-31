@@ -8,7 +8,7 @@
 from django.contrib import admin
 from django.urls import include, path
 
-from fleetsite.admin_views import benchmark_console_view
+from fleetsite.admin_views import benchmark_console_view, bundle_sync_view
 
 admin.site.site_header = "Chachkalica Fleet"
 admin.site.site_title = "Chachkalica Fleet"
@@ -21,6 +21,13 @@ urlpatterns = [
         "admin/benchmarks/",
         admin.site.admin_view(benchmark_console_view),
         name="benchmark-console",
+    ),
+    # JSON endpoint shared by the "Sync bundle" button on every inference form;
+    # same admin_view auth, same must-precede-admin.site.urls rule as above.
+    path(
+        "admin/bundles/sync/",
+        admin.site.admin_view(bundle_sync_view),
+        name="bundle-sync",
     ),
     path("admin/", admin.site.urls),
     path("django-rq/", include("django_rq.urls")),

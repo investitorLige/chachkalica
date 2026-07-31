@@ -1,4 +1,5 @@
 {% extends "admin/base_site.html" %}
+{% load static %}
 
 {% block content %}
 <p>Run a model frame-by-frame over <strong>{{ video.name }}</strong> and burn the detected
@@ -25,7 +26,48 @@ once it finishes.</p>
   <input type="hidden" name="model_source" value="{{ model_source }}">
   <input type="hidden" name="apply" value="1">
 
-  {% if is_exported %}
+  {% if is_bundle %}
+    <div class="form-row" data-bundle-sync="{{ bundle_sync_url }}">
+      <label for="bundle_path">Infer bundle:</label>
+      <select name="bundle_path" id="bundle_path" data-bundle-select required>
+        <option value="">———</option>
+        {% for b in bundles %}
+          <option value="{{ b.relpath }}"
+                  {% if selected_model == b.relpath %}selected{% endif %}>
+            {{ b.relpath }} — {{ b.pipeline|default:"unknown pipeline" }},
+            {{ b.kind }}, {{ b.size_mb }} MB{% if not b.ok %} (BROKEN){% endif %}
+          </option>
+        {% endfor %}
+      </select>
+      <p>
+        <input type="button" class="button" value="Sync bundle" data-bundle-button>
+        <label style="font-weight:normal;margin-left:10px">
+          <input type="checkbox" data-bundle-load-test checked>
+          load the model on the GPU to prove it runs here
+        </label>
+      </p>
+      <div data-bundle-report
+           style="margin-top:8px;font-family:monospace;font-size:11px;line-height:1.6"></div>
+      <p class="help">
+        {% if bundles %}
+          Bundle directories under <code>{{ bundles_root }}</code>, newest first. Pick one and
+          press <strong>Sync bundle</strong>: it reads the bundle's
+          <code>pipeline.json</code>, checks its model / detector / classes, then fills the
+          pipeline fields below from it and locks them — a bundle ships the geometry its
+          weights were tuned with, and those values are re-read from it when the job is
+          submitted. The load test additionally proves the artifacts load <em>on this
+          machine</em>, which is the check a TensorRT engine copied from another machine most
+          needs; it briefly takes the GPU and evicts the trainer's warm model.
+        {% else %}
+          No bundles under <code>{{ bundles_root }}</code>. Export a model (Models →
+          &ldquo;Export best + last to ONNX/TensorRT…&rdquo;) — each export writes a
+          <code>…-bundle/</code> beside its artifact — or copy a bundle directory in from
+          another machine, or point <em>bundles_root</em> in Training settings at where yours
+          live.
+        {% endif %}
+      </p>
+    </div>
+  {% elif is_exported %}
     <div class="form-row">
       <label for="artifact_path">Exported model:</label>
       <select name="artifact_path" id="artifact_path" required>
@@ -175,6 +217,16 @@ once it finishes.</p>
   </div>
 </form>
 
+{# Drives the "Sync bundle" button above; shared with the camera live-inference
+   inline. Loaded before the inline script below, which does not depend on it. #}
+<script src="{% static 'training/bundle_sync.js' %}"></script>
+
+{# json_script, not a raw dump into the <script> below: these maps are keyed by
+   artifact filename / model pk and carry operator-set paths, and json.dumps escapes
+   JSON syntax but not HTML — a "</script>" in any value would end the script early.
+   Only one of the two is populated on a given render (see is_exported in the view). #}
+{{ trained_defaults|json_script:"trained-defaults" }}
+{{ artifact_defaults|json_script:"artifact-defaults" }}
 <script>
   // Two behaviours: (1) show only the rows the selected pipeline uses — rows opt in
   // via data-pipelines, same convention as the model-preview page; (2) when a
@@ -225,9 +277,14 @@ once it finishes.</p>
     // models carry it frozen on the row, exported artifacts in the ".pipeline.json"
     // sidecar written beside them. Only one of the two selects exists on a given
     // render of this page (see is_exported in the view).
+    function defaultsMap(id) {
+      var node = document.getElementById(id);
+      return node ? JSON.parse(node.textContent) : {};
+    }
+
     var modelSel = document.getElementById("trained_model");
     if (modelSel) {
-      var trainedDefaults = {{ trained_defaults|safe }};
+      var trainedDefaults = defaultsMap("trained-defaults");
       modelSel.addEventListener("change", function () {
         applyDefaults(trainedDefaults[modelSel.value]);
       });
@@ -235,7 +292,7 @@ once it finishes.</p>
 
     var artifactSel = document.getElementById("artifact_path");
     if (artifactSel) {
-      var artifactDefaults = {{ artifact_defaults|safe }};
+      var artifactDefaults = defaultsMap("artifact-defaults");
       artifactSel.addEventListener("change", function () {
         applyDefaults(artifactDefaults[artifactSel.value]);
       });

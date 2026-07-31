@@ -8,7 +8,6 @@ A "Play selected video…" action (and per-row ▶ play link) opens an HTML5 pla
 backed by a Range-aware streaming endpoint so seeking works.
 """
 
-import json
 import re
 from pathlib import Path
 
@@ -25,7 +24,7 @@ from django.utils.html import format_html
 from fleet.admin import _status_badge as _job_status_badge
 from training import pipelines
 from training.models import TrainedModel
-from training.services import exports, pipeline_meta
+from training.services import bundles, exports, pipeline_meta
 from videos import jobs
 from videos.models import FrameExtractionJob, InferenceJob, Video
 from videos.services import downloader, frame_extraction, inference
@@ -391,12 +390,19 @@ class VideoAdmin(admin.ModelAdmin):
         """Two-step "Run model inference…": pick where the model comes from, then
         configure that model plus the pipeline the frames go through.
 
-        Step 1 only asks trained-catalogue vs exported-artifact; step 2 is rendered
-        for the chosen source, so the model selector is either the ``TrainedModel``
-        list or a scan of the export output directory (there is no DB row for an
-        exported ``.onnx``/``.engine``). Both land on the same submit, which
-        pre-flights the resulting ``/predict_image`` payload before enqueuing so a
-        missing detector/artifact is reported here rather than as a failed job.
+        Step 1 asks trained-catalogue vs exported-artifact vs infer bundle; step 2
+        is rendered for the chosen source, so the model selector is the
+        ``TrainedModel`` list, a scan of the export output directory, or a scan of
+        the bundle root (neither an exported ``.onnx``/``.engine`` nor a bundle has
+        a DB row). All three land on the same submit, which pre-flights the
+        resulting ``/predict_image`` payload before enqueuing so a missing
+        detector/artifact is reported here rather than as a failed job.
+
+        The bundle source differs in one way, deliberately: its pipeline fields are
+        filled and locked by the "Sync bundle" button rather than being the
+        operator's to set, and are re-derived from the manifest on submit (see
+        ``training.services.bundles``). A bundle carries the geometry its weights
+        were tuned with, so the bundle is the record of what runs.
         """
         if queryset.count() != 1:
             self.message_user(request, "Select exactly one video to run inference on.",
@@ -418,7 +424,7 @@ class VideoAdmin(admin.ModelAdmin):
 
         # ------------------------------------------------- step 1: model source
         model_source = request.POST.get("model_source") or ""
-        if model_source not in (InferenceJob.TRAINED, InferenceJob.EXPORTED):
+        if model_source not in dict(InferenceJob.MODEL_SOURCE_CHOICES):
             if request.POST.get("configure") or request.POST.get("apply"):
                 self.message_user(request, "Choose which kind of model to run.",
                                   level=messages.WARNING)
@@ -429,6 +435,8 @@ class VideoAdmin(admin.ModelAdmin):
                 "default_model_source": InferenceJob.TRAINED,
                 "artifact_count": len(exports.list_artifacts()),
                 "exports_root": str(exports.exports_root()),
+                "bundle_count": len(bundles.list_bundles()),
+                "bundles_root": str(bundles.bundles_root()),
             })
 
         # ------------------------------------------------------- step 2: submit
@@ -455,6 +463,8 @@ class VideoAdmin(admin.ModelAdmin):
         # client-side from the maps below.
         artifacts = exports.list_artifacts()
         is_exported = model_source == InferenceJob.EXPORTED
+        is_bundle = model_source == InferenceJob.BUNDLE
+        bundle_list = bundles.list_bundles() if is_bundle else []
         trained_models = list(
             TrainedModel.objects
             .select_related("source_run_result__run__experiment")
@@ -472,7 +482,15 @@ class VideoAdmin(admin.ModelAdmin):
             for d in [exports.read_pipeline_defaults(a["relpath"])] if d
         }
 
-        if is_exported:
+        if is_bundle:
+            # No preselection and no prefill: a bundle's geometry arrives via the
+            # explicit "Sync bundle" press, which is also the only thing that
+            # reports whether the bundle loads here (bundles.validate). Landing on
+            # a preselected bundle with its fields already filled would imply that
+            # check had happened.
+            selected = request.POST.get("bundle_path") or ""
+            defaults = pipeline_meta.raw()
+        elif is_exported:
             selected = request.POST.get("artifact_path") or (
                 artifacts[0]["relpath"] if artifacts else "")
             defaults = artifact_defaults.get(selected) or pipeline_meta.raw()
@@ -486,10 +504,19 @@ class VideoAdmin(admin.ModelAdmin):
             "title": f"Run model inference — {video.name}",
             "model_source": model_source,
             "is_exported": is_exported,
+            "is_bundle": is_bundle,
             "trained_models": trained_models,
-            "trained_defaults": json.dumps(trained_defaults),
+            # Passed as dicts, not pre-serialized: the template renders them with
+            # ``json_script``, which escapes the HTML-significant characters
+            # ``json.dumps`` does not. Model names, artifact filenames and detector
+            # paths all reach these maps, and a ``</script>`` in any of them would
+            # otherwise close the script element early.
+            "trained_defaults": trained_defaults,
             "artifacts": artifacts,
-            "artifact_defaults": json.dumps(artifact_defaults),
+            "artifact_defaults": artifact_defaults,
+            "bundles": bundle_list,
+            "bundles_root": str(bundles.bundles_root()) if is_bundle else "",
+            "bundle_sync_url": reverse("bundle-sync"),
             "selected_model": selected,
             "values": _form_values(defaults, request.POST),
             "default_score_threshold": _DEFAULT_SCORE_THRESHOLD,
@@ -514,10 +541,25 @@ class VideoAdmin(admin.ModelAdmin):
         """
         trained_model = None
         artifact_path = ""
+        bundle_path = ""
         if model_source == InferenceJob.EXPORTED:
             artifact_path = (request.POST.get("artifact_path") or "").strip()
             if not artifact_path:
                 return None, "Choose an exported artifact."
+        elif model_source == InferenceJob.BUNDLE:
+            bundle_path = (request.POST.get("bundle_path") or "").strip()
+            if not bundle_path:
+                return None, "Choose a bundle."
+            # Structural checks only — the load test belongs to the "Sync bundle"
+            # button, where the operator asked for it; submitting a job must not
+            # take the trainer's GPU lock.
+            result = bundles.validate(bundle_path)
+            if not result["ok"]:
+                failures = "; ".join(
+                    f"{c['label']}: {c['detail']}"
+                    for c in result["checks"] if c["status"] == "fail"
+                )
+                return None, f"{bundle_path} is not usable — {failures}"
         else:
             trained_model = TrainedModel.objects.filter(
                 pk=request.POST.get("trained_model") or None
@@ -597,6 +639,7 @@ class VideoAdmin(admin.ModelAdmin):
             model_source=model_source,
             trained_model=trained_model,
             artifact_path=artifact_path,
+            bundle_path=bundle_path,
             score_threshold=score_threshold,
             frame_stride=frame_stride,
             pipeline=pipeline,
@@ -606,6 +649,16 @@ class VideoAdmin(admin.ModelAdmin):
             output_filename=inference.unique_output_filename(video.name),
             **numbers,
         )
+
+        # A bundle's geometry is the bundle's, not the form's: whatever was posted
+        # for the pipeline fields is replaced by the manifest's own values. This is
+        # the server-side half of the locked fields on the form — a stale page or a
+        # bundle that changed on disk since the sync still runs what the bundle
+        # says today.
+        try:
+            job.sync_bundle()
+        except ValueError as exc:
+            return None, str(exc)
 
         # Pre-flight the exact payload the job will send, so a missing artifact,
         # an out-of-root path, or a detector-less person pipeline fails here.
@@ -749,7 +802,8 @@ class InferenceJobAdmin(admin.ModelAdmin):
     list_display = ["video", "model_display", "pipeline", "status_badge",
                      "frames_processed", "play_link", "created_at"]
     list_filter = ["status", "model_source", "pipeline", "trained_model"]
-    search_fields = ["video__name", "trained_model__name", "artifact_path"]
+    search_fields = ["video__name", "trained_model__name", "artifact_path",
+                     "bundle_path"]
     readonly_fields = [f.name for f in InferenceJob._meta.fields]
     ordering = ["-created_at"]
 
@@ -783,10 +837,13 @@ class InferenceJobAdmin(admin.ModelAdmin):
 
     @admin.display(description="model")
     def model_display(self, obj):
-        """The trained model's name, or the exported artifact's path."""
+        """The trained model's name, or the exported artifact's / bundle's path."""
         if obj.model_source == InferenceJob.EXPORTED:
             return format_html('<span title="exported artifact">{}</span>',
                                obj.artifact_path or "—")
+        if obj.model_source == InferenceJob.BUNDLE:
+            return format_html('<span title="infer bundle">{}</span>',
+                               obj.bundle_path or "—")
         if not obj.trained_model_id:
             return "—"
         url = reverse("admin:training_trainedmodel_change", args=[obj.trained_model_id])

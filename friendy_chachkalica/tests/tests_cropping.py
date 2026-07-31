@@ -146,6 +146,64 @@ class CropBatchTests(unittest.TestCase):
         self.assertEqual(targets, [])
 
 
+class UpscaledCropTargetTests(unittest.TestCase):
+    """An upscaled crop's boxes must be in the *tensor's* pixel space.
+
+    A crop under ``min_box_size`` whose frame is smaller than the floor is
+    bilinearly upscaled, while ``crop_regions`` keeps reporting the region's size in
+    frame pixels (deliberately — that's the geometry remapping uses). The training
+    targets have to follow the tensor: torchvision archs read box coordinates as
+    pixels of the image they're handed, so pre-upscale boxes land in the top-left
+    corner at 1/scale of their real size.
+    """
+
+    def test_boxes_follow_the_upscale(self):
+        img = torch.zeros(3, 100, 100)
+        det = _StubDetector([[_person_pred([0, 0, 100, 100], 100, 100)]])
+        pipeline = _people_pipeline(det, min_box_size=200.0)
+
+        images, targets = crop_batch(
+            [img], [_target([[10, 10, 50, 50]], [1])], pipeline)
+
+        # The whole frame is the region (100x100), upscaled 2x to clear the floor.
+        self.assertEqual(tuple(images[0].shape), (3, 200, 200))
+        self.assertTrue(torch.equal(
+            targets[0]["boxes"], torch.tensor([[20.0, 20.0, 100.0, 100.0]])))
+        self.assertTrue(torch.equal(targets[0]["orig_size"], torch.tensor([200, 200])))
+        # area is rebuilt in the same space, not left at the pre-upscale value.
+        self.assertEqual(float(targets[0]["area"][0]), 80.0 * 80.0)
+
+    def test_normalized_coords_are_unchanged_by_the_rescale(self):
+        # What crop_cache writes (YOLO labels normalized by orig_size) and what the
+        # pipeline remaps back onto the frame are both normalized, so this fix must
+        # leave them exactly where they were.
+        img = torch.zeros(3, 100, 100)
+        det = _StubDetector([[_person_pred([0, 0, 100, 100], 100, 100)]])
+
+        plain = crop_batch([img], [_target([[10, 10, 50, 50]], [1])],
+                           _people_pipeline(det, min_box_size=0.0))[1][0]
+        upscaled = crop_batch([img], [_target([[10, 10, 50, 50]], [1])],
+                              _people_pipeline(det, min_box_size=200.0))[1][0]
+
+        def normalized(target):
+            h, w = target["orig_size"].tolist()
+            box = target["boxes"][0]
+            return [round(float(v), 6) for v in
+                    (box[0] / w, box[1] / h, box[2] / w, box[3] / h)]
+
+        self.assertEqual(normalized(plain), normalized(upscaled))
+
+    def test_a_crop_that_was_not_upscaled_is_untouched(self):
+        img = torch.zeros(3, 100, 100)
+        det = _StubDetector([[_person_pred([50, 50, 100, 100], 100, 100)]])
+        _, targets = crop_batch(
+            [img], [_target([[60, 60, 90, 90]], [1])], _people_pipeline(det))
+
+        self.assertTrue(torch.equal(
+            targets[0]["boxes"], torch.tensor([[10.0, 10.0, 40.0, 40.0]])))
+        self.assertTrue(torch.equal(targets[0]["orig_size"], torch.tensor([50, 50])))
+
+
 class _StubModelAdapter:
     """Predicts one centered box per crop, normalized to that crop."""
 

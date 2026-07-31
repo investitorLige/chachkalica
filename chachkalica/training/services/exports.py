@@ -18,6 +18,7 @@ Every export also carries the pipeline it must be served with, so an ``.onnx`` o
 """
 
 import json
+import logging
 import shutil
 from pathlib import Path
 
@@ -25,15 +26,32 @@ from training import pipelines
 from training.models import DEFAULT_PERSON_DETECTOR_CHECKPOINT, TrainingSettings
 from training.services import config_gen
 
+logger = logging.getLogger(__name__)
+
 # Sidecar carrying the chachak pipeline config a trained model's export was
 # produced from — see :func:`pipeline_defaults_for` / :func:`write_pipeline_sidecar`.
 PIPELINE_SIDECAR_SUFFIX = ".pipeline.json"
+
+# Sidecar an ``.onnx``/``.engine`` carries its input geometry, normalization and
+# class map in. Its name is derived from the artifact's, not recorded anywhere:
+# both loaders resolve it as ``artifact.with_suffix(".meta.json")``
+# (``onnx_infer/adapter.py``, ``trt_infer/adapter.py``) and open it directly, so an
+# artifact without it cannot be loaded at all — which is why it has to travel with
+# every copy made here (see :func:`_copy_artifact_set`).
+META_SIDECAR_SUFFIX = ".meta.json"
 
 # Suffixes chachak's ``load_checkpoint_adapter`` can load directly as a complete
 # inference artifact (ONNX via onnxruntime, .engine via TensorRT).
 ARTIFACT_SUFFIXES = (".onnx", ".engine")
 
 _KIND_LABELS = {".onnx": "ONNX", ".engine": "TensorRT"}
+
+# Person-detector copies :func:`export_pipeline_sidecar` leaves beside an export are
+# named ``<artifact stem>.detector<suffix>``. By suffix they are indistinguishable
+# from an exported model, but they are a *dependency* of the artifact next to them,
+# addressed only through that artifact's ``.pipeline.json`` — so neither the scan
+# nor the resolver may offer one as a model (see :func:`_is_detector_copy`).
+DETECTOR_COPY_MARKER = ".detector"
 
 
 def exports_root(ts: TrainingSettings | None = None) -> Path:
@@ -42,12 +60,27 @@ def exports_root(ts: TrainingSettings | None = None) -> Path:
     return config_gen._resolve(ts.exports_root)
 
 
+def _is_detector_copy(path: Path) -> bool:
+    """Is this one of the person-detector copies left beside an export?
+
+    Keyed on the ``.detector`` marker :func:`export_pipeline_sidecar` puts in the
+    name (``m-best.detector.engine`` -> stem ``m-best.detector``), since the
+    filesystem is the only record these files have.
+    """
+    return Path(path.stem).suffix == DETECTOR_COPY_MARKER
+
+
 def list_artifacts(ts: TrainingSettings | None = None) -> list[dict]:
     """Exported artifacts under :func:`exports_root`, newest first.
 
     Recursive, since operators commonly export one subdirectory per model. Each
     entry is ``{relpath, name, kind, size_mb, absolute}``; ``relpath`` is the
     form value and ``kind`` is the human label ("ONNX" / "TensorRT").
+
+    Person-detector copies are skipped: they carry a model suffix but are a
+    dependency of the export beside them, and offering one as a selectable model
+    means running a single-class person detector where the operator picked their
+    own model (see :func:`_is_detector_copy`).
     """
     root = exports_root(ts)
     if not root.is_dir():
@@ -56,6 +89,8 @@ def list_artifacts(ts: TrainingSettings | None = None) -> list[dict]:
     entries = []
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in ARTIFACT_SUFFIXES:
+            continue
+        if _is_detector_copy(path):
             continue
         relpath = path.relative_to(root).as_posix()
         entries.append({
@@ -74,7 +109,10 @@ def resolve(relpath: str, ts: TrainingSettings | None = None) -> Path:
     """Absolute path for an artifact addressed relative to :func:`exports_root`.
 
     Raises ``ValueError`` for a blank value, a path that escapes the root, a
-    non-file, or a suffix chachak cannot load.
+    non-file, a suffix chachak cannot load, or a person-detector copy. The last
+    one is what :func:`list_artifacts` already leaves out of the dropdowns;
+    refusing it here too makes that an invariant of the addressing scheme rather
+    than a filter one code path happens to apply.
     """
     relpath = (relpath or "").strip()
     if not relpath:
@@ -93,6 +131,12 @@ def resolve(relpath: str, ts: TrainingSettings | None = None) -> Path:
             f"{relpath!r} is not an exported artifact "
             f"({' / '.join(ARTIFACT_SUFFIXES)})."
         )
+    if _is_detector_copy(candidate):
+        raise ValueError(
+            f"{relpath!r} is the person detector belonging to the export beside it, "
+            f"not a model of its own. Select that export instead — it already runs "
+            f"this detector as part of its pipeline."
+        )
     if not candidate.is_file():
         raise ValueError(f"Exported artifact not found: {candidate}")
     return candidate
@@ -103,6 +147,64 @@ def _needs_detector(pipeline: str, chain: list) -> bool:
         pipeline == pipelines.CHAIN
         and any(c in pipelines.DETECTOR_PIPELINES for c in (chain or []))
     )
+
+
+def _copy_artifact_set(source: Path, dest: Path) -> None:
+    """Copy one inference artifact *and* the ``.meta.json`` its loader resolves by name.
+
+    An ``.onnx``/``.engine`` is a pair, not a file (see ``META_SIDECAR_SUFFIX``):
+    copying only the graph produces something that looks complete and raises
+    ``FileNotFoundError`` on a path nobody wrote the moment it is loaded.
+    """
+    shutil.copy2(source, dest)
+    meta = source.with_suffix(META_SIDECAR_SUFFIX)
+    if meta.is_file():
+        shutil.copy2(meta, dest.with_suffix(META_SIDECAR_SUFFIX))
+
+
+def _copy_detector_beside(detector_path: Path, artifact_path: Path) -> Path | None:
+    """Copy a person-detector checkpoint next to ``artifact_path``; return the copy.
+
+    Returns ``None`` — meaning "keep pointing at ``detector_path``" — when the
+    source is missing, or when it is an ``.onnx``/``.engine`` with no
+    ``.meta.json`` beside it. That second case can't be made into a loadable
+    copy, and a record pointing at the original is strictly better than one
+    pointing at a copy that raises: the original at least loads wherever this
+    export was produced.
+    """
+    if not detector_path.is_file():
+        return None
+
+    if (
+        detector_path.suffix.lower() in ARTIFACT_SUFFIXES
+        and not detector_path.with_suffix(META_SIDECAR_SUFFIX).is_file()
+    ):
+        logger.warning(
+            "Person detector %s has no %s sidecar, so it cannot be copied next to "
+            "%s as a loadable artifact; the exported pipeline metadata keeps "
+            "pointing at the original path.",
+            detector_path, META_SIDECAR_SUFFIX, artifact_path.name,
+        )
+        return None
+
+    dest = artifact_path.with_suffix(f"{DETECTOR_COPY_MARKER}{detector_path.suffix}")
+    _copy_artifact_set(detector_path, dest)
+
+    # chachak prefers an ONNX artifact exported beside a .pt over the checkpoint
+    # itself (chachak/infer.py's load_checkpoint_adapter looks for
+    # `checkpoint.with_suffix(".onnx")`), so a lone .pt copy would silently switch
+    # the detector onto the torch path — needing the training arch packages
+    # installed wherever this runs. Carrying the sibling keeps the same preference
+    # resolvable from the copy: `m-best.detector.pt` -> `m-best.detector.onnx`.
+    sibling = detector_path.with_suffix(".onnx")
+    if (
+        detector_path.suffix.lower() not in ARTIFACT_SUFFIXES
+        and sibling.is_file()
+        and sibling.with_suffix(META_SIDECAR_SUFFIX).is_file()
+    ):
+        _copy_artifact_set(sibling, dest.with_suffix(".onnx"))
+
+    return dest
 
 
 def export_pipeline_sidecar(trained_model, artifact_path: Path) -> dict:
@@ -117,11 +219,13 @@ def export_pipeline_sidecar(trained_model, artifact_path: Path) -> dict:
     before this existed, and sends the operator back to filling the form by hand.
 
     Also copies the person-detector checkpoint the pipeline needs (if any) next
-    to ``artifact_path`` and points the metadata at the copy, so the detector
-    travels with the export instead of depending on a path that may not exist
-    wherever this artifact eventually runs — see
-    ``cameras.services.live_inference`` / ``videos.services.inference``, which
-    both just need a checkpoint path, trained or exported alike.
+    to ``artifact_path`` — as a whole artifact set, sidecar included — and points
+    the metadata at the copy, so the detector travels with the export instead of
+    depending on a path that may not exist wherever this artifact eventually runs
+    — see ``cameras.services.live_inference`` / ``videos.services.inference``,
+    which both just need a checkpoint path, trained or exported alike. The
+    metadata is only repointed when a loadable copy was actually made
+    (:func:`_copy_detector_beside`).
     """
     from training.services import pipeline_meta
 
@@ -131,11 +235,9 @@ def export_pipeline_sidecar(trained_model, artifact_path: Path) -> dict:
         from videos.services.frame_extraction import _resolve_checkpoint
 
         checkpoint = defaults["detector_checkpoint"] or DEFAULT_PERSON_DETECTOR_CHECKPOINT
-        detector_path = _resolve_checkpoint(checkpoint)
-        if detector_path.is_file():
-            dest = artifact_path.with_suffix(f".detector{detector_path.suffix}")
-            shutil.copy2(detector_path, dest)
-            defaults["detector_checkpoint"] = str(dest)
+        copied = _copy_detector_beside(_resolve_checkpoint(checkpoint), artifact_path)
+        if copied is not None:
+            defaults["detector_checkpoint"] = str(copied)
 
     sidecar = artifact_path.with_suffix(PIPELINE_SIDECAR_SUFFIX)
     sidecar.write_text(json.dumps(defaults, indent=2))
@@ -148,7 +250,7 @@ def _classes_from_meta(artifact_path: Path) -> list[str] | None:
     Fallback for :func:`build_bundle_request` when the catalogued
     :class:`~training.models.TrainedModel` has no ``classes`` of its own.
     """
-    meta_path = artifact_path.with_suffix(".meta.json")
+    meta_path = artifact_path.with_suffix(META_SIDECAR_SUFFIX)
     try:
         class_map = json.loads(meta_path.read_text()).get("class_map") or {}
     except (OSError, ValueError):

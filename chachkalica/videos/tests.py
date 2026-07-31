@@ -1,3 +1,4 @@
+import json
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -214,6 +215,38 @@ class InferencePayloadTests(VideosBase):
             model_source=InferenceJob.EXPORTED, artifact_path="m-best.engine"))
         self.assertEqual(payload["model_checkpoint"], str(artifact.resolve()))
 
+    def test_bundle_job_sends_the_bundled_model_and_detector(self):
+        """The end of the road: a bundle-sourced job runs the bundle's own files.
+
+        Neither service needed changing for this — both build their payload from
+        ``model_checkpoint()`` plus the row's own fields, and a bundle fills both
+        in. This asserts that stays true.
+        """
+        from training.tests_bundles import MANIFEST
+
+        root = self.root / "bundles"
+        bundle = root / "ppe-bundle"
+        (bundle / "models").mkdir(parents=True)
+        (bundle / "pipeline.json").write_text(json.dumps(MANIFEST))
+        (bundle / "models/model.engine").write_bytes(b"x")
+        (bundle / "models/detector.engine").write_bytes(b"x")
+        ts = TrainingSettings.load()
+        ts.bundles_root = str(root)
+        ts.save()
+
+        job = self._job(model_source=InferenceJob.BUNDLE, bundle_path="ppe-bundle")
+        job.sync_bundle()
+
+        payload = inference.build_predict_payload(job)
+
+        self.assertEqual(payload["model_checkpoint"], str(bundle / "models/model.engine"))
+        self.assertEqual(payload["detector_checkpoint"],
+                         str(bundle / "models/detector.engine"))
+        self.assertEqual(payload["pipeline"], "people_detect_first")
+        self.assertEqual(payload["detector_expand_ratio"], 0.1)
+        self.assertEqual(payload["detector_min_box_size"], 224.0)
+        self.assertEqual(payload["merge_nms_iou"], 0.3)
+
     def test_pipeline_knobs_are_forwarded(self):
         detector = self.root / "person.engine"
         detector.write_bytes(b"x")
@@ -369,6 +402,98 @@ class RunInferenceActionTests(VideosBase):
         # Re-renders step 2 rather than bouncing back to the model-type page.
         self.assertContains(resp, 'name="pipeline"')
 
+    # ------------------------------------------------------------- bundles
+    def _bundle(self, name="ppe-bundle"):
+        """A complete bundle under a bundle root pointed at by TrainingSettings."""
+        from training.tests_bundles import MANIFEST
+
+        root = self.root / "bundles"
+        bundle = root / name
+        (bundle / "models").mkdir(parents=True)
+        (bundle / "pipeline.json").write_text(json.dumps(MANIFEST))
+        (bundle / "models/model.engine").write_bytes(b"x")
+        (bundle / "models/detector.engine").write_bytes(b"x")
+        (bundle / "runtime").mkdir()
+        (bundle / "infer.py").write_text("")
+        ts = TrainingSettings.load()
+        ts.bundles_root = str(root)
+        ts.save()
+        return bundle
+
+    def test_step_one_offers_bundles(self):
+        self._bundle()
+        resp = self._post()
+        self.assertContains(resp, "infer bundle")
+        self.assertContains(resp, "1 found")
+
+    def test_step_two_bundle_renders_the_bundle_select(self):
+        self._bundle()
+        resp = self._post(configure="1", model_source=InferenceJob.BUNDLE)
+        self.assertContains(resp, 'name="bundle_path"')
+        self.assertContains(resp, "ppe-bundle")
+        self.assertContains(resp, "Sync bundle")
+        # Nothing preselected: the geometry arrives via an explicit sync, and a
+        # preselected bundle with filled-in fields would imply that happened.
+        self.assertContains(resp, 'value="">———')
+
+    @mock.patch("videos.admin._queue")
+    def test_apply_bundle_takes_its_geometry_from_the_manifest(self, queue):
+        bundle = self._bundle()
+        self._post(
+            apply="1", model_source=InferenceJob.BUNDLE, bundle_path="ppe-bundle",
+            # What a stale page or a hand-edited POST might send for the locked
+            # fields — the bundle's own values must win.
+            pipeline="raw", detector_expand_ratio="9", merge_nms_iou="0.99",
+            detector_checkpoint="/wrong/person.pt",
+            score_threshold="0.5", frame_stride="2",
+        )
+        job = InferenceJob.objects.get()
+        self.assertEqual(job.model_source, InferenceJob.BUNDLE)
+        self.assertEqual(job.bundle_path, "ppe-bundle")
+        self.assertEqual(job.pipeline, "people_detect_first")
+        self.assertEqual(job.detector_expand_ratio, 0.1)
+        self.assertEqual(job.detector_min_box_size, 224.0)
+        self.assertEqual(job.merge_nms_iou, 0.3)
+        self.assertEqual(job.detector_checkpoint,
+                         str(bundle / "models/detector.engine"))
+        # The one knob the operator keeps.
+        self.assertEqual(job.score_threshold, 0.5)
+        self.assertEqual(job.frame_stride, 2)
+        self.assertEqual(job.model_checkpoint(), str(bundle / "models/model.engine"))
+        queue.return_value.enqueue.assert_called_once()
+
+    @mock.patch("videos.admin._queue")
+    def test_apply_rejects_a_bundle_missing_its_model(self, queue):
+        bundle = self._bundle()
+        (bundle / "models/model.engine").unlink()
+        resp = self._post(
+            apply="1", model_source=InferenceJob.BUNDLE, bundle_path="ppe-bundle",
+            pipeline="raw", score_threshold="0.5", frame_stride="1",
+        )
+        self.assertFalse(InferenceJob.objects.exists())
+        queue.return_value.enqueue.assert_not_called()
+        self.assertContains(resp, "is not usable")
+
+    @mock.patch("videos.admin._queue")
+    def test_apply_rejects_an_out_of_root_bundle(self, queue):
+        self._bundle()
+        resp = self._post(
+            apply="1", model_source=InferenceJob.BUNDLE, bundle_path="../../etc",
+            pipeline="raw", score_threshold="0.5", frame_stride="1",
+        )
+        self.assertFalse(InferenceJob.objects.exists())
+        self.assertContains(resp, "outside the bundle directory")
+
+    @mock.patch("videos.admin._queue")
+    def test_apply_bundle_without_a_selection_asks_for_one(self, queue):
+        self._bundle()
+        resp = self._post(
+            apply="1", model_source=InferenceJob.BUNDLE, bundle_path="",
+            pipeline="raw", score_threshold="0.5", frame_stride="1",
+        )
+        self.assertFalse(InferenceJob.objects.exists())
+        self.assertContains(resp, "Choose a bundle")
+
     @mock.patch("videos.admin._queue")
     def test_apply_drops_knobs_the_pipeline_cannot_use(self, queue):
         """Rows hidden by CSS still POST — the saved job must not claim them."""
@@ -502,6 +627,27 @@ class RunInferencePrefillTests(VideosBase):
         self.assertIn('<option value="people_detect_first" selected>', html)
         self.assertIn(f'value="{self.detector}"', html)
         self.assertIn('value="0.12"', html)
+
+    def test_the_defaults_maps_are_rendered_as_json_script(self):
+        html = self._step_two().content.decode()
+        self.assertIn('<script id="trained-defaults" type="application/json">', html)
+        self.assertIn('JSON.parse', html)
+
+    def test_a_script_tag_in_the_metadata_cannot_break_out(self):
+        # The maps are keyed by model pk / artifact filename and carry operator-set
+        # paths, so their values reach a <script> block; json.dumps escapes JSON
+        # syntax but not HTML, which json_script does.
+        TrainedModel.objects.create(
+            name="sneaky", arch="yolox", checkpoint_path=str(self.root / "d.pt"),
+            pipeline_metadata=pipeline_meta.normalize({
+                "pipeline": "people_detect_first",
+                "detector_checkpoint": '</script><script>alert(1)</script>',
+            }),
+        )
+        html = self._step_two().content.decode()
+
+        self.assertNotIn("<script>alert(1)</script>", html)
+        self.assertIn("\\u003Cscript\\u003Ealert(1)", html)
 
     def test_a_model_with_no_pipeline_on_record_renders_raw_and_blank(self):
         TrainedModel.objects.create(

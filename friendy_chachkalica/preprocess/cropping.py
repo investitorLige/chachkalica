@@ -36,6 +36,43 @@ except ImportError:  # run as a flat script
 _MIN_VISIBLE_FRACTION = 0.1
 
 
+def _rescale_target_to_crop(
+    target: Dict[str, Any], crop: torch.Tensor, crop_w: int, crop_h: int
+) -> Dict[str, Any]:
+    """Put ``target``'s boxes in the crop *tensor's* pixel space.
+
+    ``pipeline.crop_regions`` reports every region's size in **frame** pixels, on
+    purpose: that is the geometry both it and ``crop_cache`` remap by, and it must
+    not track a resize. But a crop under ``detector.min_box_size`` whose frame is
+    smaller than the floor is bilinearly upscaled
+    (``chachak.boxes.upscale_crop_to_min_size``), so for that one case the tensor is
+    larger than the region it covers — and ``remap_target_to_window`` has just
+    written absolute boxes in region pixels. Training consumes both together (the
+    torchvision archs read target boxes as pixels of the tensor they're given;
+    ``RTDETRAdapter`` derives its own scale from the tensor's shape), so the boxes
+    have to follow the tensor. A no-op when no upscale happened, which is the norm.
+    """
+    tensor_h, tensor_w = int(crop.shape[-2]), int(crop.shape[-1])
+    if (tensor_w, tensor_h) == (crop_w, crop_h):
+        return target
+
+    scale_x, scale_y = tensor_w / crop_w, tensor_h / crop_h
+    boxes = target["boxes"]
+    scaled = boxes.clone()
+    scaled[:, [0, 2]] *= scale_x
+    scaled[:, [1, 3]] *= scale_y
+
+    rescaled = dict(target)
+    rescaled["boxes"] = scaled
+    rescaled["area"] = (scaled[:, 2] - scaled[:, 0]) * (scaled[:, 3] - scaled[:, 1])
+    orig_size = target.get("orig_size")
+    if orig_size is not None:
+        rescaled["orig_size"] = torch.tensor(
+            [tensor_h, tensor_w], dtype=orig_size.dtype, device=orig_size.device
+        )
+    return rescaled
+
+
 def crop_batch_regions(
     images: List[torch.Tensor],
     targets: List[Dict[str, Any]],
@@ -45,7 +82,9 @@ def crop_batch_regions(
     ``(crop_chw, crop_target, source_target, offset_xy, crop_size, frame_size)``.
 
     ``crop_target`` is the frame's target re-mapped into the crop's local
-    coordinates (:func:`window_targets.remap_target_to_window`); ``source_target``
+    coordinates (:func:`window_targets.remap_target_to_window`) and then put in the
+    crop tensor's own pixel space (:func:`_rescale_target_to_crop`, a no-op unless
+    the crop was upscaled to clear the min-size floor); ``source_target``
     is the original, un-remapped frame target (carries ``image_path`` etc.).
     ``offset_xy``/``crop_size``/``frame_size`` are pixel geometry in the *source*
     frame — the exact bookkeeping needed to later remap a crop's boxes back onto
@@ -69,6 +108,10 @@ def crop_batch_regions(
             )
             if new_target is None:
                 continue
+            new_target = _rescale_target_to_crop(new_target, crop, crop_w, crop_h)
+            # `crop_size` stays the *frame*-pixel region — normalized coordinates are
+            # what gets remapped back onto the frame, and those are invariant under
+            # the upscale `_rescale_target_to_crop` just followed.
             yield crop, new_target, target, (x0, y0), (crop_w, crop_h), (frame_w, frame_h)
 
 

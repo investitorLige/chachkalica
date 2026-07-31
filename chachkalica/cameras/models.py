@@ -83,9 +83,11 @@ class CameraInference(models.Model):
 
     TRAINED = "trained"
     EXPORTED = "exported"
+    BUNDLE = "bundle"
     MODEL_SOURCE_CHOICES = [
         (TRAINED, "trained model (.pt checkpoint)"),
         (EXPORTED, "exported artifact (ONNX / TensorRT)"),
+        (BUNDLE, "infer bundle (self-contained pipeline directory)"),
     ]
 
     # "raw" is not a chachak pipeline — it means "no pipeline, feed the model the
@@ -116,8 +118,9 @@ class CameraInference(models.Model):
 
     model_source = models.CharField(
         max_length=16, choices=MODEL_SOURCE_CHOICES, default=TRAINED,
-        help_text="Where the model comes from: the trained-models catalogue, or an "
-                  "exported artifact in the export output directory.",
+        help_text="Where the model comes from: the trained-models catalogue, an "
+                  "exported artifact in the export output directory, or a "
+                  "self-contained infer bundle under the bundle root.",
     )
     trained_model = models.ForeignKey(
         "training.TrainedModel", null=True, blank=True,
@@ -128,6 +131,12 @@ class CameraInference(models.Model):
         max_length=1024, blank=True,
         help_text="Path of the exported .onnx/.engine relative to the export output "
                   "directory. Set when model_source is 'exported'.",
+    )
+    bundle_path = models.CharField(
+        max_length=1024, blank=True,
+        help_text="Path of the bundle directory relative to the bundle root. Set "
+                  "when model_source is 'bundle'; the bundle's manifest supplies "
+                  "the model, the detector and the whole pipeline geometry.",
     )
     score_threshold = models.FloatField(
         default=0.5, help_text="Detections below this confidence are dropped.",
@@ -212,16 +221,32 @@ class CameraInference(models.Model):
         """Human name of the model this config runs, whichever source it came from."""
         if self.model_source == self.EXPORTED:
             return self.artifact_path or "(no artifact)"
+        if self.model_source == self.BUNDLE:
+            return self.bundle_path or "(no bundle)"
         return self.trained_model.name if self.trained_model_id else "(no model)"
+
+    def sync_bundle(self) -> dict | None:
+        """Re-derive the pipeline fields from this config's bundle, if it has one.
+
+        Mirrors :meth:`videos.models.InferenceJob.sync_bundle` — a bundle carries
+        the geometry it was tuned with, so a bundle-sourced row takes its pipeline
+        fields from the manifest rather than from the form. Returns the applied
+        metadata, or ``None`` for the other two sources.
+        """
+        if self.model_source != self.BUNDLE:
+            return None
+        from training.services import bundles
+
+        return bundles.apply_defaults(self, self.bundle_path)
 
     def model_checkpoint(self) -> str:
         """Absolute path of the model artifact to run.
 
         Mirrors :meth:`videos.models.InferenceJob.model_checkpoint`: trained
         models carry a possibly project-relative checkpoint path, exported
-        artifacts resolve against the export output directory (which also
-        rejects anything escaping it). Raises ``ValueError`` when the config's
-        model is missing or unusable.
+        artifacts resolve against the export output directory and bundles against
+        the bundle root (both reject anything escaping their root). Raises
+        ``ValueError`` when the config's model is missing or unusable.
         """
         from django.conf import settings
 
@@ -231,6 +256,11 @@ class CameraInference(models.Model):
             if not (self.artifact_path or "").strip():
                 raise ValueError("No exported artifact selected.")
             return str(exports.resolve(self.artifact_path))
+
+        if self.model_source == self.BUNDLE:
+            from training.services import bundles
+
+            return str(bundles.model_artifact(self.bundle_path))
 
         if not self.trained_model_id:
             raise ValueError("Live inference has no trained model selected.")
@@ -255,6 +285,7 @@ class CameraInference(models.Model):
         """
         return (
             self.model_source, self.trained_model_id, self.artifact_path,
+            self.bundle_path,
             self.score_threshold, self.pipeline, self.detector_checkpoint,
             self.detector_expand_ratio, self.detector_min_box_size,
             self.tile_size_px, self.tile_width_pct, self.tile_height_pct,

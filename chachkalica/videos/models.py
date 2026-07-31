@@ -136,12 +136,14 @@ class InferenceJob(models.Model):
     ``<videos_root>/inferred/`` (see ``videos.services.inference.output_dir``),
     same "DB stores metadata, bytes stay on disk" convention as ``Video``.
 
-    The model to run comes from one of two places (``model_source``): a
-    catalogued :class:`training.TrainedModel` (its ``.pt`` checkpoint), or an
+    The model to run comes from one of three places (``model_source``): a
+    catalogued :class:`training.TrainedModel` (its ``.pt`` checkpoint), an
     exported ``.onnx`` / ``.engine`` artifact sitting in the export output
     directory, addressed by ``artifact_path`` relative to it (see
-    ``training.services.exports``). Exported artifacts have no DB row of their
-    own, hence ``trained_model`` is nullable.
+    ``training.services.exports``), or an **infer bundle** under the bundle root,
+    addressed by ``bundle_path`` (see ``training.services.bundles``). Neither
+    exported artifacts nor bundles have a DB row of their own, hence
+    ``trained_model`` is nullable.
 
     The remaining fields describe *how* frames reach the model: ``pipeline`` is
     ``"raw"`` (whole frame straight to the model) or a chachak pipeline that
@@ -149,6 +151,10 @@ class InferenceJob(models.Model):
     detector/tiling knobs beside it. Mirrors
     :class:`eval_pipelines.models.PipelineEvalRun`'s field set, minus the
     dataset/metrics half.
+
+    For a bundle those knobs are not the operator's to choose: a bundle ships the
+    geometry its weights were tuned with, so the admin renders them read-only and
+    :meth:`sync_bundle` re-derives them from the manifest on save.
     """
 
     QUEUED = "queued"
@@ -164,9 +170,11 @@ class InferenceJob(models.Model):
 
     TRAINED = "trained"
     EXPORTED = "exported"
+    BUNDLE = "bundle"
     MODEL_SOURCE_CHOICES = [
         (TRAINED, "trained model (.pt checkpoint)"),
         (EXPORTED, "exported artifact (ONNX / TensorRT)"),
+        (BUNDLE, "infer bundle (self-contained pipeline directory)"),
     ]
 
     # "raw" is not a chachak pipeline — it means "no pipeline, feed the model the
@@ -180,8 +188,9 @@ class InferenceJob(models.Model):
     video = models.ForeignKey(Video, on_delete=models.CASCADE, related_name="inference_jobs")
     model_source = models.CharField(
         max_length=16, choices=MODEL_SOURCE_CHOICES, default=TRAINED,
-        help_text="Where the model comes from: the trained-models catalogue, or an "
-                  "exported artifact in the export output directory.",
+        help_text="Where the model comes from: the trained-models catalogue, an "
+                  "exported artifact in the export output directory, or a "
+                  "self-contained infer bundle under the bundle root.",
     )
     trained_model = models.ForeignKey(
         "training.TrainedModel", null=True, blank=True,
@@ -192,6 +201,12 @@ class InferenceJob(models.Model):
         max_length=1024, blank=True,
         help_text="Path of the exported .onnx/.engine relative to the export output "
                   "directory. Set when model_source is 'exported'.",
+    )
+    bundle_path = models.CharField(
+        max_length=1024, blank=True,
+        help_text="Path of the bundle directory relative to the bundle root. Set "
+                  "when model_source is 'bundle'; the bundle's manifest supplies "
+                  "the model, the detector and the whole pipeline geometry.",
     )
     score_threshold = models.FloatField(
         default=0.5, help_text="Detections below this confidence are dropped.",
@@ -283,15 +298,31 @@ class InferenceJob(models.Model):
         """Human name of the model this job runs, whichever source it came from."""
         if self.model_source == self.EXPORTED:
             return self.artifact_path or "(no artifact)"
+        if self.model_source == self.BUNDLE:
+            return self.bundle_path or "(no bundle)"
         return self.trained_model.name if self.trained_model_id else "(deleted model)"
+
+    def sync_bundle(self) -> dict | None:
+        """Re-derive the pipeline fields from this job's bundle, if it has one.
+
+        Bundle-sourced rows own no geometry of their own — see the class
+        docstring. Returns the applied metadata, or ``None`` for the other two
+        sources. Raises ``ValueError`` (``bundles.BundleError``) when the bundle
+        can't be read.
+        """
+        if self.model_source != self.BUNDLE:
+            return None
+        from training.services import bundles
+
+        return bundles.apply_defaults(self, self.bundle_path)
 
     def model_checkpoint(self) -> str:
         """Absolute path of the model artifact to run.
 
         Trained models carry a checkpoint path that may be project-relative;
-        exported artifacts resolve against the export output directory (which also
-        rejects anything escaping it). Raises ``ValueError`` when the job's model
-        is missing or unusable.
+        exported artifacts resolve against the export output directory and
+        bundles against the bundle root (both reject anything escaping their
+        root). Raises ``ValueError`` when the job's model is missing or unusable.
         """
         from django.conf import settings
 
@@ -299,6 +330,11 @@ class InferenceJob(models.Model):
             from training.services import exports
 
             return str(exports.resolve(self.artifact_path))
+
+        if self.model_source == self.BUNDLE:
+            from training.services import bundles
+
+            return str(bundles.model_artifact(self.bundle_path))
 
         if not self.trained_model_id:
             raise ValueError("Inference job has no trained model.")

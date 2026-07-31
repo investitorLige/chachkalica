@@ -124,6 +124,25 @@ def _export_role(
     }
 
 
+def _role_formats(exported: Dict[str, Dict[str, Any]], *, want_engine: bool) -> Dict[str, str]:
+    """Which format each role's artifact is carried as: ``{role: "onnx"|"engine"}``.
+
+    The requested format where the role has it, otherwise the only one it has.
+    Roles are resolved independently on purpose. Requiring one format across all of
+    them — the previous rule — made the common case impossible: the shipped person
+    detector is a prebuilt ``.engine``, an engine cannot be decompiled back to ONNX,
+    so every ONNX bundle of a person-crop pipeline aborted outright. Nothing at run
+    time needs them to match, because chachak dispatches on each path's own suffix
+    (``load_checkpoint_adapter``); what a mixed bundle costs is portability, which
+    the caller warns about.
+    """
+    preferred = "engine" if want_engine else "onnx"
+    return {
+        role: (preferred if preferred in info["paths"] else next(iter(info["paths"])))
+        for role, info in exported.items()
+    }
+
+
 def _batchable_in_trt(arch: str) -> bool:
     """Whether this arch's engine decodes a ``B > 1`` submission correctly.
 
@@ -280,61 +299,62 @@ def export_bundle_for_config(
         for role, source, batch in roles
     }
 
-    # Only offer a format every role has: a pipeline can't run half on ONNX.
-    artifacts: Dict[str, Dict[str, Any]] = {}
-    for candidate in ("onnx", "engine"):
-        if not all(candidate in info["paths"] for info in exported.values()):
-            continue
-        artifacts[candidate] = {
-            "model": exported["model"]["paths"][candidate].relative_to(bundle_dir).as_posix(),
+    # One artifact per role, format chosen per role — see `_role_formats`.
+    missing = [role for role, info in exported.items() if not info["paths"]]
+    if missing:
+        raise SystemExit(
+            f"[bundle] No artifact could be produced for: {', '.join(missing)}. Point "
+            f"the request at a .pt checkpoint or an exported .onnx/.engine for each role."
+        )
+
+    role_format = _role_formats(exported, want_engine=want_engine)
+
+    def _relative(role: str) -> str:
+        return exported[role]["paths"][role_format[role]].relative_to(bundle_dir).as_posix()
+
+    # The manifest carries one flat artifact set, and `resolve_format` reports which
+    # format that is by reading the *model* artifact's extension — so the model
+    # role's own format is the bundle's format.
+    default_format = role_format["model"]
+    artifacts: Dict[str, Dict[str, Any]] = {
+        default_format: {
+            "model": _relative("model"),
             "extra_models": [
-                exported[role]["paths"][candidate].relative_to(bundle_dir).as_posix()
-                for role in exported
-                if role.startswith("extra_")
+                _relative(role) for role in exported if role.startswith("extra_")
             ],
-            "detector": (
-                exported["detector"]["paths"][candidate].relative_to(bundle_dir).as_posix()
-                if "detector" in exported
-                else None
-            ),
+            "detector": _relative("detector") if "detector" in exported else None,
             "max_batch": {
                 "model": min(
                     [
-                        info["max_batch"].get(candidate)
+                        cap
                         for role, info in exported.items()
                         if not role.startswith("detector")
-                        and info["max_batch"].get(candidate) is not None
+                        for cap in [info["max_batch"].get(role_format[role])]
+                        if cap is not None
                     ]
                     or [None]
                 ),
                 "detector": (
-                    exported["detector"]["max_batch"].get(candidate)
+                    exported["detector"]["max_batch"].get(role_format["detector"])
                     if "detector" in exported
                     else None
                 ),
             },
         }
-    if not artifacts:
-        raise SystemExit(
-            "[bundle] No single format is available for every role, so the pipeline "
-            "could not be bundled. Point the request at .pt checkpoints (or matching "
-            "exported artifacts) for all of: "
-            + ", ".join(f"{role} ({'/'.join(info['paths'])})" for role, info in exported.items())
-        )
+    }
 
-    default_format = "engine" if want_engine and "engine" in artifacts else "onnx"
-    if default_format not in artifacts:
-        default_format = next(iter(artifacts))
-        engine_only = [
-            role for role, info in exported.items() if "onnx" not in info["paths"]
-        ]
+    mixed = sorted(role for role, fmt_ in role_format.items() if fmt_ != default_format)
+    if mixed:
         print(
-            f"[bundle] WARNING: this bundle is {default_format}-only, not portable. "
-            f"{', '.join(engine_only)} was given as a prebuilt .engine, which cannot be "
-            f"decompiled back to ONNX, so no ONNX bundle is possible. The result runs "
-            f"only on the GPU model + TensorRT version those engines were built for. "
-            f"Point the request at the .pt checkpoint instead to get a portable bundle."
+            f"[bundle] WARNING: mixed-format bundle — "
+            + ", ".join(f"{role}={role_format[role]}" for role in mixed)
+            + f" instead of {default_format}, because a prebuilt artifact cannot be "
+            f"converted to the other format. It runs as-is (each role loads by its own "
+            f"suffix), but any `.engine` in the bundle ties the whole pipeline to the GPU "
+            f"model + TensorRT version that engine was built on. Point the request at .pt "
+            f"checkpoints for a fully portable bundle."
         )
+    engine_roles = sorted(role for role, fmt_ in role_format.items() if fmt_ == "engine")
 
     default_conf = float(conf) if conf is not None else _inference_score_threshold(config)
     if default_conf < _SWEEP_THRESHOLD:
@@ -365,7 +385,9 @@ def export_bundle_for_config(
     )
     (bundle_dir / "pipeline.json").write_text(json.dumps(manifest, indent=2))
 
-    runtime_entries = vendor_runtime(bundle_dir / "runtime", include_trt="engine" in artifacts)
+    # Vendor the TensorRT runtime whenever *any* role runs on an engine, not just
+    # when the bundle's own format is "engine" — a mixed bundle needs both loaders.
+    runtime_entries = vendor_runtime(bundle_dir / "runtime", include_trt=bool(engine_roles))
 
     entrypoint = bundle_dir / "infer.py"
     shutil.copy2(_TEMPLATES / "infer.py", entrypoint)
@@ -378,7 +400,9 @@ def export_bundle_for_config(
           f"{len(manifest['classes'])} classes, conf default {default_conf}")
     print(f"[bundle]   models/           {', '.join(sorted(p.name for info in exported.values() for p in info['paths'].values()))}")
     print(f"[bundle]   runtime/          {', '.join(runtime_entries)}")
-    print(f"[bundle]   formats           {', '.join(sorted(artifacts))} (default {default_format})")
+    print(f"[bundle]   formats           "
+          + ", ".join(f"{role}={fmt_}" for role, fmt_ in sorted(role_format.items()))
+          + f" (bundle format {default_format})")
     print(f"[bundle] Run it with: cd {bundle_dir} && python infer.py IMAGES --conf {default_conf}")
     return bundle_dir
 

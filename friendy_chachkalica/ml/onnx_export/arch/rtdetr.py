@@ -152,4 +152,12 @@ def export_rtdetr(adapter, *, num_classes, params, class_map, onnx_path: str | P
         input_scale="unit",
         normalize={"mean": mean, "std": std},
         box_coords="input_normalized",
+        # The decoder emits normalized cxcywh through a sigmoid, so a box centred
+        # near an edge can extend past the canvas (cx - w/2 < 0) with no padding
+        # involved at all. The torch path clamps those (adapters/rtdetr.py's
+        # predict() calls clip_xyxy), so the exported path must too or the same
+        # checkpoint scores differently per format: an unclipped box has a larger
+        # area, so IoU against an edge-touching ground truth drops and near-
+        # threshold matches flip to misses.
+        clip_boxes=True,
     )

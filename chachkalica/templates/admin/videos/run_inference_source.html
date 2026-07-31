@@ -29,8 +29,12 @@ model list plus the pipeline the frames are run through.</p>
       <strong>Trained models</strong> are the catalogued <code>.pt</code> checkpoints in the
       Models tab. <strong>Exported artifacts</strong> are the <code>.onnx</code> /
       <code>.engine</code> files under the export output directory
-      (<code>{{ exports_root }}</code>) — {{ artifact_count }} found. Change that directory in
-      Training settings if your exports live elsewhere.
+      (<code>{{ exports_root }}</code>) — {{ artifact_count }} found.
+      <strong>Infer bundles</strong> are the self-contained pipeline directories under
+      <code>{{ bundles_root }}</code> — {{ bundle_count }} found; each carries its model, its
+      person detector and the geometry they were tuned with, so a bundle copied in from
+      another machine needs nothing configured. Change either directory in Training settings
+      if yours live elsewhere.
     </p>
   </div>
 

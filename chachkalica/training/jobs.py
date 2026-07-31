@@ -220,17 +220,56 @@ def _bundle_after_export(run: ExportRun, artifact_path: Path, *, fmt: str, preci
     ``TrainedModelAdmin._export_bundle`` used to do synchronously in the admin
     request. A bundle failure is recorded on ``run.bundle_error`` but does not
     fail the export itself — the primary artifact already exported fine.
+
+    ``build_bundle_request`` is inside the guard too: it resolves checkpoint paths
+    and reads the artifact's sidecar, so it can raise for the same environmental
+    reasons the bundle call can, and a raise here used to escape the job entirely.
     """
-    bundle_request = exports.build_bundle_request(run.model, artifact_path)
-    if bundle_request is None:
-        return
-    bundle_dir = artifact_path.parent / f"{artifact_path.stem}-bundle"
     try:
+        bundle_request = exports.build_bundle_request(run.model, artifact_path)
+        if bundle_request is None:
+            return
+        bundle_dir = artifact_path.parent / f"{artifact_path.stem}-bundle"
         result = runner.export_bundle(bundle_request, bundle_dir, fmt=fmt, precision=precision)
     except Exception as exc:  # noqa: BLE001 - non-fatal, recorded on the row
         run.bundle_error = str(exc)
         return
     run.bundle_dir = result.get("bundle_dir", "")
+
+
+def _finish_export(run: ExportRun, result: dict, *, fmt: str, precision: str = "auto") -> dict:
+    """Run the post-export steps, then mark ``run`` terminal. Never raises.
+
+    Everything here happens *after* the artifact is already on disk, so none of it
+    may fail the export — but none of it may strand the row either. Both steps used
+    to sit outside any guard: a raise from either left the row at ``RUNNING`` with
+    an empty ``last_error`` forever (RQ logs the traceback, but nothing reads it
+    back onto the row, and ``reconcile`` has no ExportRun handling), where the old
+    synchronous admin action messaged every error to the operator. Failures are
+    recorded on ``bundle_error`` — the row's non-fatal error channel — labelled by
+    stage, since a missing pipeline sidecar and a missing bundle are different
+    problems with the same non-fatal weight.
+    """
+    artifact_path = Path(run.output_path)
+    problems = []
+    run.bundle_error = ""  # a retried job reports this attempt, not the last one
+
+    try:
+        exports.export_pipeline_sidecar(run.model, artifact_path)
+    except Exception as exc:  # noqa: BLE001 - non-fatal, recorded on the row
+        problems.append(f"pipeline sidecar: {exc}")
+
+    try:
+        _bundle_after_export(run, artifact_path, fmt=fmt, precision=precision)
+    except Exception as exc:  # noqa: BLE001 - belt and braces; the helper guards itself
+        problems.append(f"bundle: {exc}")
+    if run.bundle_error:
+        problems.append(f"bundle: {run.bundle_error}")
+
+    run.bundle_error = "; ".join(problems)
+    run.status, run.result, run.finished_at = ExportRun.OK, result, timezone.now()
+    run.save(update_fields=["status", "result", "bundle_dir", "bundle_error", "finished_at"])
+    return result
 
 
 def run_export_onnx(export_id: int) -> dict:
@@ -246,13 +285,7 @@ def run_export_onnx(export_id: int) -> dict:
         run.save(update_fields=["status", "last_error", "finished_at"])
         raise
 
-    artifact_path = Path(run.output_path)
-    exports.export_pipeline_sidecar(run.model, artifact_path)
-    _bundle_after_export(run, artifact_path, fmt="onnx")
-
-    run.status, run.result, run.finished_at = ExportRun.OK, result, timezone.now()
-    run.save(update_fields=["status", "result", "bundle_dir", "bundle_error", "finished_at"])
-    return result
+    return _finish_export(run, result, fmt="onnx")
 
 
 def run_export_trt(export_id: int) -> dict:
@@ -270,10 +303,4 @@ def run_export_trt(export_id: int) -> dict:
         run.save(update_fields=["status", "last_error", "finished_at"])
         raise
 
-    artifact_path = Path(run.output_path)
-    exports.export_pipeline_sidecar(run.model, artifact_path)
-    _bundle_after_export(run, artifact_path, fmt="engine", precision=run.precision)
-
-    run.status, run.result, run.finished_at = ExportRun.OK, result, timezone.now()
-    run.save(update_fields=["status", "result", "bundle_dir", "bundle_error", "finished_at"])
-    return result
+    return _finish_export(run, result, fmt="engine", precision=run.precision)

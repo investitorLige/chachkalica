@@ -82,6 +82,11 @@ that duplication is what this module exists to prevent.
 - **Bundle export** — `exports.build_bundle_request` builds chachak's Contract C
   request from the record, so a bundle can still be produced after the source
   experiment is gone.
+- **Bundle *import*** — the same road travelled backwards:
+  `bundles._manifest_defaults` translates a bundle's `pipeline.json` into this
+  schema, so a bundle copied in from another machine prefills the same forms with
+  no DB row and no sidecar behind it. It is the one source whose record *wins*
+  over the form rather than seeding it — see [Infer Bundles](infer-bundles.md).
 
 Artifacts exported before sidecars existed still prefill:
 `exports.read_pipeline_defaults` falls back to the catalogued model matched by
