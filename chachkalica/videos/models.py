@@ -232,8 +232,8 @@ class InferenceJob(models.Model):
         null=True, blank=True,
         verbose_name="Person-crop minimum size (px)",
         help_text="Grow person crops smaller than this many pixels rather than "
-                  "dropping them. Blank = chachak's default. Only used by "
-                  "people_detect_first.",
+                  "dropping them. Blank = chachak's default. Used by "
+                  "people_detect_first / batch_people.",
     )
     tile_size_px = models.PositiveIntegerField(
         null=True, blank=True,

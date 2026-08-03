@@ -25,6 +25,21 @@ PIPELINE_CHOICES = [
 # Pipelines that require a person-detector checkpoint.
 DETECTOR_PIPELINES = {PEOPLE_DETECT_FIRST, BATCH_PEOPLE}
 
+
+def needs_detector(pipeline: str, chain=None) -> bool:
+    """Does ``pipeline`` (with its ``chain``, for :data:`CHAIN`) run a person detector?
+
+    The one definition. This predicate decides whether a detector checkpoint is
+    required, whether the crop knobs mean anything, and whether an export must
+    carry a detector alongside the model — and it was previously re-spelled at
+    each of those call sites, which is how a caller ends up asking "is the field
+    non-blank" instead (and leaking a detector block into a tiling pipeline, or
+    dropping one a chain member needs).
+    """
+    if pipeline in DETECTOR_PIPELINES:
+        return True
+    return pipeline == CHAIN and any(c in DETECTOR_PIPELINES for c in (chain or []))
+
 # Pipelines that support being trained *through*: the training loop applies the
 # same frame transform (tiling, or person-cropping via the detector) it uses at
 # val/test, so the model trains on the exact sub-frames it is served on. Keep in

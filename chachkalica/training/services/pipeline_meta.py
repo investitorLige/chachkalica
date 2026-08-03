@@ -95,12 +95,30 @@ def from_experiment(experiment) -> Dict[str, Any]:
     Called at promotion time (see :func:`training.services.promote
     .promote_run_result`), so a model records the geometry it was actually
     trained with. A blank ``experiment.pipeline`` yields :func:`raw`.
+
+    A blank ``detector_checkpoint`` on a detector-requiring pipeline is resolved
+    to :data:`~training.models.DEFAULT_PERSON_DETECTOR_CHECKPOINT` here, because
+    that is the detector the run *actually used*: ``config_gen.pipeline_block``
+    substitutes it when writing the training YAML. Freezing the blank instead
+    recorded a pipeline the model was never trained through, and every consumer
+    then had to re-guess the fallback — which the eval request, the sidecar and
+    the bundle request each did, while ``config_gen.build_predict_request``
+    raised instead, so video/camera inference refused to run a model whose
+    experiment simply hadn't overridden the default.
     """
+    from training.models import DEFAULT_PERSON_DETECTOR_CHECKPOINT
+    from training import pipelines
+
     if experiment is None or not experiment.pipeline:
         return raw()
+    detector_checkpoint = experiment.detector_checkpoint or ""
+    if not detector_checkpoint and pipelines.needs_detector(
+        experiment.pipeline, experiment.chain or []
+    ):
+        detector_checkpoint = DEFAULT_PERSON_DETECTOR_CHECKPOINT
     return normalize({
         "pipeline": experiment.pipeline,
-        "detector_checkpoint": experiment.detector_checkpoint or "",
+        "detector_checkpoint": detector_checkpoint,
         "detector_expand_ratio": experiment.detector_expand_ratio,
         "detector_min_box_size": experiment.detector_min_box_size,
         "tile_size_px": experiment.tile_size_px,

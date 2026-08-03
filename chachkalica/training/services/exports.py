@@ -142,11 +142,7 @@ def resolve(relpath: str, ts: TrainingSettings | None = None) -> Path:
     return candidate
 
 
-def _needs_detector(pipeline: str, chain: list) -> bool:
-    return pipeline in pipelines.DETECTOR_PIPELINES or (
-        pipeline == pipelines.CHAIN
-        and any(c in pipelines.DETECTOR_PIPELINES for c in (chain or []))
-    )
+_needs_detector = pipelines.needs_detector
 
 
 def _copy_artifact_set(source: Path, dest: Path) -> None:
@@ -321,10 +317,19 @@ def build_bundle_request(trained_model, artifact_path: Path) -> dict | None:
         from videos.services.frame_extraction import _resolve_checkpoint
 
         checkpoint = meta["detector_checkpoint"] or DEFAULT_PERSON_DETECTOR_CHECKPOINT
+        # Same None-dropping rule as `tiling` above, for the same reason:
+        # chachak's detector parser does `float(raw.get(key, default))`, so a key
+        # present with value None raises TypeError instead of falling through to
+        # the default. A partial record (a sidecar or manifest written before a
+        # field existed) normalizes those two knobs to None.
         request["detector"] = {
             "checkpoint": str(_resolve_checkpoint(checkpoint)),
-            "expand_ratio": meta["detector_expand_ratio"],
-            "min_box_size": meta["detector_min_box_size"],
+            **{
+                key: value for key, value in {
+                    "expand_ratio": meta["detector_expand_ratio"],
+                    "min_box_size": meta["detector_min_box_size"],
+                }.items() if value is not None
+            },
         }
 
     return request

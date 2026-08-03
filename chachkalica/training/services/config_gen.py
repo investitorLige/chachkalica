@@ -192,11 +192,11 @@ def pipeline_block(experiment: Experiment) -> dict | None:
     pipeline, which falls back to ``DEFAULT_PERSON_DETECTOR_CHECKPOINT`` instead
     of being left unset (mirrors ``build_pipeline_request``).
 
-    ``detector.min_box_size`` (from ``experiment.detector_min_box_size``) is only
-    emitted for people_detect_first, not batch_people — see
-    ``Experiment.detector_min_box_size``'s help text for why the floor exists and
-    why it's scoped this narrowly (paired with the ``num_queries`` default
-    :func:`model_entry` injects for rtdetr on the same pipeline).
+    ``detector.min_box_size`` (from ``experiment.detector_min_box_size``) is
+    emitted for every detector pipeline — see
+    ``Experiment.detector_min_box_size``'s help text for why the floor exists
+    (paired with the ``num_queries`` default :func:`model_entry` injects for
+    rtdetr on people_detect_first).
     """
     name = experiment.pipeline
     if not name:
@@ -207,10 +207,7 @@ def pipeline_block(experiment: Experiment) -> dict | None:
     if name == pipelines.CHAIN and experiment.chain:
         data["chain"] = list(experiment.chain)
 
-    needs_detector = name in pipelines.DETECTOR_PIPELINES or (
-        name == pipelines.CHAIN
-        and any(c in pipelines.DETECTOR_PIPELINES for c in (experiment.chain or []))
-    )
+    needs_detector = pipelines.needs_detector(name, experiment.chain or [])
     # Gated on needs_detector, not just "is the field non-blank": the field
     # carries a non-blank default (the bundled person engine) so it's never
     # actually empty, which would otherwise leak a detector block into
@@ -225,12 +222,16 @@ def pipeline_block(experiment: Experiment) -> dict | None:
         detector: dict = {"checkpoint": str(_resolve(checkpoint))}
         if experiment.detector_expand_ratio is not None:
             detector["expand_ratio"] = experiment.detector_expand_ratio
-        # min_box_size is only emitted for people_detect_first, not batch_people:
-        # batch_people's person crops come from fixed-size tiles, so they don't
-        # shrink to the degenerate sizes people_detect_first can produce (a person
-        # detected small/at the frame edge, with no tiling floor under it). See
-        # Experiment.detector_min_box_size's help text for why this floor exists.
-        if name == pipelines.PEOPLE_DETECT_FIRST and experiment.detector_min_box_size:
+        # Emitted for batch_people too, not just people_detect_first. It used to
+        # be scoped to the latter on the theory that batch_people crops come from
+        # fixed-size tiles and so can't shrink to degenerate sizes — but
+        # BatchPeoplePipeline only *finds* people in tiles and then crops the
+        # original frame (chachak.pipeline.BatchPeoplePipeline.process_batch), so
+        # its crops are exactly as small as people_detect_first's. Meanwhile
+        # chachak applies the floor for both (crop_regions has no pipeline gate),
+        # so scoping it here meant a batch_people model trained with no floor and
+        # was then served with one.
+        if experiment.detector_min_box_size:
             detector["min_box_size"] = experiment.detector_min_box_size
         data["detector"] = detector
 
@@ -471,10 +472,7 @@ def build_pipeline_request(pe, output_dir: Path | str, ts: TrainingSettings | No
     if pe.pipeline == PipelineEvalRun.CHAIN and pe.chain:
         data["chain"] = list(pe.chain)
 
-    needs_detector = pe.pipeline in PipelineEvalRun.DETECTOR_PIPELINES or (
-        pe.pipeline == PipelineEvalRun.CHAIN
-        and any(c in PipelineEvalRun.DETECTOR_PIPELINES for c in (pe.chain or []))
-    )
+    needs_detector = pipelines.needs_detector(pe.pipeline, pe.chain or [])
     # Mirrors pipeline_block's fallback and its needs_detector gating — see
     # that function for why checking "is the field non-blank" alone isn't safe.
     checkpoint = (
@@ -485,10 +483,9 @@ def build_pipeline_request(pe, output_dir: Path | str, ts: TrainingSettings | No
         detector: dict = {"checkpoint": str(_resolve(checkpoint))}
         if pe.detector_expand_ratio is not None:
             detector["expand_ratio"] = pe.detector_expand_ratio
-        # Scoped to people_detect_first for the same reason as pipeline_block —
-        # batch_people's crops come from fixed-size tiles and can't shrink to the
-        # degenerate sizes this floor exists to catch.
-        if pe.pipeline == PipelineEvalRun.PEOPLE_DETECT_FIRST and pe.detector_min_box_size:
+        # Emitted for every detector pipeline, matching pipeline_block — see there
+        # for why scoping this to people_detect_first was wrong.
+        if pe.detector_min_box_size:
             detector["min_box_size"] = pe.detector_min_box_size
         data["detector"] = detector
 
@@ -630,10 +627,7 @@ def build_predict_request(
     if unknown_chain:
         raise ValueError(f"Unknown chain member(s): {', '.join(unknown_chain)}.")
 
-    needs_detector = pipeline in PipelineEvalRun.DETECTOR_PIPELINES or (
-        pipeline == PipelineEvalRun.CHAIN
-        and any(c in PipelineEvalRun.DETECTOR_PIPELINES for c in chain)
-    )
+    needs_detector = pipelines.needs_detector(pipeline, chain)
     if needs_detector and not detector_checkpoint:
         raise ValueError(f"pipeline '{pipeline}' requires a detector checkpoint.")
 

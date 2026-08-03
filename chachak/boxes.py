@@ -334,13 +334,20 @@ def merge_predictions(
     frame_w: int,
     frame_h: int,
     nms_iou: float,
-    min_box_size: float = 0.0,
 ) -> torch.Tensor:
     """Concatenate per-region predictions and de-duplicate with per-class NMS.
 
     All inputs are full-frame-normalized ``(N, 6)`` tensors (as produced by
-    :func:`remap_local_preds_to_frame`). ``min_box_size`` drops boxes whose pixel
-    width or height is below the threshold. Returns a single ``(M, 6)`` tensor.
+    :func:`remap_local_preds_to_frame`). Returns a single ``(M, 6)`` tensor.
+
+    Deliberately has no size floor. It used to take a ``min_box_size`` that
+    dropped boxes below a pixel threshold, and the person-crop pipeline passed
+    ``detector.min_box_size`` into it — which silently discarded nearly every
+    real detection, since that floor sizes *person crops going in* (hundreds of
+    px) while these are the model's own item-level boxes coming out (a helmet is
+    tens of px). The two are different scales and must never share a threshold,
+    so the parameter is gone rather than merely unused: see
+    ``pipeline.Pipeline._crop_infer_remap``.
     """
     preds = [p for p in preds_list if p is not None and p.numel() > 0]
     if not preds:
@@ -348,15 +355,6 @@ def merge_predictions(
     preds = torch.cat(preds, dim=0)
 
     boxes = _xywhn_to_xyxy_tensor(preds[:, :4], frame_w, frame_h)
-    if min_box_size > 0:
-        widths = boxes[:, 2] - boxes[:, 0]
-        heights = boxes[:, 3] - boxes[:, 1]
-        keep = (widths >= min_box_size) & (heights >= min_box_size)
-        preds = preds[keep]
-        boxes = boxes[keep]
-        if preds.numel() == 0:
-            return torch.zeros((0, 6))
-
     scores = preds[:, 4]
     classes = preds[:, 5].to(torch.int64)
     keep = _class_aware_overlap_nms(boxes, scores, classes, nms_iou)
