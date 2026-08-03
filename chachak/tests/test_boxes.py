@@ -191,13 +191,17 @@ class MergeTest(unittest.TestCase):
         self.assertAlmostEqual(float(merged[0, 4]), 0.95)
         self.assertTrue(torch.allclose(merged[0, :4], small[0, :4]))
 
-    def test_min_box_size_filters_tiny_boxes(self):
+    def test_tiny_boxes_survive_the_merge(self):
+        """No size floor here: a 1x1 px box is kept.
+
+        Guards the fix for the bug the old ``min_box_size`` parameter caused —
+        item-level detections (a helmet, a glove) are legitimately tiny in
+        full-frame pixels, and the merge step must not second-guess them.
+        """
         big = torch.tensor([[0.5, 0.5, 0.5, 0.5, 0.9, 0.0]])   # 50x50 px
         tiny = torch.tensor([[0.1, 0.1, 0.01, 0.01, 0.9, 0.0]])  # 1x1 px
-        merged = boxes.merge_predictions(
-            [big, tiny], 100, 100, nms_iou=0.5, min_box_size=5.0
-        )
-        self.assertEqual(merged.shape[0], 1)
+        merged = boxes.merge_predictions([big, tiny], 100, 100, nms_iou=0.5)
+        self.assertEqual(merged.shape[0], 2)
 
     def test_all_empty_returns_empty(self):
         merged = boxes.merge_predictions([torch.zeros((0, 6))], 100, 100, nms_iou=0.5)
