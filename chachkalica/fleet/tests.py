@@ -13,6 +13,7 @@ from fleet.services import data_quality_solve
 from fleet.services import datasets as datasets_svc
 from fleet.services import lsapi
 from fleet.services import merge as merge_svc
+from fleet.services import overlap as overlap_svc
 from fleet.services import shape_split
 
 _PPE_NAMES = [
@@ -325,6 +326,22 @@ class DatasetAnalyticsTests(TestCase):
             {"label": "640 × 480", "count": 1, "pct": 33.3},
         ])
 
+    def test_image_dimensions_reads_real_baseline_jpeg(self):
+        # Regression test: a real JPEG's APP0/JFIF segment often runs past the
+        # 32-byte header sniff read (e.g. padding, EXIF). _image_dimensions
+        # must seek back to byte 2 before walking markers, or it resumes
+        # mid-segment and never finds SOF0.
+        app0_payload = b"JFIF\x00" + b"\x00" * 33  # segment ends at byte 44
+        app0 = b"\xff\xe0" + (2 + len(app0_payload)).to_bytes(2, "big") + app0_payload
+        sof0_payload = b"\x08" + (240).to_bytes(2, "big") + (320).to_bytes(2, "big") + b"\x01\x01\x11\x00"
+        sof0 = b"\xff\xc0" + (2 + len(sof0_payload)).to_bytes(2, "big") + sof0_payload
+        jpeg_bytes = b"\xff\xd8" + app0 + sof0 + b"\xff\xd9"
+
+        path = self.src / "real.jpg"
+        path.write_bytes(jpeg_bytes)
+
+        self.assertEqual(analytics_svc._image_dimensions(path), (320, 240))
+
     def test_per_image_density_and_empties(self):
         # img1: 1 box; img2: 12 boxes (crowded); img3: empty label file; img4: no file.
         twelve = "0 0.5 0.5 0.1 0.1\n" * 12
@@ -375,6 +392,83 @@ class DatasetAnalyticsTests(TestCase):
         by_name = {r["name"]: r for r in analytics_svc.analyze_dataset(ds)["rows"]}
         self.assertEqual(by_name["big"]["avg_size_pct"], 20.0)
         self.assertEqual(by_name["small"]["avg_size_pct"], 1.0)
+
+
+class IntraDatasetDuplicatesTests(TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = Path(self.tmp.name)
+        fs = FleetSettings.load()
+        fs.source_dir = str(self.src)
+        fs.save()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _make_images_dataset(self, name: str, images: dict[str, bytes]) -> Dataset:
+        ds_dir = self.src / name
+        ds_dir.mkdir(parents=True)
+        for filename, content in images.items():
+            (ds_dir / filename).write_bytes(content)
+        return Dataset.objects.create(name=name, storage_type=Dataset.LOCAL)
+
+    def test_exact_duplicate_group_detected_and_others_left_alone(self):
+        ds = self._make_images_dataset("exact_dupes", {
+            "a.jpg": b"same-bytes",
+            "b.jpg": b"same-bytes",
+            "c.jpg": b"different-bytes",
+        })
+
+        report = overlap_svc.find_intra_duplicates(ds)
+
+        self.assertEqual(report["exact_duplicate_extra"], 1)
+        self.assertEqual(len(report["exact_groups"]), 1)
+        self.assertEqual(
+            [fp["path"].name for fp in report["exact_groups"][0]], ["a.jpg", "b.jpg"],
+        )
+        self.assertEqual(report["near_duplicate_extra"], 0)
+        self.assertEqual(report["prunable_exact"], [self.src / "exact_dupes" / "b.jpg"])
+
+    def test_no_duplicates_reports_empty_groups(self):
+        ds = self._make_images_dataset("unique", {
+            "a.jpg": b"one", "b.jpg": b"two", "c.jpg": b"three",
+        })
+
+        report = overlap_svc.find_intra_duplicates(ds)
+
+        self.assertEqual(report["exact_groups"], [])
+        self.assertEqual(report["near_groups"], [])
+        self.assertEqual(report["exact_duplicate_extra"], 0)
+        self.assertEqual(report["near_duplicate_extra"], 0)
+
+    def test_prune_deletes_extra_copies_and_backs_up_first(self):
+        ds = self._make_images_dataset("prune_me", {
+            "a.jpg": b"same-bytes",
+            "b.jpg": b"same-bytes",
+            "keep.jpg": b"unique-bytes",
+        })
+
+        result = overlap_svc.prune_intra_duplicates(ds)
+
+        ds_dir = self.src / "prune_me"
+        self.assertEqual(result["deleted_images"], 1)
+        self.assertTrue((ds_dir / "a.jpg").exists())   # alphabetically-first copy kept
+        self.assertFalse((ds_dir / "b.jpg").exists())  # extra copy pruned
+        self.assertTrue((ds_dir / "keep.jpg").exists())
+
+        backup_dir = Path(result["backup_dir"])
+        self.assertTrue((backup_dir / "prune_me" / "b.jpg").exists())
+
+    def test_prune_is_a_noop_when_nothing_is_duplicated(self):
+        ds = self._make_images_dataset("clean", {"a.jpg": b"one", "b.jpg": b"two"})
+
+        result = overlap_svc.prune_intra_duplicates(ds)
+
+        self.assertEqual(result["deleted_images"], 0)
+        self.assertEqual(result["deleted_labels"], 0)
+        self.assertEqual(result["backup_dir"], "")
+        self.assertTrue((self.src / "clean" / "a.jpg").exists())
+        self.assertTrue((self.src / "clean" / "b.jpg").exists())
 
 
 class DataQualitySolveTests(TestCase):

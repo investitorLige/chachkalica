@@ -34,6 +34,13 @@
   .ds-bar span { display: block; height: 100%; }
   .ds-barlegend { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 16px;
                   font-size: 12px; color: #9bb7a6; }
+  .ds-dim-list { max-height: 190px; overflow-y: auto; padding-right: 6px; }
+  .ds-dim-row { display: flex; align-items: center; gap: 10px; margin: 4px 0; }
+  .ds-dim-label { width: 100px; flex-shrink: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  .ds-dim-bar { flex: 1; height: 14px; border-radius: 4px; overflow: hidden;
+                background: #0f1a12; border: 1px solid #1d2a20; }
+  .ds-dim-bar span { display: block; width: var(--pct); min-width: 2px; height: 100%; background: #0891b2; }
+  .ds-dim-count { flex-shrink: 0; min-width: 92px; }
   .ds-issues { margin: 4px 0; padding-left: 18px; color: #e6c07a; font-size: 13px; }
   .ds-issues li { margin: 2px 0; }
   .ds-ok { color: #34d399; }
@@ -118,15 +125,15 @@
     <div class="cap ds-info" data-info-title="Image dimensions"
          data-info="Original pixel dimensions of the source images. Each bar shows how many readable images share that exact width and height.">Image dimensions<span class="sub"> — original width × height in pixels</span></div>
     {% if report.image_size_dist %}
+      <div class="ds-dim-list">
       {% for size in report.image_size_dist %}
-      <div style="display:flex; align-items:center; gap:10px; margin:6px 0; max-width:560px;">
-        <span style="width:100px; text-align:right; font-variant-numeric:tabular-nums;">{{ size.label }}</span>
-        <div style="flex:1; height:18px; border-radius:4px; overflow:hidden; background:#0f1a12; border:1px solid #1d2a20;">
-          <span style="display:block; width:{{ size.pct }}%; min-width:2px; height:100%; background:#0891b2;"></span>
-        </div>
-        <span class="ds-note" style="min-width:88px;">{{ size.count }} image{{ size.count|pluralize }} ({{ size.pct }}%)</span>
+      <div class="ds-dim-row">
+        <span class="ds-dim-label">{{ size.label }}</span>
+        <div class="ds-dim-bar"><span style="--pct: {{ size.pct }}%;"></span></div>
+        <span class="ds-note ds-dim-count">{{ size.count }} image{{ size.count|pluralize }} ({{ size.pct }}%)</span>
       </div>
       {% endfor %}
+      </div>
       {% if report.unreadable_images %}<p class="ds-note">{{ report.unreadable_images }} image{{ report.unreadable_images|pluralize }} could not be read for dimensions.</p>{% endif %}
     {% else %}
       <p class="ds-note">No readable image dimensions found.</p>
@@ -194,13 +201,14 @@
 
   <div class="ds-section">
     <div class="cap ds-info" data-info-title="Data quality"
-         data-info="Automatic checks for common annotation problems: orphan label files with no matching image, class indices outside classes.txt, boxes extending past the image edge, and zero/negative-area boxes.">Data quality</div>
+         data-info="Automatic checks for common annotation problems: orphan label files with no matching image, class indices outside classes.txt, boxes extending past the image edge, zero/negative-area boxes, and duplicate/near-duplicate images (by exact file match and by visual similarity).">Data quality</div>
     {% if report.quality.issue_total %}
     <ul class="ds-issues">
       {% if report.quality.orphan_label_files %}<li><button type="button" class="ds-fix-trigger" data-dataset-id="{{ report.dataset.pk }}" data-dataset-name="{{ report.dataset.name }}" data-fix-issue="orphan_label_files" data-primary-action="delete" data-primary-label="Delete orphan label files" data-message="Delete {{ report.quality.orphan_label_files }} label file(s) that do not match any image? Changed files are backed up first.">Warning: {{ report.quality.orphan_label_files }} orphan label file(s) - no matching image{% if report.quality.orphan_examples %} (e.g. {{ report.quality.orphan_examples|join:", " }}){% endif %}.</button></li>{% endif %}
       {% if report.quality.invalid_class_regions %}<li><button type="button" class="ds-fix-trigger" data-dataset-id="{{ report.dataset.pk }}" data-dataset-name="{{ report.dataset.name }}" data-fix-issue="invalid_class_regions" data-primary-action="remove" data-primary-label="Remove invalid regions" data-message="Remove {{ report.quality.invalid_class_regions }} region(s) whose class index is outside classes.txt? Changed files are backed up first.">Warning: {{ report.quality.invalid_class_regions }} region(s) with a class index outside classes.txt (ignored in the stats above).</button></li>{% endif %}
       {% if report.quality.out_of_bounds_boxes %}<li><button type="button" class="ds-fix-trigger" data-dataset-id="{{ report.dataset.pk }}" data-dataset-name="{{ report.dataset.name }}" data-fix-issue="out_of_bounds_boxes" data-primary-action="clip" data-primary-label="Clip boxes" data-secondary-action="remove" data-secondary-label="Remove boxes" data-message="Fix {{ report.quality.out_of_bounds_boxes }} box(es) extending outside the image bounds? Clipping preserves labels by fitting them to the image. Changed files are backed up first.">Warning: {{ report.quality.out_of_bounds_boxes }} box(es) extending outside the image bounds.</button></li>{% endif %}
       {% if report.quality.zero_area_boxes %}<li><button type="button" class="ds-fix-trigger" data-dataset-id="{{ report.dataset.pk }}" data-dataset-name="{{ report.dataset.name }}" data-fix-issue="zero_area_boxes" data-primary-action="remove" data-primary-label="Remove zero-area boxes" data-message="Remove {{ report.quality.zero_area_boxes }} box(es) with zero/negative area? Changed files are backed up first.">Warning: {{ report.quality.zero_area_boxes }} box(es) with zero/negative area.</button></li>{% endif %}
+      {% if report.quality.duplicate_extra_images %}<li><button type="button" class="ds-fix-trigger" data-dataset-id="{{ report.dataset.pk }}" data-dataset-name="{{ report.dataset.name }}" data-fix-issue="duplicate_images" data-primary-action="prune" data-primary-label="Prune duplicates" data-message="Prune {{ report.quality.duplicate_extra_images }} duplicate/near-duplicate image(s) across {{ report.quality.duplicate_image_groups }} group(s), keeping one copy per group? This re-checks and runs as a background job; changed files are backed up first.">Warning: {{ report.quality.duplicate_extra_images }} duplicate/near-duplicate image(s) in {{ report.quality.duplicate_image_groups }} group(s){% if report.quality.duplicate_examples %} (e.g. {{ report.quality.duplicate_examples|join:", " }}){% endif %}.</button></li>{% endif %}
     </ul>
     {% else %}
       <p class="ds-note ds-ok">✓ No data-quality issues detected.</p>
@@ -330,7 +338,13 @@
         if (!response.ok) throw new Error(data.error || 'Fix failed');
         return data;
       });
-    }).then(function () {
+    }).then(function (data) {
+      if (data.queued) {
+        modalStatus.textContent = 'Prune queued as a background job — refresh in a bit to see updated results.';
+        primaryBtn.disabled = false;
+        secondaryBtn.disabled = false;
+        return;
+      }
       modalStatus.textContent = 'Fix applied. Reloading analytics...';
       refreshAnalytics();
     }).catch(function (err) {

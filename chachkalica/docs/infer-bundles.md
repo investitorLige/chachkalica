@@ -59,6 +59,11 @@ info, where info is a note or a skipped check rather than a problem:
 Everything except the load test is filesystem work: instant, and safe to run
 while a camera is inferring.
 
+One exception to the table: a bundle built on a **build node** is reported as
+*info*, not *fail*, for the load test. Its engine was compiled for another GPU on
+purpose, so it cannot load here and never will — see
+[Build Nodes](build-nodes.md).
+
 ### The load test, and why it's the one that matters
 
 `.engine` files are TensorRT plans **tied to the GPU model and TensorRT version
@@ -136,6 +141,12 @@ Both are offered; they answer different needs.
 | Prefill | silently, on change | explicitly, via **Sync bundle**, with a report |
 | Geometry | editable | the bundle's |
 | Survives a copy to another machine | only with its sidecars | yes, whole |
+
+Bundles built remotely land under `bundles_root/<node name>/` — already inside the
+bundle root, so they appear in the dropdowns with no copying. The node-name
+directory is not decoration: an engine only runs on the GPU that compiled it, so
+which machine a bundle came from is part of what it *is*. See
+[Build Nodes](build-nodes.md).
 
 The bundles the export jobs write under `exports_root` are found through *that*
 setting, as loose artifacts (`<bundle>/models/model.engine` shows up in the

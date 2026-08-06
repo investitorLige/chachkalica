@@ -24,6 +24,7 @@ Endpoints:
     POST /predict_image       -> {boxes, classes}          (synchronous 1-image inference; warm model)
     POST /checkpoint_info     -> {arch, trained_size}      (synchronous, cheap: no export)
     POST /export_onnx         -> {onnx_path, meta_path}    (synchronous ONNX export of one checkpoint)
+    POST /export_trt_onnx     -> {onnx_path, meta_path, arch, prepared}  (TRT-ready ONNX; CPU-only)
     POST /promote_labels      -> {labels_written, ...}     (synchronous: write a run's predictions as source labels)
 
 Operational logging (what the service itself does — launches, stops, rejections,
@@ -169,6 +170,19 @@ class CheckpointInfoRequest(BaseModel):
 
 class ExportOnnxRequest(BaseModel):
     """Export one ``.pt`` checkpoint to ``<onnx_path>`` + ``<onnx_path>.meta.json``."""
+
+    checkpoint_path: str
+    onnx_path: str
+
+
+class ExportTrtOnnxRequest(BaseModel):
+    """Re-export one ``.pt`` as a TensorRT-*ready* ONNX graph at ``<onnx_path>``.
+
+    For the archs whose standard ONNX bakes a data-dependent NMS that TensorRT
+    cannot compile (yolox, retinanet, fasterrcnn), this produces the raw-output +
+    ``EfficientNMS_TRT`` graph the compiler does accept. Everything else already
+    compiles from its standard export and does not need this.
+    """
 
     checkpoint_path: str
     onnx_path: str
@@ -717,6 +731,86 @@ def export_onnx(req: ExportOnnxRequest):
     meta_path = onnx_path.with_suffix(".meta.json")
     log.info("exported %s -> %s", checkpoint, onnx_path)
     return {"onnx_path": str(onnx_path), "meta_path": str(meta_path)}
+
+
+@app.post("/export_trt_onnx")
+def export_trt_onnx(req: ExportTrtOnnxRequest):
+    """Produce the TensorRT-ready ONNX for a checkpoint, without building anything.
+
+    This exists for the remote build nodes (``buildnode/``). A node compiles
+    engines without torch, which works for rtdetr/rfdetr — they compile straight
+    from their standard ONNX — but not for yolox, retinanet or fasterrcnn, whose
+    graphs must first be re-exported as raw outputs plus an ``EfficientNMS_TRT``
+    node. That re-export runs off the torch model, so it has to happen here.
+
+    CPU-only and GPU-free, exactly like ``/export_onnx``: this is a torch ONNX
+    export, not a compile. It takes ``_export_lock`` rather than
+    ``_trt_build_lock`` so it does not queue behind an engine build, and is safe
+    to call while the GPU is training.
+
+    Returns ``{onnx_path, meta_path, arch, prepared}``. ``prepared`` is False for
+    an arch that needs no re-export — the standard ONNX was copied through
+    unchanged, and the caller can send it to a node as-is.
+    """
+    log = _service_log()
+    checkpoint = Path(req.checkpoint_path)
+    if not checkpoint.exists():
+        log.error("trt-onnx export rejected: checkpoint not found: %s", checkpoint)
+        raise HTTPException(status_code=400, detail=f"checkpoint not found: {checkpoint}")
+
+    with _export_lock:
+        try:
+            from ml.checkpoint_info import inspect_checkpoint
+            from ml.onnx_export.cli import export_checkpoint
+            from ml.trt_export.arch import get_trt_prep, has_trt_prep
+            from ml.trt_export.cli import _load_adapter
+
+            onnx_path = Path(req.onnx_path)
+            onnx_path.parent.mkdir(parents=True, exist_ok=True)
+            arch = inspect_checkpoint(checkpoint).get("arch")
+
+            if not has_trt_prep(arch):
+                # Nothing to prepare — the standard export is already compilable.
+                written = export_checkpoint(str(checkpoint), str(onnx_path))
+                return {
+                    "onnx_path": str(written),
+                    "meta_path": str(Path(written).with_suffix(".meta.json")),
+                    "arch": arch,
+                    "prepared": False,
+                }
+
+            # The prep needs the meta the standard exporter writes, so export once
+            # to a scratch name first and carry its sidecar over verbatim.
+            staging = onnx_path.with_name(onnx_path.stem + ".standard.onnx")
+            export_checkpoint(str(checkpoint), str(staging))
+            meta = json.loads(staging.with_suffix(".meta.json").read_text())
+
+            get_trt_prep(arch)(_load_adapter(checkpoint), meta, onnx_path)
+            onnx_path.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2))
+
+            # The scratch standard export and the prep's own raw intermediate are
+            # both inputs, not outputs; leaving them would double the disk cost of
+            # every remote build.
+            staging.unlink(missing_ok=True)
+            staging.with_suffix(".meta.json").unlink(missing_ok=True)
+            raw = onnx_path.with_name(onnx_path.name.replace(".onnx", ".raw.onnx"))
+            raw.unlink(missing_ok=True)
+        except HTTPException:
+            raise
+        except (ValueError, FileNotFoundError) as exc:
+            log.warning("trt-onnx export rejected: %s", exc)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:  # noqa: BLE001 - surface export failures to the caller
+            log.exception("trt-onnx export failed: %s", exc)
+            raise HTTPException(status_code=500, detail=f"trt-onnx export failed: {exc}")
+
+    log.info("prepared TRT onnx %s -> %s (%s)", checkpoint, onnx_path, arch)
+    return {
+        "onnx_path": str(onnx_path),
+        "meta_path": str(onnx_path.with_suffix(".meta.json")),
+        "arch": arch,
+        "prepared": True,
+    }
 
 
 @app.post("/export_trt")

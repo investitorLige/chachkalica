@@ -201,6 +201,45 @@ services:
               count: all
               capabilities: [gpu]
 
+  # A TensorRT build node on THIS box, for exercising the remote-build path
+  # without a second machine. Profile-gated: `docker compose up` does not start
+  # it, because the whole point of a build node is to run somewhere else, and on
+  # this box it would contend with `trainer` for the same GPU.
+  #
+  #   BUILDNODE_TOKEN=dev-token docker compose --profile buildnode up -d buildnode
+  #
+  # Deploy it for real with buildnode/docker-compose.yml on the target machine.
+  # See chachkalica/docs/build-nodes.md.
+  buildnode:
+    profiles: ["buildnode"]
+    build:
+      context: .
+      dockerfile: buildnode/Dockerfile
+    environment:
+      # Weak default on purpose — this service is opt-in, local, and throwaway.
+      # It is only safe BECAUSE the port below is bound to loopback. A required
+      # variable (${VAR:?}) would be stricter but breaks `docker compose config`
+      # for everyone even with the profile inactive, so the port is the control.
+      BUILDNODE_TOKEN: ${BUILDNODE_TOKEN:-dev-token}
+      BUILDNODE_PORT: 8300
+    ports:
+      # 127.0.0.1, unlike every other service here: a build node compiles
+      # arbitrary uploaded ONNX on the GPU, and this one ships a guessable token.
+      # Publishing it on the LAN would hand that to anyone who can reach the box.
+      # A REAL node (buildnode/docker-compose.yml) binds all interfaces and
+      # demands a real token instead.
+      - "127.0.0.1:${BUILDNODE_HOST_PORT:-8300}:8300"
+    volumes:
+      - buildnode-work:/var/lib/buildnode
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   sam-backend:
     # Grounding-DINO + SAM ML backend, folded in from its standalone
     # ml_backends/sam/docker-compose.yml so it shares the same data mount as
@@ -241,3 +280,4 @@ services:
 
 volumes:
   fleet-postgres:
+  buildnode-work:

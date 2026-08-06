@@ -10,9 +10,10 @@ import time
 from pathlib import Path
 
 from django.utils import timezone
+from rq.job import Dependency, Job
 
 from training.models import EvalRun, ExportRun, TrainingRun
-from training.services import autoeval, exports, ingest, runner
+from training.services import autoeval, buildnode, bundles, exports, ingest, runner
 
 POLL_INTERVAL = 10       # seconds between status checks
 MAX_WAIT = 60 * 60 * 48  # give up after 48h
@@ -23,6 +24,32 @@ MAX_WAIT = 60 * 60 * 48  # give up after 48h
 # row is stranded at "running" while training carries on in the trainer service.
 # Enqueue every run_training/run_eval with job_timeout=JOB_TIMEOUT.
 JOB_TIMEOUT = MAX_WAIT + 60 * 60  # poll window + an hour for launch/ingest
+
+
+def depends_on(prev_job) -> Dependency | None:
+    """``depends_on=`` for chaining a queued job onto ``prev_job``.
+
+    The trainer service allows only one train/eval/pipeline job at a time (see
+    ``friendy_chachkalica.service.MAX_CONCURRENT``) and rejects a second launch
+    with a 409. RQ pulls jobs off one shared queue with several worker
+    processes, so a batch enqueued back-to-back — the auto-eval scheduler
+    after a training run, or a "Launch selected" bulk admin action — used to
+    race each other for that single slot, with the loser's row landing on
+    ``error`` ("launch failed: 409 ..."). Chain every job in a batch onto the
+    one before it with this so a worker never even picks up job N+1 until job
+    N's RQ call has actually returned.
+
+    ``allow_failure=True``: the point is strict ordering, not gating later
+    jobs on earlier ones succeeding — one bad run must not strand the rest of
+    a batch. Guarded on ``isinstance(prev_job, Job)`` because ``Dependency``
+    validates its ``jobs`` eagerly and raises on anything else; real
+    ``queue.enqueue()`` always returns a ``Job``, but a caller with a stubbed
+    queue (as in the test suite) does not, and that must not blow up the
+    scheduling loop.
+    """
+    if not isinstance(prev_job, Job):
+        return None
+    return Dependency(jobs=[prev_job], allow_failure=True)
 
 
 def _mark(run: TrainingRun, status: str, *, error: str = "", finished: bool = False):
@@ -304,3 +331,157 @@ def run_export_trt(export_id: int) -> dict:
         raise
 
     return _finish_export(run, result, fmt="engine", precision=run.precision)
+
+
+# ── remote builds ────────────────────────────────────────────────────────────
+#
+# A remote export is the same operator intent as run_export_trt — "give me an
+# engine and a bundle for this model" — but almost none of the same steps, which
+# is why it is a separate job rather than a branch inside that one. The trainer
+# writes its artifact onto a filesystem we share and we bundle it afterwards; a
+# node shares nothing, so we ship it a graph and it hands back a finished bundle.
+# What the two have in common is the ExportRun row, and that is enough.
+
+# The ONNX export runs locally first, then the whole remote round trip.
+EXPORT_REMOTE_JOB_TIMEOUT = (
+    runner.EXPORT_TIMEOUT + buildnode.MAX_WAIT
+    + buildnode.SUBMIT_TIMEOUT + buildnode.DOWNLOAD_TIMEOUT + 60
+)
+
+
+def _remote_graph(run: ExportRun) -> tuple[Path, bool]:
+    """The ONNX to upload, and whether it is EfficientNMS-prepared.
+
+    A node compiles without torch, which the DETR-family archs allow straight from
+    their standard export but yolox/retinanet/fasterrcnn do not — those need their
+    baked NMS replaced first, off the torch model. ``/export_trt_onnx`` decides
+    which case applies and does the re-export when needed, so this always returns
+    something the node can actually compile.
+    """
+    staging = exports.exports_root() / "_remote"
+    staging.mkdir(parents=True, exist_ok=True)
+    checkpoint = Path(run.checkpoint_path)
+
+    if checkpoint.suffix.lower() != ".pt":
+        # Already an exported graph. Only the passthrough archs can be sent as-is;
+        # for the rest we have no checkpoint to re-export from, so let the node
+        # refuse it with its own (clearer) message rather than guessing here.
+        return checkpoint, False
+
+    target = staging / f"{Path(run.output_path).stem}.trt.onnx"
+    result = runner.export_trt_onnx(checkpoint, target)
+    return Path(result["onnx_path"]), bool(result.get("prepared"))
+
+
+def _remote_spec(run: ExportRun, graph: Path, prepared: bool) -> dict:
+    """The build spec, with every path reduced to a name the node will accept."""
+    request = exports.build_bundle_request(run.model, graph)
+    if request is None:
+        raise RuntimeError(
+            f"{run.model.name} has no pipeline geometry to bundle (it was trained on "
+            f"plain full frames), so there is nothing for a build node to assemble."
+        )
+
+    # The node resolves uploads by fixed basename; anything else in the request
+    # would be a path on THIS machine that means nothing over there.
+    request["model_checkpoint"] = "model.onnx"
+    if isinstance(request.get("detector"), dict):
+        # Never upload the detector: ours is models/people/best_ckpt.engine, an
+        # engine compiled for this box's GPU, which is exactly the artifact that
+        # cannot travel. The node compiles its own from the graph baked into its
+        # image. This is the whole reason a remote bundle is usable at all.
+        request["detector"] = {**request["detector"], "checkpoint": "builtin"}
+
+    return {
+        "name": Path(run.output_path).stem,
+        "fmt": "engine",
+        "precision": run.precision or "fp16",
+        "conf": request.get("score_threshold"),
+        "input_hw": list(run.input_hw) if run.input_hw else None,
+        "model_prepared": prepared,
+        "request": request,
+    }
+
+
+def _finish_remote_export(run: ExportRun, bundle_dir: Path, status: dict) -> dict:
+    """Mark a remote export done. The sibling of :func:`_finish_export`.
+
+    Not a reuse of it: that one writes a pipeline sidecar beside a local artifact
+    and then bundles it, and neither step applies here — the node already
+    assembled the bundle, and the artifact only exists inside it.
+    """
+    result = dict(status.get("result") or {})
+    result["node"] = run.node.name if run.node else None
+    result["remote_build_id"] = run.remote_build_id
+
+    run.bundle_dir = str(bundle_dir)
+    run.output_path = str(bundle_dir / "models" / "model.engine")
+    run.result = result
+    run.status = ExportRun.OK
+    run.finished_at = timezone.now()
+    run.save(update_fields=[
+        "bundle_dir", "output_path", "result", "status", "finished_at"])
+    return result
+
+
+def run_export_remote(export_id: int) -> dict:
+    """Build one model's engine + bundle on a remote node. See ``ExportRun.node``.
+
+    Export the graph locally (CPU), upload it, wait, download the bundle, unpack
+    it under ``bundles_root/<node>/``. The bundle is the deliverable — there is no
+    loose artifact on this machine, because the engine inside it was compiled for
+    the node's GPU and would not load here anyway.
+    """
+    run = ExportRun.objects.get(pk=export_id)
+    run.status, run.started_at = ExportRun.RUNNING, timezone.now()
+    run.save(update_fields=["status", "started_at"])
+
+    node = run.node
+    if node is None:
+        run.status, run.last_error = ExportRun.ERROR, "no build node on this export run"
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "last_error", "finished_at"])
+        raise RuntimeError(run.last_error)
+
+    build_id = ""
+    try:
+        graph, prepared = _remote_graph(run)
+        meta = graph.with_suffix(".meta.json")
+        if not meta.exists():
+            raise RuntimeError(
+                f"{graph.name} has no {meta.name} beside it; a node cannot compile a "
+                f"graph without its Contract-B meta."
+            )
+
+        spec = _remote_spec(run, graph, prepared)
+        build_id = buildnode.submit_build(
+            node, spec, {"model": graph, "model_meta": meta})
+        run.remote_build_id = build_id
+        run.save(update_fields=["remote_build_id"])
+
+        status = buildnode.wait(node, build_id)
+        if status.get("status") != "ok":
+            raise RuntimeError(
+                f"build node {node.name} failed the build: "
+                f"{status.get('error') or 'no error reported'}\n"
+                f"{(status.get('log_tail') or '')[-2000:]}"
+            )
+
+        # Namespaced by node: an engine is only valid on the GPU that built it, so
+        # which machine a bundle came from is part of what it IS, not metadata.
+        destination = bundles.bundles_root() / node.name
+        tarball = destination / f".{build_id}.tar.gz"
+        try:
+            buildnode.download_artifact(node, build_id, tarball)
+            bundle_dir = buildnode.extract_bundle(tarball, destination)
+        finally:
+            tarball.unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001 - surface node/network errors on the row
+        run.status, run.last_error, run.finished_at = ExportRun.ERROR, str(exc), timezone.now()
+        run.save(update_fields=["status", "last_error", "finished_at"])
+        if build_id:
+            buildnode.cleanup(node, build_id)
+        raise
+
+    buildnode.cleanup(node, build_id)
+    return _finish_remote_export(run, bundle_dir, status)

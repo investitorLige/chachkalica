@@ -27,9 +27,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..config import PipelineConfig, load_pipeline_config
-from ..pipeline import _inference_score_threshold
-from ..run import _needs_detector
+# Only ``config`` — deliberately not ``pipeline``/``run``, which import torch at
+# module scope. Assembling a bundle is pure file work, and keeping this import
+# list torch-free is what lets a slim build node (buildnode/) run it with nothing
+# but TensorRT installed. The two predicates below used to live in those modules.
+from ..config import PipelineConfig, _inference_score_threshold, _needs_detector, load_pipeline_config
 from .manifest import build_manifest
 from .readme import render_readme
 from .vendor import vendor_runtime
@@ -50,7 +52,16 @@ def _artifact_meta(path: Path) -> Dict[str, Any]:
 
 
 def _copy_artifact(source: Path, destination: Path) -> None:
-    """Copy an already-exported artifact plus its ``.meta.json`` sidecar."""
+    """Copy an already-exported artifact plus its ``.meta.json`` sidecar.
+
+    A prebuilt ``.engine`` also gets its ``<name>.engine.json`` build-provenance
+    sidecar copied along, when present. That sidecar carries the TensorRT version
+    the engine was built with (see ``trt_export/cli.py::build_engine``); shipping
+    it in the bundle is what lets ``TrtModel`` (``trt_infer/session.py``) catch a
+    stale or wrong-version cached engine with a clear error instead of an opaque
+    "failed to deserialize" one. Not fatal if missing — older/hand-built engines
+    just skip the check.
+    """
     meta = source.with_suffix(".meta.json")
     if not meta.exists():
         raise SystemExit(
@@ -59,6 +70,10 @@ def _copy_artifact(source: Path, destination: Path) -> None:
         )
     shutil.copy2(source, destination)
     shutil.copy2(meta, destination.with_suffix(".meta.json"))
+
+    engine_provenance = Path(str(source) + ".json")
+    if engine_provenance.exists():
+        shutil.copy2(engine_provenance, Path(str(destination) + ".json"))
 
 
 def _export_role(
@@ -76,14 +91,18 @@ def _export_role(
     ``.engine`` (copied with its sidecar) — chachak requests legitimately point at
     any of the three.
     """
-    from friendy_chachkalica.ml.onnx_export.cli import export_checkpoint
-
     suffix = source.suffix.lower()
     onnx_path = models_dir / f"{role}.onnx"
     engine_path = models_dir / f"{role}.engine"
     produced: Dict[str, Path] = {}
 
     if suffix == ".pt":
+        # Imported here, not at the top of the function: the ONNX exporter needs
+        # torch, and this is the only branch that uses it. A caller handing over
+        # already-exported artifacts (the slim build node always does) must not be
+        # made to install the training stack for an import it never calls.
+        from friendy_chachkalica.ml.onnx_export.cli import export_checkpoint
+
         print(f"[bundle] {role}: exporting {source.name} -> {onnx_path.name}")
         export_checkpoint(source, onnx_path)
         produced["onnx"] = onnx_path
@@ -115,12 +134,22 @@ def _export_role(
         max_batch["engine"] = _engine_profile_batch(engine_path)
 
     meta = _artifact_meta(next(iter(produced.values())))
+    tensorrt_version = None
+    if "engine" in produced:
+        engine_provenance = Path(str(produced["engine"]) + ".json")
+        if engine_provenance.exists():
+            try:
+                tensorrt_version = json.loads(engine_provenance.read_text()).get("tensorrt_version")
+            except (json.JSONDecodeError, OSError):
+                tensorrt_version = None
+
     return {
         "paths": produced,
         "max_batch": max_batch,
         "arch": arch,
         "classes": meta.get("class_map") or {},
         "source": str(source),
+        "tensorrt_version": tensorrt_version,
     }
 
 
@@ -152,10 +181,20 @@ def _batchable_in_trt(arch: str) -> bool:
     archs compile the standard ONNX graph, whose outputs carry a single detection
     axis and no batch dimension — there is nothing to split them by. So only the
     former get a batch profile wider than 1.
-    """
-    from friendy_chachkalica.ml.trt_export.arch import get_trt_prep
 
-    return get_trt_prep(arch) is not None
+    The cap this produces is enforced twice over: ``manifest.batch_caps`` clamps the
+    bundle's configured batch sizes, and ``TrtModel`` rejects an oversized submission
+    outright. The second check is the load-bearing one — TensorRT reports an
+    over-profile ``set_input_shape`` through its logger rather than an exception and
+    then runs at its previous shape, so without it a passthrough engine silently
+    returns the first image's detections for every image in the batch.
+    """
+    # has_trt_prep, not get_trt_prep: the answer is a table lookup, but *fetching*
+    # the callable imports torch, and bundle assembly must stay torch-free so the
+    # slim build node (buildnode/) can run it.
+    from friendy_chachkalica.ml.trt_export.arch import has_trt_prep
+
+    return has_trt_prep(arch)
 
 
 def _build_engine(
@@ -377,6 +416,11 @@ def export_bundle_for_config(
                     "checkpoint": info["source"],
                     "arch": info["arch"],
                     "classes": info["classes"],
+                    # Only set for an engine artifact; traceability only (nothing
+                    # reads it back) — the load-bearing check is in
+                    # trt_infer/session.py, run against the shipped
+                    # `<name>.engine.json` sidecar, not this manifest field.
+                    "tensorrt_version": info.get("tensorrt_version"),
                 }
                 for role, info in exported.items()
             },

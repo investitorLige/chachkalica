@@ -3,10 +3,20 @@
 
 Owns the deserialized engine + execution context and runs one pre-processed
 ``[B,3,H,W]`` batch through it, returning the three Contract-A outputs
-(``boxes``/``scores``/``labels``) in that canonical order — a single
-``(boxes, scores, labels)`` triple for ``B == 1`` (unchanged from before, so
-every existing single-image caller keeps working as-is), or a list of one
-triple per image for ``B > 1``.
+(``boxes``/``scores``/``labels``) in that canonical order.
+
+Two entry points over one implementation:
+
+* :meth:`TrtModel.run_torch` — torch in, torch out, everything staying in device
+  memory. **Always** a list of ``B`` triples. This is the path
+  :class:`~trt_infer.adapter.TrtAdapter` uses, so a person crop never round-trips
+  through the host.
+* :meth:`TrtModel.run` — the original numpy contract, kept verbatim for callers
+  that predate ``run_torch`` (``person_model_test/run_yolox_export_eval.py``,
+  ``inferlica/benchmark/kernel_util.py``): numpy in, numpy out, a bare
+  ``(boxes, scores, labels)`` triple when ``B == 1`` and a list of triples
+  otherwise. It is a thin wrapper over ``run_torch``, so the TensorRT plumbing
+  exists once and the two paths cannot drift.
 
 Device memory and the CUDA stream are managed with **torch** (present wherever a
 GPU runtime runs), so there is no pycuda / cuda-python dependency: input bytes go
@@ -17,6 +27,7 @@ TensorRT output allocator that (re)allocates a torch buffer on demand.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -95,6 +106,11 @@ class TrtModel:
         # request to cuda rather than silently mis-binding.
         name = str(device).lower()
         self._device = "cuda" if ("cuda" in name or "gpu" in name) else "cuda"
+        # The execution context binds to whichever device is current at creation.
+        # `run` always allocated its own input here so that was implicit; `run_torch`
+        # accepts a caller-owned tensor, which could sit on a different GPU and would
+        # otherwise be read as garbage. Recorded so it can be rejected instead.
+        self._device_index = torch.cuda.current_device()
 
         self._logger = trt.Logger(trt.Logger.WARNING)
         # Register the standard TensorRT plugins (EfficientNMS_TRT et al.) before
@@ -104,6 +120,7 @@ class TrtModel:
         # build+load in one process worked without this — but a fresh runtime
         # (the real trt_infer path) must register them itself.
         trt.init_libnvinfer_plugins(self._logger, "")
+        _check_engine_version(self.path, trt.__version__)
         runtime = trt.Runtime(self._logger)
         self.engine = runtime.deserialize_cuda_engine(self.path.read_bytes())
         if self.engine is None:
@@ -138,22 +155,51 @@ class TrtModel:
         else:
             self._emit_order = list(self._output_names)
 
+        # Largest batch this engine's optimization profile accepts. Submitting more
+        # is not a soft failure: TensorRT rejects set_input_shape through its *logger*
+        # rather than an exception, leaves the context bound to its previous shape, and
+        # runs anyway — so every image past the first comes back holding a slice of the
+        # first one's output. For a passthrough arch there isn't even a batch axis to
+        # index, so `_split_passthrough` walks the query axis and `reshape(-1, 4)`
+        # hides it. Checked up front instead.
+        self._max_batch = _profile_max_batch(self.engine, self.input_name)
+
         self._Allocator = _build_allocator_class(trt, torch)
+
+    @property
+    def device(self):
+        """The device the execution context is bound to — where inputs must live."""
+        return self._device
+
+    @property
+    def max_batch(self):
+        """Largest batch this engine's optimization profile accepts, or ``None`` if
+        unreadable. Public mirror of :attr:`_max_batch` — read by callers (e.g.
+        ``chachak.infer.infer_in_chunks``) that want to chunk *before* handing this
+        engine a same-shaped stack, rather than relying on :meth:`run_torch` to
+        reject an oversized one after the fact."""
+        return self._max_batch
 
     def to(self, device) -> "TrtModel":
         # The engine is bound to the GPU it was built on; nothing to move. Kept for
         # interface parity with OnnxModel.to().
         return self
 
-    def run(self, batched: np.ndarray) -> list:
+    def run_torch(self, batched) -> list:
+        """``[B,3,H,W]`` CUDA float32 -> a list of ``B`` CUDA ``[boxes, scores, labels]``.
+
+        Always a list, never the bare-triple special case — a caller holding real
+        torch tensors has no legacy shape to preserve. The returned tensors are
+        views into the output allocator's buffers, which stay alive through the
+        views' storage; a fresh allocator per call means no aliasing between calls.
+        """
         trt, torch = self._trt, self._torch
 
-        batched = np.ascontiguousarray(batched, dtype=np.float32)
+        batched = self._as_engine_input(batched)  # keep alive through execute
         batch_size = int(batched.shape[0])
-        input_gpu = torch.from_numpy(batched).to(self._device)  # keep alive through execute
 
         self.context.set_input_shape(self.input_name, tuple(int(d) for d in batched.shape))
-        self.context.set_tensor_address(self.input_name, int(input_gpu.data_ptr()))
+        self.context.set_tensor_address(self.input_name, int(batched.data_ptr()))
 
         allocator = self._Allocator()
         for tname in self._output_names:
@@ -171,37 +217,114 @@ class TrtModel:
                 shape = tuple(int(d) for d in self.context.get_tensor_shape(tname))
             dtype = _torch_dtype_for(trt, torch, self.engine.get_tensor_dtype(tname))
             numel = int(np.prod(shape)) if len(shape) else 1
-            typed = self._torch.empty(0, dtype=dtype)
-            elem_size = typed.element_size()
+            elem_size = torch.empty(0, dtype=dtype).element_size()
             buf = allocator.buffers[tname]
-            flat = buf[: numel * elem_size].view(dtype)
-            outputs[tname] = flat.reshape(shape).detach().cpu().numpy()
+            outputs[tname] = buf[: numel * elem_size].view(dtype).reshape(shape)
 
         ordered = [outputs[tname] for tname in self._emit_order]
         if self._efficientnms:
-            triples = _unpack_efficientnms(ordered, batch_size)
-        else:
-            triples = _split_passthrough(ordered, batch_size)
-        # B == 1: return the bare triple, exactly what every caller written
-        # before batching existed still expects. B > 1: return the list so a
-        # caller that actually submitted a real batch can tell images apart.
-        return triples[0] if batch_size == 1 else triples
+            return _unpack_efficientnms(ordered, batch_size)
+        return _split_passthrough(ordered, batch_size)
+
+    def run(self, batched: np.ndarray) -> list:
+        """numpy in, numpy out — the pre-``run_torch`` contract, unchanged.
+
+        Output dtypes are whatever the engine declares (EfficientNMS labels stay
+        int32, which is why callers here ``.astype(np.int64)``), and ``B == 1``
+        returns the bare triple rather than a one-element list.
+        """
+        torch = self._torch
+        array = np.ascontiguousarray(batched, dtype=np.float32)
+        triples = self.run_torch(torch.from_numpy(array).to(self._device))
+        out = [[tensor.detach().cpu().numpy() for tensor in triple] for triple in triples]
+        # B == 1: the bare triple, exactly what every caller written before batching
+        # existed still expects. B > 1: the list, so a caller that actually submitted
+        # a real batch can tell images apart.
+        return out[0] if len(out) == 1 else out
+
+    def _as_engine_input(self, batched):
+        """Coerce to the contiguous float32 CUDA tensor the context expects."""
+        torch = self._torch
+        if not torch.is_tensor(batched):
+            raise TypeError(
+                f"run_torch expects a torch tensor, got {type(batched).__name__}; "
+                f"use run() for numpy input"
+            )
+        if batched.is_cuda and batched.device.index not in (None, self._device_index):
+            raise ValueError(
+                f"input is on cuda:{batched.device.index} but this engine's context "
+                f"is on cuda:{self._device_index}; TensorRT would read the wrong "
+                f"device memory"
+            )
+        batch = int(batched.shape[0])
+        if self._max_batch is not None and batch > self._max_batch:
+            raise ValueError(
+                f"{self.path.name} was built with a batch profile of at most "
+                f"{self._max_batch}, but {batch} images were submitted as one batch. "
+                f"TensorRT would silently return the first image's detections for all "
+                f"of them. Send at most {self._max_batch} at a time, or rebuild the "
+                f"engine with a wider batch profile."
+            )
+        return batched.to(device=self._device, dtype=torch.float32).contiguous()
+
+
+def _check_engine_version(engine_path: Path, runtime_version: str) -> None:
+    """Fail loudly if ``engine_path`` was built by a different TensorRT than this one.
+
+    An engine plan only deserializes on the exact TensorRT version that built it —
+    a mismatch doesn't raise from ``deserialize_cuda_engine``, it just returns
+    ``None`` (the ``RuntimeError`` right after this call), which reads as "this
+    file is corrupt" with no hint that the real problem is a stale cached engine
+    or a container image that drifted to a newer TensorRT. The builder
+    (``friendy_chachkalica.ml.trt_export.cli.build_engine``) always stamps its own
+    ``trt.__version__`` into ``<engine>.json`` beside the engine; check it up
+    front instead of letting deserialization fail opaquely.
+    """
+    provenance_path = Path(str(engine_path) + ".json")
+    if not provenance_path.exists():
+        return  # no provenance sidecar (e.g. a hand-built engine) — nothing to check
+    try:
+        built_version = json.loads(provenance_path.read_text()).get("tensorrt_version")
+    except (json.JSONDecodeError, OSError):
+        return
+    if built_version and built_version != runtime_version:
+        raise RuntimeError(
+            f"{engine_path} was built with TensorRT {built_version}, but this "
+            f"runtime is TensorRT {runtime_version} — engine plans only load on "
+            f"the exact version that built them. Rebuild the engine here, or run "
+            f"it where TensorRT {built_version} is installed (see "
+            f"{provenance_path.name})."
+        )
+
+
+def _profile_max_batch(engine, input_name):
+    """Batch ceiling from the engine's first optimization profile, or None if unreadable."""
+    try:
+        return int(engine.get_tensor_profile_shape(input_name, 0)[-1][0])
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
 
 
 def _unpack_efficientnms(ordered: list, batch_size: int) -> list:
     """[num_detections, boxes, scores, classes] (fixed-size *per image*) ->
     one ``[boxes[Ni,4], scores[Ni], labels[Ni]]`` triple per image, each sliced
-    to that image's own valid detection count."""
+    to that image's own valid detection count.
+
+    The counts are the one thing that genuinely has to reach the host — the plugin
+    zero-pads the tail, and a score mask can't stand in for them because callers
+    legitimately pass ``score_threshold=0.0``. That is a single ``B x 4``-byte copy
+    per *batch*, on an already-synchronized stream, and the slices it drives are
+    stride-preserving views rather than copies.
+    """
     num_det, det_boxes, det_scores, det_classes = ordered
-    num_det = np.asarray(num_det).reshape(batch_size, -1)[:, 0]
-    det_boxes = np.asarray(det_boxes).reshape(batch_size, -1, 4)
-    det_scores = np.asarray(det_scores).reshape(batch_size, -1)
-    det_classes = np.asarray(det_classes).reshape(batch_size, -1)
-    triples = []
-    for i in range(batch_size):
-        n = int(num_det[i])
-        triples.append([det_boxes[i, :n], det_scores[i, :n], det_classes[i, :n]])
-    return triples
+    counts = num_det.reshape(batch_size, -1)[:, 0].cpu().tolist()
+    det_boxes = det_boxes.reshape(batch_size, -1, 4)
+    det_scores = det_scores.reshape(batch_size, -1)
+    det_classes = det_classes.reshape(batch_size, -1)
+    return [
+        [det_boxes[i, :n], det_scores[i, :n], det_classes[i, :n]]
+        for i, n in enumerate(int(count) for count in counts)
+    ]
 
 
 def _split_passthrough(ordered: list, batch_size: int) -> list:

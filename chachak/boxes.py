@@ -351,7 +351,11 @@ def merge_predictions(
     """
     preds = [p for p in preds_list if p is not None and p.numel() > 0]
     if not preds:
-        return torch.zeros((0, 6))
+        # Take the device from whatever we were handed — the inputs can all be empty
+        # and still be CUDA tensors. Returning a bare CPU tensor here would hand a
+        # caller working on the GPU a silently device-mismatched result.
+        device = next((p.device for p in preds_list if p is not None), None)
+        return torch.zeros((0, 6)) if device is None else torch.zeros((0, 6), device=device)
     preds = torch.cat(preds, dim=0)
 
     boxes = _xywhn_to_xyxy_tensor(preds[:, :4], frame_w, frame_h)

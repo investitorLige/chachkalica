@@ -630,6 +630,20 @@ class ExportRun(models.Model):
     precision = models.CharField(max_length=8, blank=True)
     input_hw = models.JSONField(null=True, blank=True)  # [H, W] or null (dynamic profile)
 
+    # Where the build ran. NULL means the local trainer — the only possibility
+    # before build nodes existed, so every historical row reads correctly. A row
+    # with a node was built remotely by ``jobs.run_export_remote``, which produces
+    # a whole bundle rather than a loose artifact; see ``docs/build-nodes.md``.
+    node = models.ForeignKey(
+        # String reference: BuildNode is declared below this class.
+        "BuildNode", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="export_runs",
+        help_text="Blank = built on the local trainer.",
+    )
+    # The node's own id for the build, kept so an operator can go read its log or
+    # clean up a scratch dir by hand after a failure.
+    remote_build_id = models.CharField(max_length=64, blank=True)
+
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=QUEUED)
     result = models.JSONField(null=True, blank=True)  # runner.export_onnx/export_trt's return dict
     bundle_dir = models.CharField(max_length=1024, blank=True)
@@ -645,6 +659,79 @@ class ExportRun(models.Model):
 
     def __str__(self) -> str:
         return f"{self.get_kind_display()} export #{self.pk} — {self.model.name}"
+
+
+class BuildNode(models.Model):
+    """One remote machine that can compile TensorRT engines on its own GPU.
+
+    A TensorRT engine only deserializes on the GPU model and TensorRT version that
+    built it, so an engine this box builds runs nowhere else. A build node is the
+    answer: a slim service (``buildnode/`` at the repo root) deployed on the target
+    machine, which takes an already-exported ONNX and hands back a finished infer
+    bundle compiled for *its* hardware. See ``docs/build-nodes.md``.
+
+    Unlike the trainer — a single address in an env var (``runner.base_url``) —
+    there can be many of these, so they are rows. Everything below ``token`` is a
+    cached snapshot of the node's ``/health``, refreshed by the admin's ping
+    action; nothing here is authoritative about the node, it is just the last
+    thing it said about itself.
+    """
+
+    ACTIVE = "active"
+    RETIRED = "retired"
+    STATUS_CHOICES = [(ACTIVE, "active"), (RETIRED, "retired")]
+
+    OK = "ok"
+    ERROR = "error"
+    UNKNOWN = "unknown"
+    HEALTH_CHOICES = [(OK, "ok"), (ERROR, "error"), (UNKNOWN, "unknown")]
+
+    name = models.SlugField(
+        max_length=64, unique=True,
+        help_text="Short identifier, also the directory bundles from this node are "
+                  "filed under inside the bundle root.",
+    )
+    base_url = models.CharField(
+        max_length=512,
+        help_text="Where the node's service listens, e.g. http://10.10.155.40:8300",
+    )
+    token = models.CharField(
+        max_length=128, blank=True,
+        help_text="Must equal the BUILDNODE_TOKEN the node was started with — the "
+                  "node is authoritative, this is a copy. Use the 'Generate a token' "
+                  "action to mint one when setting a node up, then pass the same "
+                  "value to the node's environment.",
+    )
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=ACTIVE)
+    notes = models.TextField(blank=True)
+
+    # --- last /health snapshot ------------------------------------------------
+    # Denormalized out of last_health so they can be listed, sorted and filtered
+    # in the changelist; last_health keeps the whole body, including any field a
+    # newer node reports that this app does not know about yet.
+    gpu_name = models.CharField(max_length=128, blank=True)
+    compute_capability = models.CharField(max_length=16, blank=True)
+    tensorrt_version = models.CharField(max_length=32, blank=True)
+    driver_version = models.CharField(max_length=32, blank=True)
+    last_health = models.JSONField(null=True, blank=True)
+    last_status = models.CharField(max_length=16, choices=HEALTH_CHOICES, default=UNKNOWN)
+    last_error = models.TextField(blank=True)
+    last_seen_at = models.DateTimeField(
+        null=True, blank=True, help_text="Last time the node answered a ping successfully.")
+    last_checked_at = models.DateTimeField(
+        null=True, blank=True, help_text="Last time a ping was attempted, successful or not.")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.gpu_name})" if self.gpu_name else self.name
+
+    @property
+    def api_url(self) -> str:
+        return self.base_url.rstrip("/")
 
 
 class EvalRun(models.Model):

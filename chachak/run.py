@@ -31,7 +31,9 @@ try:
         resolve_device,
     )
     from .boxes import merge_predictions
-    from .config import load_pipeline_config
+    # _needs_detector is re-exported (not defined here) so bundle_export can
+    # reach it without importing this module's torch — see chachak/config.py.
+    from .config import _needs_detector, load_pipeline_config  # noqa: F401
     from .detector import load_detector
     from .infer import load_checkpoint_adapter
     from .pipeline import _frame_size
@@ -51,19 +53,11 @@ except ImportError:  # run as a flat script
         resolve_device,
     )
     from boxes import merge_predictions
-    from config import load_pipeline_config
+    from config import _needs_detector, load_pipeline_config  # noqa: F401
     from detector import load_detector
     from infer import load_checkpoint_adapter
     from pipeline import _frame_size
     from registry import build_pipeline
-
-
-def _needs_detector(config) -> bool:
-    if config.pipeline in {"people_detect_first", "batch_people"}:
-        return True
-    if config.pipeline == "chain":
-        return any(c in {"people_detect_first", "batch_people"} for c in config.chain)
-    return False
 
 
 def build_pipeline_runtime(config, device):

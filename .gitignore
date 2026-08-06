@@ -10,3 +10,14 @@ person_model_test/
 bench_out/
 
 models/
+
+# Bundle-exporter smoke-test output (build artifacts; carried a vendored copy of
+# chachak that silently drifted from the real one).
+dist/
+
+# Python bytecode (58 .pyc files were tracked; nothing should compile into the repo).
+__pycache__/
+*.py[cod]
+
+buildnode.tar.gz
+trt_build_export.zip

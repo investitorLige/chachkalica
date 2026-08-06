@@ -62,6 +62,34 @@ class PipelineConfig:
     extra_checkpoints: List[Path] = field(default_factory=list)
 
 
+# ── Config predicates ────────────────────────────────────────────────────────
+# These read nothing but the config, yet they used to live in ``pipeline.py`` and
+# ``run.py`` — both of which import torch at module scope. ``bundle_export`` needs
+# them and nothing else from those modules, so keeping them there made assembling
+# a bundle impossible without the whole torch stack. They live here instead, and
+# their old homes re-export them so every existing importer is unaffected.
+
+
+def _needs_detector(config) -> bool:
+    """Whether ``config``'s pipeline crops around detected people."""
+    if config.pipeline in {"people_detect_first", "batch_people"}:
+        return True
+    if config.pipeline == "chain":
+        return any(c in {"people_detect_first", "batch_people"} for c in config.chain)
+    return False
+
+
+def _inference_score_threshold(config) -> float:
+    """The threshold to run inference at.
+
+    ``score_threshold`` defaults low (0.001) so a metric sweep sees the full
+    precision/recall curve; ``map_score_threshold`` overrides it when set.
+    """
+    if config.map_score_threshold is not None:
+        return config.map_score_threshold
+    return config.score_threshold
+
+
 def _resolve_path(value: Any, base_dir: Path) -> Path:
     path = Path(value)
     if not path.is_absolute():

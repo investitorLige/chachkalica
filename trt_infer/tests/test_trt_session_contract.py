@@ -1,0 +1,207 @@
+"""``TrtModel``'s two entry points and the contracts other code depends on.
+
+``run_torch`` is the new GPU-resident path. ``run`` is the pre-existing numpy one,
+now implemented on top of it — and it has out-of-tree callers
+(``person_model_test/run_yolox_export_eval.py``,
+``inferlica/benchmark/kernel_util.py``) that unpack a bare triple and call
+``labels.astype(np.int64)``. Those two facts are what this file pins down.
+
+Nothing here compares two engine invocations: the shared fixture's engine is not
+self-consistent across calls (see ``conftest``). The value-level logic —
+``_unpack_efficientnms``, ``_as_engine_input``, and ``run``'s numpy conversion — is
+tested directly as pure functions instead, which is both deterministic and more
+precise about what is being asserted.
+
+Requires a CUDA GPU + TensorRT; skips cleanly otherwise.
+"""
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+torch = pytest.importorskip("torch")
+
+from trt_infer.session import _split_passthrough, _unpack_efficientnms  # noqa: E402
+
+
+# --------------------------------------------------------------- pure output slicing
+
+
+def test_unpack_efficientnms_slices_each_image_to_its_own_count():
+    """The plugin emits fixed-size, zero-padded outputs; only num_detections says
+    where each image's real detections stop."""
+    counts = torch.tensor([[3], [0], [2]], dtype=torch.int32)
+    boxes = torch.arange(3 * 4 * 4, dtype=torch.float32).reshape(3, 4, 4)
+    scores = torch.arange(3 * 4, dtype=torch.float32).reshape(3, 4)
+    classes = torch.arange(3 * 4, dtype=torch.int32).reshape(3, 4)
+
+    triples = _unpack_efficientnms([counts, boxes, scores, classes], 3)
+
+    assert [triple[0].shape[0] for triple in triples] == [3, 0, 2]
+    for i, n in enumerate([3, 0, 2]):
+        torch.testing.assert_close(triples[i][0], boxes[i, :n])
+        torch.testing.assert_close(triples[i][1], scores[i, :n])
+        torch.testing.assert_close(triples[i][2], classes[i, :n])
+
+
+def test_unpack_efficientnms_accepts_flat_plugin_output():
+    """TensorRT hands back num_detections as [B,1] or [B]; both must work."""
+    flat = _unpack_efficientnms(
+        [torch.tensor([2, 1], dtype=torch.int32),
+         torch.zeros(2, 5, 4), torch.zeros(2, 5), torch.zeros(2, 5, dtype=torch.int32)],
+        2,
+    )
+    assert [triple[0].shape[0] for triple in flat] == [2, 1]
+
+
+def test_split_passthrough_indexes_the_batch_axis():
+    boxes = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+    scores = torch.arange(2 * 3, dtype=torch.float32).reshape(2, 3)
+    labels = torch.arange(2 * 3, dtype=torch.int64).reshape(2, 3)
+
+    triples = _split_passthrough([boxes, scores, labels], 2)
+
+    assert len(triples) == 2
+    for i in range(2):
+        torch.testing.assert_close(triples[i][0], boxes[i])
+        torch.testing.assert_close(triples[i][1], scores[i])
+        torch.testing.assert_close(triples[i][2], labels[i])
+
+
+# ------------------------------------------------------------------ engine plumbing
+
+
+@pytest.fixture(scope="module")
+def model(batched_yolox_engine):
+    from onnx_infer.meta import ModelMeta
+    from trt_infer.session import TrtModel
+
+    meta = ModelMeta.load(batched_yolox_engine.path.with_suffix(".meta.json"))
+    return TrtModel(batched_yolox_engine.path, meta, device="cuda")
+
+
+@pytest.fixture(scope="module")
+def batch(batched_yolox_engine):
+    def make(n, seed=0):
+        rng = np.random.default_rng(seed)
+        return rng.random((n, 3, *batched_yolox_engine.static_hw), dtype=np.float32)
+
+    return make
+
+
+@pytest.fixture(scope="module")
+def profile(batched_yolox_engine):
+    return batched_yolox_engine.batch_profile
+
+
+def test_reads_the_engines_batch_profile(model, profile):
+    assert model._max_batch == profile
+
+
+def test_run_returns_a_bare_numpy_triple_for_one_image(model, batch):
+    """The shape every caller written before batching still expects."""
+    out = model.run(batch(1))
+
+    assert isinstance(out, list) and len(out) == 3
+    boxes, scores, labels = out
+    for array in (boxes, scores, labels):
+        assert isinstance(array, np.ndarray), type(array)
+    assert boxes.ndim == 2 and boxes.shape[1] == 4
+    assert scores.shape == (boxes.shape[0],)
+    # The out-of-tree callers' literal next move.
+    assert labels.astype(np.int64).shape == (boxes.shape[0],)
+
+
+def test_run_returns_a_list_of_triples_for_a_real_batch(model, batch):
+    out = model.run(batch(2))
+
+    assert len(out) == 2
+    for triple in out:
+        assert len(triple) == 3
+        assert all(isinstance(array, np.ndarray) for array in triple)
+
+
+def test_run_torch_always_returns_a_list_of_cuda_triples(model, batch, profile):
+    for n in (1, 2, profile):
+        out = model.run_torch(torch.from_numpy(batch(n)).cuda())
+        assert len(out) == n, n
+        for triple in out:
+            assert len(triple) == 3
+            for tensor in triple:
+                assert torch.is_tensor(tensor) and tensor.is_cuda
+
+
+def test_run_converts_run_torch_output_without_changing_dtypes(model, monkeypatch):
+    """``run``'s only job over ``run_torch`` is the numpy conversion and the
+    bare-triple shape. Driven off a stub so it is exact rather than at the mercy of
+    the engine's tie-breaking."""
+    fake = [
+        [torch.ones(2, 4).cuda(), torch.full((2,), 0.5).cuda(),
+         torch.tensor([1, 2], dtype=torch.int32).cuda()],
+        [torch.zeros(1, 4).cuda(), torch.full((1,), 0.25).cuda(),
+         torch.tensor([0], dtype=torch.int32).cuda()],
+    ]
+    monkeypatch.setattr(model, "run_torch", lambda _batched: fake)
+
+    out = model.run(np.zeros((2, 3, 8, 8), dtype=np.float32))
+
+    assert len(out) == 2
+    for triple_out, triple_fake in zip(out, fake):
+        for array, tensor in zip(triple_out, triple_fake):
+            assert isinstance(array, np.ndarray)
+            assert array.dtype == np.dtype(str(tensor.dtype).removeprefix("torch."))
+            np.testing.assert_array_equal(array, tensor.cpu().numpy())
+
+
+def test_run_unwraps_a_single_image_from_run_torch(model, monkeypatch):
+    fake = [[torch.ones(2, 4).cuda(), torch.ones(2).cuda(), torch.ones(2).cuda()]]
+    monkeypatch.setattr(model, "run_torch", lambda _batched: fake)
+
+    boxes, scores, labels = model.run(np.zeros((1, 3, 8, 8), dtype=np.float32))
+    assert boxes.shape == (2, 4) and scores.shape == (2,) and labels.shape == (2,)
+
+
+# -------------------------------------------------------------------- input coercion
+
+
+def test_accepts_a_cpu_tensor(model, batch):
+    out = model.run_torch(torch.from_numpy(batch(1)))
+    assert len(out) == 1 and out[0][0].is_cuda
+
+
+def test_accepts_a_non_contiguous_input(model, batched_yolox_engine):
+    """A sub-view of a larger buffer, which is what person crops are. Note
+    ``torch.flip`` would not do: it materializes a contiguous copy."""
+    height, width = batched_yolox_engine.static_hw
+    strided = torch.rand(2, 3, height + 16, width + 16, device="cuda")[:, :, :height, :width]
+    assert not strided.is_contiguous()
+
+    out = model.run_torch(strided)
+    assert len(out) == 2
+
+
+def test_accepts_a_non_float32_input(model, batch):
+    out = model.run_torch(torch.from_numpy(batch(1)).cuda().to(torch.float64))
+    assert len(out) == 1
+
+
+def test_run_torch_rejects_numpy(model, batch):
+    with pytest.raises(TypeError, match="use run\\(\\) for numpy input"):
+        model.run_torch(batch(1))
+
+
+def test_a_batch_over_the_profile_is_rejected_not_silently_wrong(model, batch, profile):
+    """TensorRT reports an oversized set_input_shape through its logger, not an
+    exception, then runs at the previous shape — so without this check every image
+    past the first comes back holding a slice of the first one's output."""
+    with pytest.raises(ValueError, match="batch profile of at most"):
+        model.run_torch(torch.from_numpy(batch(profile + 1)).cuda())
+
+    with pytest.raises(ValueError, match="batch profile of at most"):
+        model.run(batch(profile + 1))

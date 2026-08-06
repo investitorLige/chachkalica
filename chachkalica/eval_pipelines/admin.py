@@ -192,12 +192,16 @@ class BaseEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
     @admin.action(description="Launch / relaunch on trainer service")
     def launch_selected(self, request, queryset):
         queue = _queue()
+        prev_job = None  # chain so a multi-select launch doesn't race the trainer's single slot
         for eval_run in queryset:
             if not eval_run.request_yaml_path:
                 self.message_user(request, f"Eval #{eval_run.pk} has no request; skipped.",
                                   level=messages.WARNING)
                 continue
-            queue.enqueue(jobs.run_eval, eval_run.pk, job_timeout=jobs.JOB_TIMEOUT)
+            prev_job = queue.enqueue(
+                jobs.run_eval, eval_run.pk,
+                depends_on=jobs.depends_on(prev_job), job_timeout=jobs.JOB_TIMEOUT,
+            )
             eval_run.status = BaseEval.QUEUED
             eval_run.save(update_fields=["status"])
         self.message_user(request, "Eval job(s) queued — refresh to see progress.")
@@ -244,12 +248,16 @@ class PipelineEvalRunAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmi
     @admin.action(description="Launch / relaunch on trainer service")
     def launch_selected(self, request, queryset):
         queue = _queue()
+        prev_job = None  # chain so a multi-select launch doesn't race the trainer's single slot
         for pe in queryset:
             if not pe.request_yaml_path:
                 self.message_user(request, f"Pipeline eval #{pe.pk} has no request; skipped.",
                                   level=messages.WARNING)
                 continue
-            queue.enqueue(jobs.run_pipeline_eval, pe.pk, job_timeout=jobs.JOB_TIMEOUT)
+            prev_job = queue.enqueue(
+                jobs.run_pipeline_eval, pe.pk,
+                depends_on=jobs.depends_on(prev_job), job_timeout=jobs.JOB_TIMEOUT,
+            )
             pe.status = PipelineEvalRun.QUEUED
             pe.save(update_fields=["status"])
         self.message_user(request, "Pipeline eval job(s) queued — refresh to see progress.")
@@ -301,6 +309,7 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
     @admin.action(description="Launch / relaunch on trainer service")
     def launch_selected(self, request, queryset):
         queue = _queue()
+        prev_job = None  # chain so a multi-select launch doesn't race the trainer's single slot
         for row in queryset:
             eval_obj, kind = self._promote_target(row)
             if not eval_obj.request_yaml_path:
@@ -308,7 +317,10 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
                                   level=messages.WARNING)
                 continue
             job = jobs.run_eval if kind == "base" else jobs.run_pipeline_eval
-            queue.enqueue(job, eval_obj.pk, job_timeout=jobs.JOB_TIMEOUT)
+            prev_job = queue.enqueue(
+                job, eval_obj.pk,
+                depends_on=jobs.depends_on(prev_job), job_timeout=jobs.JOB_TIMEOUT,
+            )
             eval_obj.status = eval_obj.QUEUED
             eval_obj.save(update_fields=["status"])
         self.message_user(request, "Eval job(s) queued — refresh to see progress.")

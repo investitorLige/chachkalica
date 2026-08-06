@@ -1,0 +1,44 @@
+# Build-node deps. Deliberately NO torch: this image compiles ready-made ONNX
+# graphs and assembles bundles, both of which are torch-free (see buildnode/
+# compile.py for exactly which subset of the trainer's trt_export it reaches).
+#
+# CUDA comes from the tensorrt wheel's own nvidia-* dependencies. On the trainer
+# image that job is done by the CUDA-enabled torch wheels; without torch, the
+# TensorRT wheel is the equivalent source, which is why this image can stay on a
+# plain python:3.12-slim base rather than an nvidia/cuda one.
+
+# PINNED EXACT, and it must match friendy_chachkalica/requirements-trt.txt. A
+# TensorRT engine plan only deserializes on the runtime version that built it
+# (trt_infer/session.py checks the .engine.json sidecar and fails loudly), so a
+# node on a different version silently produces bundles this stack cannot load.
+# Bump the two files together, and rebuild every cached engine in lockstep.
+tensorrt==11.2.1.2
+
+# Graph surgery for the EfficientNMS_TRT plugin node. Only READ here — the node
+# never performs the surgery (that needs torch); it compiles graphs that already
+# carry the node. Still required: builder.py imports it.
+onnx_graphsurgeon
+onnx
+
+# TensorRT >= 11 is strongly-typed (no BuilderFlag.FP16), so a real fp16 engine
+# needs the ONNX graph cast to fp16 first; trt_export/fp16_cast.py uses
+# onnxruntime's float16 converter.
+onnxruntime
+
+# GPU identity + free memory for /health (NVIDIA's maintained wheel; provides the
+# `pynvml` import).
+nvidia-ml-py
+
+# chachak.config parses the pipeline request.
+pyyaml
+numpy
+
+# The service.
+fastapi
+uvicorn[standard]
+python-multipart
+
+# fastapi.testclient's transport. Small, and worth shipping in the image: it means
+# `python -m unittest discover -s buildnode/tests -t .` runs ON a node, which is
+# the quickest way to tell a broken deployment from a broken build request.
+httpx
