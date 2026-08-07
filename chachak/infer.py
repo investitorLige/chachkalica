@@ -6,6 +6,8 @@ threshold-tolerant way, and running a long list of images through the adapter in
 bounded chunks so the GPU never sees more than ``chunk_size`` images at once.
 """
 
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -101,16 +103,43 @@ def predict_adapter(
         return adapter.predict(images)
 
 
+def _adapter_max_batch(adapter: Any) -> Optional[int]:
+    """Largest batch ``adapter`` can safely be handed in one ``predict`` call.
+
+    Only ``TrtAdapter`` (``trt_infer.adapter.TrtAdapter``) caps this — it stacks
+    same-shaped images into one real engine call, which only the EfficientNMS
+    archs decode correctly past batch 1; a passthrough arch (rfdetr/rtdetr, see
+    ``chachak.bundle_export.cli._batchable_in_trt``) is built with a batch-1
+    profile, and ``TrtModel.max_batch`` (read off that profile at load time) is
+    how this finds out. Every other adapter (onnx, trained torch) has no such
+    ceiling — ``None`` means uncapped. Duck-typed rather than an isinstance check
+    so this has no import-time dependency on ``trt_infer`` (torch/tensorrt), same
+    reasoning as ``chachak.detector._adapter_max_input_hw``.
+    """
+    max_batch = getattr(getattr(adapter, "_model", None), "max_batch", None)
+    return int(max_batch) if isinstance(max_batch, int) else None
+
+
 def infer_in_chunks(
     adapter: Any,
     images: List[torch.Tensor],
     chunk_size: int,
     score_threshold: Optional[float] = None,
 ) -> List[torch.Tensor]:
-    """Run ``images`` through the adapter ``chunk_size`` at a time, in order."""
+    """Run ``images`` through the adapter ``chunk_size`` at a time, in order.
+
+    ``chunk_size`` is a throughput knob, not a contract the adapter is assumed to
+    tolerate — it is clamped to :func:`_adapter_max_batch` when the adapter has
+    one, so a caller configured for a wider batch than a batch-1 TensorRT engine
+    supports (e.g. ``people_detect_first`` cropping multiple person boxes out of
+    one frame, all bound for a passthrough-arch bundle) degrades to one engine
+    call per image instead of the adapter rejecting the oversized stack.
+    """
+    max_batch = _adapter_max_batch(adapter)
+    effective_chunk_size = max(1, chunk_size if max_batch is None else min(chunk_size, max_batch))
     results: List[torch.Tensor] = []
-    for start in range(0, len(images), max(1, chunk_size)):
-        chunk = images[start : start + chunk_size]
+    for start in range(0, len(images), effective_chunk_size):
+        chunk = images[start : start + effective_chunk_size]
         chunk_results = predict_adapter(adapter, chunk, score_threshold)
         if len(chunk_results) != len(chunk):
             raise RuntimeError(

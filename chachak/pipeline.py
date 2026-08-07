@@ -24,6 +24,9 @@ from typing import Any, Dict, List, Optional
 import torch
 
 try:
+    # Re-exported (not defined here) so bundle_export can reach it without
+    # importing this module's torch — see chachak/config.py.
+    from .config import _inference_score_threshold  # noqa: F401
     from ._friendy import _to_builtin, evaluate_detection
     from .boxes import (
         crop_image,
@@ -38,6 +41,7 @@ try:
     )
     from .infer import infer_in_chunks
 except ImportError:  # run as a flat script
+    from config import _inference_score_threshold  # noqa: F401
     from _friendy import _to_builtin, evaluate_detection
     from boxes import (
         crop_image,
@@ -51,12 +55,6 @@ except ImportError:  # run as a flat script
         xywhn_preds_to_xyxy,
     )
     from infer import infer_in_chunks
-
-
-def _inference_score_threshold(config) -> float:
-    if config.map_score_threshold is not None:
-        return config.map_score_threshold
-    return config.score_threshold
 
 
 def _frame_size(image: torch.Tensor):

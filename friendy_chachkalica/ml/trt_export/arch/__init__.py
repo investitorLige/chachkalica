@@ -18,26 +18,60 @@ the torch adapter (hence the ``.pt`` checkpoint), not just the standard ``.onnx`
 
 from __future__ import annotations
 
-try:
-    from .fasterrcnn import prep_fasterrcnn
-    from .retinanet import prep_retinanet
-    from .yolox import prep_yolox
-except ImportError:  # run flat (cwd on sys.path)
-    from trt_export.arch.fasterrcnn import prep_fasterrcnn  # type: ignore
-    from trt_export.arch.retinanet import prep_retinanet  # type: ignore
-    from trt_export.arch.yolox import prep_yolox  # type: ignore
+import importlib
 
-# arch name -> prep callable. Archs absent here compile from their standard ONNX.
-TRT_PREP_REGISTRY = {
-    "yolox": prep_yolox,
-    "retinanet": prep_retinanet,
-    "fasterrcnn": prep_fasterrcnn,
+# arch name -> (module, callable). Archs absent here compile from their standard
+# ONNX. The prep callables are imported ON DEMAND, not here: each one re-exports a
+# graph from the torch model and so imports torch, while everything else in this
+# module (the FP16 policy tables, and the question "does this arch need a prep at
+# all?") is pure data. Importing them eagerly made the whole module torch-only,
+# which put it out of reach of the slim build node (see buildnode/) — a node that
+# compiles a ready-made graph still needs the policy tables.
+_PREP_MODULES = {
+    "yolox": ("yolox", "prep_yolox"),
+    "retinanet": ("retinanet", "prep_retinanet"),
+    "fasterrcnn": ("fasterrcnn", "prep_fasterrcnn"),
 }
 
 
+def has_trt_prep(arch: str) -> bool:
+    """Whether ``arch`` needs an EfficientNMS re-export before it can be compiled.
+
+    The torch-free half of :func:`get_trt_prep`. Callers that only need the yes/no
+    — "can this arch compile straight from its standard ONNX?" — must use this;
+    calling ``get_trt_prep`` for the answer drags torch in to get it.
+    """
+    return arch in _PREP_MODULES
+
+
+def _load_prep(arch: str):
+    module_name, attr = _PREP_MODULES[arch]
+    try:
+        module = importlib.import_module(f".{module_name}", __name__)
+    except ImportError:  # run flat (cwd on sys.path)
+        module = importlib.import_module(f"trt_export.arch.{module_name}")
+    return getattr(module, attr)
+
+
 def get_trt_prep(arch: str):
-    """Return the arch's TRT ONNX-prep callable, or ``None`` for passthrough archs."""
-    return TRT_PREP_REGISTRY.get(arch)
+    """Return the arch's TRT ONNX-prep callable, or ``None`` for passthrough archs.
+
+    Importing the callable needs torch — see :func:`has_trt_prep` when all you want
+    is whether one exists.
+    """
+    if not has_trt_prep(arch):
+        return None
+    return _load_prep(arch)
+
+
+def __getattr__(name: str):
+    # TRT_PREP_REGISTRY stays available for anything that wants the whole mapping,
+    # but materializing it imports torch, so it is built only if actually touched.
+    if name == "TRT_PREP_REGISTRY":
+        registry = {arch: _load_prep(arch) for arch in _PREP_MODULES}
+        globals()[name] = registry
+        return registry
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # --------------------------------------------------------------------------- FP16 policy
@@ -112,6 +146,7 @@ def is_fp16_trusted(arch: str) -> bool:
 __all__ = [
     "TRT_PREP_REGISTRY",
     "get_trt_prep",
+    "has_trt_prep",
     "ARCH_FP16_OP_BLOCK",
     "ARCH_FP16_NODE_BLOCK",
     "UNTRUSTED_FP16",

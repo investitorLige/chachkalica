@@ -17,10 +17,15 @@ Every export also carries the pipeline it must be served with, so an ``.onnx`` o
 :mod:`training.services.pipeline_meta` for the schema they share.
 """
 
+import hashlib
 import json
 import logging
 import shutil
+import tarfile
+import tempfile
 from pathlib import Path
+
+from django.utils import timezone
 
 from training import pipelines
 from training.models import DEFAULT_PERSON_DETECTOR_CHECKPOINT, TrainingSettings
@@ -394,3 +399,258 @@ def _pipeline_defaults_from_catalogue(artifact: Path) -> dict | None:
         .first()
     )
     return pipeline_meta.for_trained_model(model) if model is not None else None
+
+
+# ------------------------------------------------------------------- .pt bundle
+#
+# A ".pt bundle" is a different thing from the chachak bundles above: those
+# convert to a torch-free ONNX/TensorRT runtime for *serving*; this one carries
+# the raw checkpoint plus every catalog/pipeline/training fact needed to
+# re-create the `TrainedModel` row itself on another machine (see
+# `docs/pt-bundles.md`, `TrainedModelAdmin.export_pt_bundle`). No import side is
+# built for it on purpose — a human or agent reads the manifest and recreates
+# the row by hand elsewhere.
+
+PT_BUNDLE_SCHEMA_VERSION = 1
+
+_PT_BUNDLE_README = """\
+# {name} — .pt bundle
+
+A self-contained export of the trained model **{name}** ({arch}), for cataloguing
+on another machine as a `TrainedModel` row.
+
+## Contents
+
+- `checkpoint.pt` — the promoted "best" checkpoint, verbatim. It is a pickled
+  dict (`torch.load`), not a full pickled model: `model_name` + `model_config`
+  (`num_classes`, `params`) pick the architecture out of
+  `friendy_chachkalica.registry.build_model`, and `model_state_dict` loads onto
+  it. See `chachak/infer.py::load_checkpoint_adapter` for the exact recipe:
+
+  ```python
+  state = torch.load("checkpoint.pt", map_location="cpu")
+  adapter = build_model(state["model_name"], num_classes=state["model_config"]["num_classes"],
+                        **state["model_config"].get("params", {{}}))
+  adapter.model.load_state_dict(state["model_state_dict"])
+  ```
+
+- `manifest.json` — everything else: the catalog record (name/stage/classes/
+  metrics), the serving pipeline this model must run through
+  (`pipeline_metadata` — tiling/detector/NMS geometry), and training provenance
+  (hyperparameters, dataset roster, metrics) where available. One schema,
+  documented in `docs/pt-bundles.md` in the source repo.
+- `checkpoint.pipeline.json` — the same `pipeline_metadata` blob, in the
+  standalone sidecar form every chachak-produced artifact carries (see
+  `training.services.pipeline_meta`).
+- `checkpoint.detector.*` (only if the pipeline needs a person detector) — the
+  detector checkpoint this model was trained/must be served through, copied
+  alongside so the pipeline is runnable without depending on a path that may
+  not exist on the new machine.
+- `training_config.yaml` (if present) — the exact friendy_chachkalica YAML this
+  checkpoint was trained from.
+
+## Recreating the catalog row
+
+On the destination, copy `checkpoint.pt` (and `checkpoint.detector.*`, if
+present) somewhere on that machine's shared filesystem, then create a
+`TrainedModel` with `manifest.json`'s `trained_model` fields, `checkpoint_path`
+pointing at the copied checkpoint, and `pipeline_metadata` set to the
+manifest's `pipeline_metadata` blob verbatim.
+"""
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _experiment_snapshot(experiment) -> dict | None:
+    """Every :class:`~training.models.Experiment` hyperparameter, plus its
+    child model/dataset rosters — the training provenance a `.pt` alone can't
+    answer (see :mod:`training.services.pipeline_meta`'s docstring: it only
+    scopes itself to serving geometry, not how the weights were trained)."""
+    if experiment is None:
+        return None
+    fields = [
+        "epochs", "batch_size", "num_workers", "device", "seed", "amp",
+        "gradient_clip_norm", "early_stopping_patience", "best_metric", "val_interval",
+        "optimizer_name", "lr", "weight_decay", "optimizer_params",
+        "scheduler_name", "scheduler_params",
+        "eval_batch_size", "eval_num_workers", "eval_score_threshold",
+        "eval_operating_nms_threshold", "iou_thresholds",
+        "pipeline", "detector_checkpoint", "detector_expand_ratio", "detector_min_box_size",
+        "tile_size_px", "tile_width_pct", "tile_height_pct", "overlap", "merge_nms_iou", "chain",
+    ]
+    return {"name": experiment.name, **{f: getattr(experiment, f) for f in fields}}
+
+
+def _experiment_models_snapshot(experiment) -> list:
+    if experiment is None:
+        return []
+    return [
+        {"arch": m.arch, "num_classes": m.num_classes, "pretrained": m.pretrained, "params": m.params}
+        for m in experiment.models.all()
+    ]
+
+
+def _experiment_datasets_snapshot(experiment) -> list:
+    if experiment is None:
+        return []
+    return [
+        {
+            "dataset_name": d.dataset.name,
+            "storage_type": d.dataset.storage_type,
+            "storage_root": d.dataset.storage_root,
+            "role": d.role,
+            "label_source": d.label_source,
+            "annotator": d.annotator.username if d.annotator_id else None,
+            "explicit_labels_path": d.explicit_labels_path,
+            "aug_hflip": d.aug_hflip,
+            "aug_hflip_fraction": d.aug_hflip_fraction,
+            "aug_scale_crop": d.aug_scale_crop,
+            "aug_scale_crop_fraction": d.aug_scale_crop_fraction,
+        }
+        for d in experiment.datasets.select_related("dataset", "annotator").all()
+    ]
+
+
+def _run_result_snapshot(run_result) -> dict | None:
+    if run_result is None:
+        return None
+    return {
+        "run_name": run_result.run_name,
+        "run_index": run_result.run_index,
+        "model_arch": run_result.model_arch,
+        "train_dataset_name": run_result.train_dataset_name,
+        "best_epoch": run_result.best_epoch,
+        "best_loss": run_result.best_loss,
+        "run_dir": run_result.run_dir,
+        "val_metrics": run_result.val_metrics,
+        "test_metrics": run_result.test_metrics,
+    }
+
+
+def _training_run_snapshot(training_run) -> dict | None:
+    if training_run is None:
+        return None
+    return {
+        "status": training_run.status,
+        "config_yaml_path": training_run.config_yaml_path,
+        "output_dir": training_run.output_dir,
+        "started_at": training_run.started_at.isoformat() if training_run.started_at else None,
+        "finished_at": training_run.finished_at.isoformat() if training_run.finished_at else None,
+    }
+
+
+def _copy_training_config(training_run, dest: Path) -> bool:
+    """Best-effort verbatim copy of the YAML the checkpoint was actually trained
+    from. ``False`` (not an error) when there is no source run, or its config
+    file is no longer on disk — the manifest's ``experiment`` snapshot already
+    carries the same hyperparameters, so this is a nice-to-have, not load-bearing.
+    """
+    config_path = (getattr(training_run, "config_yaml_path", "") or "").strip()
+    if not config_path:
+        return False
+    source = config_gen._resolve(config_path)
+    if not source.is_file():
+        return False
+    shutil.copy2(source, dest)
+    return True
+
+
+def _build_pt_bundle_manifest(
+    trained_model, checkpoint_src: Path, checkpoint_dst: Path, pipeline_blob: dict,
+    *, training_config_included: bool,
+) -> dict:
+    from training.services import runner
+
+    run_result = trained_model.source_run_result
+    training_run = getattr(run_result, "run", None)
+    experiment = getattr(training_run, "experiment", None)
+
+    try:
+        inspected = runner.inspect_checkpoint(checkpoint_src)
+    except Exception:  # noqa: BLE001 - best-effort hint only, mirrors _trained_size_hint
+        inspected = None
+
+    checkpoint_entry = {
+        "filename": checkpoint_dst.name,
+        "original_path": str(checkpoint_src),
+        "sha256": _sha256(checkpoint_dst),
+        "size_bytes": checkpoint_dst.stat().st_size,
+    }
+    if inspected:
+        checkpoint_entry["inspected"] = inspected
+
+    return {
+        "schema_version": PT_BUNDLE_SCHEMA_VERSION,
+        "bundle_kind": "pt_bundle",
+        "exported_at": timezone.now().isoformat(),
+        "trained_model": {
+            "name": trained_model.name,
+            "description": trained_model.description,
+            "stage": trained_model.stage,
+            "arch": trained_model.arch,
+            "num_classes": trained_model.num_classes,
+            "classes": list(trained_model.classes),
+            "metrics": trained_model.metrics,
+        },
+        "checkpoint": checkpoint_entry,
+        "pipeline_metadata": pipeline_blob,
+        "provenance": {
+            "run_result": _run_result_snapshot(run_result),
+            "training_run": _training_run_snapshot(training_run),
+            "experiment": _experiment_snapshot(experiment),
+            "experiment_models": _experiment_models_snapshot(experiment),
+            "experiment_datasets": _experiment_datasets_snapshot(experiment),
+            "training_config_included": training_config_included,
+        },
+    }
+
+
+def build_pt_bundle(trained_model, checkpoint_path: str, archive_path: Path) -> dict:
+    """Package ``trained_model``'s ``checkpoint_path`` plus every catalog/pipeline/
+    training fact on record into one self-contained ``.tar.gz`` at ``archive_path``
+    — see :mod:`training.admin`'s ``TrainedModelAdmin.export_pt_bundle`` and
+    ``docs/pt-bundles.md`` for the layout/schema this produces.
+
+    Builds in a temp staging dir first so a failure partway through never leaves
+    a half-written bundle at ``archive_path``.
+    """
+    checkpoint_src = Path(checkpoint_path)
+    if not checkpoint_src.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_src}")
+
+    stem = archive_path.name
+    if stem.endswith(".tar.gz"):
+        stem = stem[: -len(".tar.gz")]
+
+    with tempfile.TemporaryDirectory(prefix="ptbundle-") as tmp:
+        stage = Path(tmp) / stem
+        stage.mkdir(parents=True)
+
+        checkpoint_dst = stage / "checkpoint.pt"
+        shutil.copy2(checkpoint_src, checkpoint_dst)
+
+        pipeline_blob = export_pipeline_sidecar(trained_model, checkpoint_dst)
+
+        training_run = getattr(trained_model.source_run_result, "run", None)
+        training_config_included = _copy_training_config(training_run, stage / "training_config.yaml")
+
+        manifest = _build_pt_bundle_manifest(
+            trained_model, checkpoint_src, checkpoint_dst, pipeline_blob,
+            training_config_included=training_config_included,
+        )
+        (stage / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
+        (stage / "README.md").write_text(
+            _PT_BUNDLE_README.format(name=trained_model.name, arch=trained_model.arch)
+        )
+
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive_path, "w:gz") as tar:
+            tar.add(stage, arcname=stage.name)
+
+    return {"bundle_path": str(archive_path), "manifest": manifest}

@@ -23,15 +23,32 @@ def _load_image_tensor(image_path: Union[str, Path], device) -> torch.Tensor:
     """Load an image into the CHW float[0,1] RGB tensor the adapters expect.
 
     Matches ``friendy_chachkalica/data.py`` so preview inference sees pixels
-    identical to training/eval.
+    identical to training/eval — but the permute/scale run *after* the transfer,
+    so the copy carries uint8 instead of float32. A quarter of the bytes (25 MB
+    rather than 100 MB for a 4K frame) and the per-pixel divide lands on the GPU
+    instead of costing ~50 ms of host time.
+
+    Bit-identical to doing it host-side, but only because the divisor is a tensor:
+    uint8 -> float32 is exact (every uint8 is representable), and dividing by a
+    tensor selects the correctly-rounded division kernel. Dividing by the plain
+    literal ``255.0`` would not be — on CUDA torch lowers ``tensor / python_scalar``
+    into a multiply by the reciprocal, and 1/255 is not representable in float32, so
+    a handful of pixels come back one ULP off and detections can shift with them.
+    ``trt_infer.postprocess_torch._divisors`` exists for the same reason.
+
+    The returned tensor keeps the same non-contiguous CHW view of an HWC buffer the
+    host-side version produced, since ``.float()`` preserves the input's strides.
     """
     import numpy as np
     from PIL import Image
 
     image = Image.open(image_path).convert("RGB")
+    # .copy(): PIL exposes a read-only buffer, and torch.from_numpy needs a
+    # writable one.
     array = np.asarray(image).copy()
-    tensor = torch.from_numpy(array).permute(2, 0, 1).float() / 255.0
-    return tensor.to(device)
+    tensor = torch.from_numpy(array).to(device)
+    scale = torch.tensor(255.0, dtype=torch.float32, device=tensor.device)
+    return tensor.permute(2, 0, 1).float() / scale
 
 
 def _to_box_dicts(

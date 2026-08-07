@@ -7,8 +7,18 @@
 #   torch cu12.x  -> tensorrt-cu12   |   torch cu13.x -> tensorrt-cu13
 # The bare `tensorrt` meta-package resolves to a CUDA-specific wheel; pin the
 # `-cuNN` variant if the resolver picks the wrong one for your torch build.
+# Pinned exact (not just major/minor): a TensorRT *engine* plan only
+# deserializes on the runtime version that built it (see trt_infer/session.py),
+# so letting this float across image rebuilds silently strands any cached
+# .engine artifact (e.g. models/people/best_ckpt.engine) that was built on an
+# older resolve. Bump this deliberately, and rebuild every cached engine in
+# lockstep, rather than letting pip pick a new version on its own.
+# THIS VERSION IS ALSO PINNED IN buildnode/requirements.txt and the two must
+# match: a build node compiles engines this stack then loads, so a node on a
+# different runtime produces bundles that cannot be deserialized here. Bump both
+# together (see chachkalica/docs/build-nodes.md).
 -r requirements.txt
-tensorrt
+tensorrt==11.2.1.2
 # Graph surgery to append the EfficientNMS_TRT plugin node for archs whose baked
 # NMS (retinanet, yolox) TensorRT can't compile directly.
 onnx_graphsurgeon

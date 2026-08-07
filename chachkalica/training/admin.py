@@ -29,6 +29,7 @@ from fleet.services import lsapi
 from fleet.services.paths import source_root
 from training import jobs
 from training.models import (
+    BuildNode,
     EvalRun,
     Experiment,
     ExperimentDataset,
@@ -42,7 +43,8 @@ from training.models import (
 from training import model_specs, pipelines
 from training.forms import ExperimentModelForm
 from training.services import (
-    combine, config_gen, exports, ingest, pipeline_meta, promote, runner, teardown,
+    buildnode, combine, config_gen, exports, ingest, pipeline_meta, promote, runner,
+    teardown,
 )
 
 
@@ -479,12 +481,16 @@ class TrainingRunAdmin(admin.ModelAdmin):
     @admin.action(description="Launch / relaunch on trainer service")
     def launch_selected(self, request, queryset):
         queue = _queue()
+        prev_job = None  # chain so a multi-select launch doesn't race the trainer's single slot
         for run in queryset:
             if not run.config_yaml_path:
                 self.message_user(request, f"Run #{run.pk} has no config; skipped.",
                                   level=messages.WARNING)
                 continue
-            queue.enqueue(jobs.run_training, run.pk, job_timeout=jobs.JOB_TIMEOUT)
+            prev_job = queue.enqueue(
+                jobs.run_training, run.pk,
+                depends_on=jobs.depends_on(prev_job), job_timeout=jobs.JOB_TIMEOUT,
+            )
             run.status = TrainingRun.QUEUED
             run.save(update_fields=["status"])
         self.message_user(request, "Launch job(s) queued — refresh to see progress.")
@@ -499,12 +505,16 @@ class TrainingRunAdmin(admin.ModelAdmin):
         first so the row reflects reality before resuming a stranded run.
         """
         queue = _queue()
+        prev_job = None  # chain so a multi-select resume doesn't race the trainer's single slot
         for run in queryset:
             if not run.config_yaml_path:
                 self.message_user(request, f"Run #{run.pk} has no config; skipped.",
                                   level=messages.WARNING)
                 continue
-            queue.enqueue(jobs.run_training, run.pk, resume=True, job_timeout=jobs.JOB_TIMEOUT)
+            prev_job = queue.enqueue(
+                jobs.run_training, run.pk, resume=True,
+                depends_on=jobs.depends_on(prev_job), job_timeout=jobs.JOB_TIMEOUT,
+            )
             run.status = TrainingRun.QUEUED
             run.save(update_fields=["status"])
         self.message_user(request, "Resume job(s) queued — refresh to see progress.")
@@ -733,7 +743,10 @@ class TrainedModelAdmin(admin.ModelAdmin):
     list_display = ["name", "stage", "arch", "num_classes", "map50", "map50_95", "created_at"]
     list_filter = ["stage", "arch"]
     search_fields = ["name", "description"]
-    actions = ["evaluate", "preview_on_dataset", "export_onnx", "export_trt", "view_hard_val_images"]
+    actions = [
+        "evaluate", "preview_on_dataset", "export_onnx", "export_trt", "export_pt_bundle",
+        "view_hard_val_images",
+    ]
     readonly_fields = ["source_run_result", "created_at", "updated_at"]
 
     @admin.display(description="mAP50")
@@ -1161,6 +1174,20 @@ class TrainedModelAdmin(admin.ModelAdmin):
                         f"Invalid input size {input_size!r}; use a number (e.g. 640) or HxW "
                         f"(e.g. 640x640).", level=messages.WARNING)
                     return None
+            # "Build on": blank = the local trainer (the only option before build
+            # nodes existed). A node instead compiles on ITS GPU and returns a whole
+            # bundle, which is a different job — see jobs.run_export_remote.
+            node = None
+            node_pk = (request.POST.get("node") or "").strip()
+            if node_pk:
+                node = BuildNode.objects.filter(
+                    pk=node_pk, status=BuildNode.ACTIVE).first()
+                if node is None:
+                    self.message_user(
+                        request, "That build node is gone or retired; nothing queued.",
+                        level=messages.WARNING)
+                    return None
+
             out_dir = config_gen._resolve(output_dir)
             stem = self._onnx_stem(model.name)
             queue = _queue()
@@ -1170,13 +1197,21 @@ class TrainedModelAdmin(admin.ModelAdmin):
                     model=model, kind=ExportRun.TRT, checkpoint_label=label,
                     checkpoint_path=checkpoint, output_path=str(engine_path),
                     precision=precision, input_hw=list(input_hw) if input_hw else None,
+                    node=node,
                 )
-                queue.enqueue(
-                    jobs.run_export_trt, export_run.pk, job_timeout=jobs.EXPORT_TRT_JOB_TIMEOUT)
+                if node is None:
+                    queue.enqueue(
+                        jobs.run_export_trt, export_run.pk,
+                        job_timeout=jobs.EXPORT_TRT_JOB_TIMEOUT)
+                else:
+                    queue.enqueue(
+                        jobs.run_export_remote, export_run.pk,
+                        job_timeout=jobs.EXPORT_REMOTE_JOB_TIMEOUT)
+            where = f"on {node.name}" if node else "on the local trainer"
             self.message_user(
                 request,
                 f"Queued {len(checkpoints)} TensorRT export job(s) for {model.name} "
-                f"({precision}) — see Export runs for progress.")
+                f"({precision}) {where} — see Export runs for progress.")
             return None
 
         default_dir = exports.exports_root()
@@ -1188,11 +1223,73 @@ class TrainedModelAdmin(admin.ModelAdmin):
             "checkpoints": [{"label": label, "path": path} for label, path in checkpoints],
             "default_output_dir": str(default_dir),
             "default_input_size": f"{trained_size[0]}x{trained_size[1]}" if trained_size else "",
+            "build_nodes": BuildNode.objects.filter(status=BuildNode.ACTIVE),
             "action": "export_trt",
             "selected": [str(model.pk)],
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
         }
         return TemplateResponse(request, "admin/training/export_trt.html", context)
+
+    # ------------------------------------------------------------------- .pt bundle export
+    @admin.action(description="Export .pt bundle…")
+    def export_pt_bundle(self, request, queryset):
+        """Package the model's best checkpoint into a self-contained ``.tar.gz``
+        another machine can catalog as a Trained model.
+
+        Unlike ``export_onnx``/``export_trt`` this doesn't touch the trainer
+        service at all — it's a plain-file operation (copy + hash + tar) against
+        the checkpoint already on the shared filesystem, so there's no precision/
+        input-size/build-node choice to make, and only the promoted ``best``
+        checkpoint is bundled (not ``last``). ``exports.build_pt_bundle`` folds in
+        the model's catalog record, its frozen pipeline metadata (plus the
+        person-detector checkpoint it depends on, if any), and every training
+        hyperparameter/dataset/metric on record for the run it came from — see
+        ``docs/pt-bundles.md``.
+        """
+        if queryset.count() != 1:
+            self.message_user(request, "Select exactly one model to export.",
+                              level=messages.WARNING)
+            return None
+        model = queryset.first()
+        best = next(
+            (path for label, path in self._export_checkpoints(model) if label == "best"), None)
+        if not best:
+            self.message_user(
+                request, f"{model.name}: no checkpoint on record to export.",
+                level=messages.WARNING)
+            return None
+
+        if request.POST.get("apply"):
+            output_dir = (request.POST.get("output_dir") or "").strip()
+            if not output_dir:
+                self.message_user(request, "Enter an output directory.",
+                                  level=messages.WARNING)
+                return None
+            out_dir = config_gen._resolve(output_dir)
+            archive_path = out_dir / f"{self._onnx_stem(model.name)}-ptbundle.tar.gz"
+            export_run = ExportRun.objects.create(
+                model=model, kind=ExportRun.PT, checkpoint_label="best",
+                checkpoint_path=best, output_path=str(archive_path),
+            )
+            _queue().enqueue(
+                jobs.run_export_pt_bundle, export_run.pk,
+                job_timeout=jobs.EXPORT_PT_BUNDLE_JOB_TIMEOUT)
+            self.message_user(
+                request,
+                f"Queued .pt bundle export for {model.name} — see Export runs for progress.")
+            return None
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Export {model.name} as a .pt bundle",
+            "model": model,
+            "checkpoint_path": best,
+            "default_output_dir": str(exports.exports_root()),
+            "action": "export_pt_bundle",
+            "selected": [str(model.pk)],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+        }
+        return TemplateResponse(request, "admin/training/export_pt_bundle.html", context)
 
     def get_urls(self):
         custom = [
@@ -1418,19 +1515,20 @@ class ExportRunAdmin(admin.ModelAdmin):
     """Queued ONNX/TensorRT export jobs — one row per checkpoint per action.
 
     Created by ``TrainedModelAdmin.export_onnx``/``export_trt`` and driven by
-    ``training.jobs.run_export_onnx``/``run_export_trt`` on the ``django_rq``
-    worker; nothing here is editable by hand.
+    ``training.jobs.run_export_onnx``/``run_export_trt``/``run_export_remote`` on
+    the ``django_rq`` worker; nothing here is editable by hand.
     """
 
     list_display = [
-        "__str__", "model", "kind", "checkpoint_label", "status_badge",
+        "__str__", "model", "kind", "checkpoint_label", "built_on", "status_badge",
         "built_precision", "output_path", "bundle_dir", "created_at",
     ]
-    list_filter = ["kind", "status", "model"]
+    list_filter = ["kind", "status", "node", "model"]
     readonly_fields = [
         "model", "kind", "checkpoint_label", "checkpoint_path", "output_path",
-        "precision", "input_hw", "status", "result", "bundle_dir", "bundle_error",
-        "last_error", "started_at", "finished_at", "created_at",
+        "precision", "input_hw", "node", "remote_build_id", "status", "result",
+        "bundle_dir", "bundle_error", "last_error", "started_at", "finished_at",
+        "created_at",
     ]
 
     def has_add_permission(self, request):
@@ -1440,6 +1538,14 @@ class ExportRunAdmin(admin.ModelAdmin):
     @admin.display(description="status", ordering="status")
     def status_badge(self, obj):
         return _status_badge(obj.status)
+
+    @admin.display(description="built on", ordering="node")
+    def built_on(self, obj):
+        """Which machine compiled this. Matters because an engine only runs there."""
+        if obj.node is None:
+            return "local trainer"
+        gpu = (obj.result or {}).get("gpu_name") or obj.node.gpu_name
+        return f"{obj.node.name} ({gpu})" if gpu else obj.node.name
 
     @admin.display(description="precision")
     def built_precision(self, obj):
@@ -1454,6 +1560,125 @@ class ExportRunAdmin(admin.ModelAdmin):
         if built != obj.precision:
             return f"{obj.precision} → {built} (fallback)"
         return built
+
+
+@admin.register(BuildNode)
+class BuildNodeAdmin(admin.ModelAdmin):
+    """Machines that can compile TensorRT engines on their own GPU.
+
+    A node is registered by hand — name, URL, token — and everything else on the
+    row is filled in by pinging it. See ``docs/build-nodes.md`` for standing one
+    up; the short version is that the token here must match the ``BUILDNODE_TOKEN``
+    the node was started with.
+    """
+
+    list_display = [
+        "name", "base_url", "status", "health_badge", "gpu_name",
+        "tensorrt_version", "person_detector", "load", "last_seen_at",
+    ]
+    list_filter = ["status", "last_status"]
+    search_fields = ["name", "base_url", "gpu_name"]
+    actions = ["ping_selected", "generate_token"]
+    readonly_fields = [
+        "last_status", "last_error", "last_seen_at", "last_checked_at",
+        "gpu_name", "compute_capability", "tensorrt_version", "driver_version",
+        "health_detail", "created_at",
+    ]
+    fieldsets = [
+        (None, {"fields": ["name", "base_url", "token", "status", "notes"]}),
+        ("Last health check", {
+            "fields": [
+                "last_status", "last_error", "last_seen_at", "last_checked_at",
+                "gpu_name", "compute_capability", "tensorrt_version",
+                "driver_version", "health_detail",
+            ],
+        }),
+    ]
+
+    @admin.display(description="health", ordering="last_status")
+    def health_badge(self, obj):
+        return _status_badge(obj.last_status)
+
+    @admin.display(description="person detector")
+    def person_detector(self, obj):
+        """Whether the node can supply a detector for a person-crop bundle.
+
+        Worth a column of its own: a node without one builds plain-frame bundles
+        fine and fails only on the pipelines that need cropping.
+        """
+        detector = (obj.last_health or {}).get("person_detector") or {}
+        if not obj.last_health:
+            return "—"
+        if not detector.get("present"):
+            return "missing"
+        kinds = [k for k in ("onnx", "trt_graph") if detector.get(k)]
+        return ", ".join(kinds) or "present"
+
+    @admin.display(description="load")
+    def load(self, obj):
+        health = obj.last_health or {}
+        if not health:
+            return "—"
+        return "busy" if health.get("busy") else f"idle ({health.get('queue_len', 0)} queued)"
+
+    @admin.display(description="full /health response")
+    def health_detail(self, obj):
+        if not obj.last_health:
+            return "Never pinged."
+        return json.dumps(obj.last_health, indent=2)
+
+    @admin.action(description="Ping selected build nodes")
+    def ping_selected(self, request, queryset):
+        """Refresh each node's health snapshot, synchronously.
+
+        Deliberately not an RQ job: it is one short GET per node, and going through
+        the worker would redisplay the page with the PREVIOUS snapshot while
+        implying it was current. An operator pressing "ping" wants the answer now.
+        """
+        ok, bad = [], []
+        for node in queryset:
+            body = buildnode.record_health(node)
+            (ok if body.get("status") == "ok" else bad).append(node)
+        if ok:
+            self.message_user(
+                request,
+                "Reachable: " + ", ".join(
+                    f"{n.name} ({n.gpu_name or 'unknown GPU'}, TRT {n.tensorrt_version or '?'})"
+                    for n in ok))
+        for node in bad:
+            self.message_user(
+                request, f"{node.name}: {node.last_error or 'unhealthy'}",
+                level=messages.WARNING)
+
+    @admin.action(description="Generate a token for selected nodes")
+    def generate_token(self, request, queryset):
+        """Mint a token to copy into the node's ``BUILDNODE_TOKEN``.
+
+        Convenience only — the node is authoritative. Setting this does not change
+        anything on the node, so it is refused once a node is answering, where it
+        would silently break a working link.
+        """
+        import secrets
+
+        changed, skipped = [], []
+        for node in queryset:
+            if node.last_status == BuildNode.OK:
+                skipped.append(node.name)
+                continue
+            node.token = secrets.token_hex(20)
+            node.save(update_fields=["token"])
+            changed.append(node)
+        for node in changed:
+            self.message_user(
+                request,
+                f"{node.name}: set BUILDNODE_TOKEN={node.token} on the node, then ping it.")
+        if skipped:
+            self.message_user(
+                request,
+                f"Left alone (currently healthy, a new token would break them): "
+                f"{', '.join(skipped)}. Retire or clear the health first if you really "
+                f"mean to rotate.",
+                level=messages.WARNING)
 
 
 # EvalRun's admin lives in ``eval_pipelines.admin`` (as the "Base Eval" proxy)

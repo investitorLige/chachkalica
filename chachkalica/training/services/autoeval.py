@@ -10,6 +10,11 @@ No-op when the experiment has no test dataset. Called from
 ``training.jobs.run_training`` after results are ingested; it enqueues the eval
 jobs by dotted path (``training.jobs.run_eval``) so this module need not import
 ``training.jobs`` back.
+
+Each eval is chained onto the previous one via ``training.jobs.depends_on`` —
+see that function's docstring for why: the trainer service only runs one
+train/eval/pipeline job at a time, and a run with more than one trained model
+used to have its evals race each other for that single slot.
 """
 
 import django_rq
@@ -43,8 +48,13 @@ def schedule_test_evals(run) -> list[int]:
     if experiment.pipeline:
         return _schedule_pipeline_evals(run, experiment, test_ds)
 
+    # Local import: training.jobs imports this module at load time, so importing
+    # it back at module level here would be circular.
+    from training.jobs import JOB_TIMEOUT, depends_on
+
     queue = _queue()
     queued: list[int] = []
+    prev_job = None  # chains each eval onto the last so only one hits the trainer at a time
     for rr in run.run_results.all():
         if not (rr.best_checkpoint or rr.last_checkpoint):
             continue  # a model that failed to train has no checkpoint to eval
@@ -63,7 +73,10 @@ def schedule_test_evals(run) -> list[int]:
             eval_run.last_error = f"could not build eval request: {exc}"
             eval_run.save(update_fields=["status", "last_error"])
             continue
-        queue.enqueue("training.jobs.run_eval", eval_run.pk)
+        prev_job = queue.enqueue(
+            "training.jobs.run_eval", eval_run.pk,
+            depends_on=depends_on(prev_job), job_timeout=JOB_TIMEOUT,
+        )
         eval_run.status = EvalRun.QUEUED
         eval_run.save(update_fields=["status"])
         queued.append(eval_run.pk)
@@ -113,9 +126,13 @@ def _schedule_pipeline_evals(run, experiment, test_ds) -> list[int]:
     # Imported here (not at module load) to avoid a training <-> eval_pipelines
     # import cycle.
     from eval_pipelines.models import PipelineEvalRun
+    # Local import: training.jobs imports this module at load time, so importing
+    # it back at module level here would be circular.
+    from training.jobs import JOB_TIMEOUT, depends_on
 
     queue = _queue()
     queued: list[int] = []
+    prev_job = None  # chains each eval onto the last so only one hits the trainer at a time
     for rr in run.run_results.all():
         if not (rr.best_checkpoint or rr.last_checkpoint):
             continue  # a model that failed to train has no checkpoint to eval
@@ -135,7 +152,10 @@ def _schedule_pipeline_evals(run, experiment, test_ds) -> list[int]:
             pe.last_error = f"could not build pipeline request: {exc}"
             pe.save(update_fields=["status", "last_error"])
             continue
-        queue.enqueue("training.jobs.run_pipeline_eval", pe.pk)
+        prev_job = queue.enqueue(
+            "training.jobs.run_pipeline_eval", pe.pk,
+            depends_on=depends_on(prev_job), job_timeout=JOB_TIMEOUT,
+        )
         pe.status = PipelineEvalRun.QUEUED
         pe.save(update_fields=["status"])
         queued.append(pe.pk)

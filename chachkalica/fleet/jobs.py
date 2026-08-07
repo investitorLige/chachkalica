@@ -142,6 +142,17 @@ def prune_overlaps(left_id: int, right_id: int, *, prune_left: bool, prune_right
     return overlap_svc.prune_overlaps(report, prune_left=prune_left, prune_right=prune_right)
 
 
+def prune_intra_duplicates(dataset_id: int) -> dict:
+    """Re-fingerprint one dataset and delete its duplicate/near-duplicate images.
+
+    Queued rather than run inline from the analytics page for the same reason
+    as ``prune_overlaps``: re-hashing every image can run long enough to hit
+    the request timeout.
+    """
+    dataset = Dataset.objects.get(pk=dataset_id)
+    return overlap_svc.prune_intra_duplicates(dataset)
+
+
 def sync_project(project_id: int) -> dict:
     project = Project.objects.get(pk=project_id)
     _mark_running(project, None)

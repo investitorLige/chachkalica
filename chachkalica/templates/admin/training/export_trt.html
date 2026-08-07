@@ -29,6 +29,28 @@ trainer's exact GPU + TensorRT version (not portable to other hardware).</p>
   <input type="hidden" name="apply" value="1">
 
   <div class="form-row">
+    <label for="node">Build on:</label>
+    <select name="node" id="node">
+      <option value="">Local trainer (this box)</option>
+      {% for node in build_nodes %}
+        <option value="{{ node.pk }}">
+          {{ node.name }}{% if node.gpu_name %} — {{ node.gpu_name }}{% endif %}{% if node.tensorrt_version %} (TRT {{ node.tensorrt_version }}){% endif %}{% if node.last_status != "ok" %} — last seen {{ node.last_status }}{% endif %}
+        </option>
+      {% endfor %}
+    </select>
+    <p class="help">A TensorRT engine only loads on the GPU and TensorRT version that
+    built it. Pick a <a href="{% url 'admin:training_buildnode_changelist' %}">build node</a>
+    to compile for <em>that</em> machine's GPU instead of this one.
+    {% if build_nodes %}
+      A remote build ignores the output directory below: it produces a whole infer
+      bundle, filed under <code>&lt;bundle root&gt;/&lt;node name&gt;/</code>, with a person
+      detector the node compiled for itself.
+    {% else %}
+      None are registered yet — see <code>docs/build-nodes.md</code>.
+    {% endif %}</p>
+  </div>
+
+  <div class="form-row">
     <label for="output_dir">Output directory:</label>
     <input type="text" name="output_dir" id="output_dir" size="80"
            value="{{ default_output_dir }}" required>

@@ -26,6 +26,7 @@ from fleet.models import Dataset
 from fleet.reconcile.txt_format import parse_label_text
 from fleet.services import datasets as datasets_svc
 from fleet.services import lsapi
+from fleet.services import overlap as overlap_svc
 from fleet.services.paths import source_root
 
 # Cycled across classes; picked to stay distinct on a white admin background.
@@ -87,6 +88,7 @@ def _image_dimensions(image_path: Path) -> tuple[int, int] | None:
 
             if header[:2] != b"\xff\xd8":
                 return None
+            image.seek(2)
             while True:
                 marker = image.read(1)
                 while marker == b"\xff":
@@ -223,6 +225,7 @@ def analyze_dataset(dataset: Dataset) -> dict:
             image_counts[cid] += 1
 
     orphan_count, orphan_examples = _orphan_label_files(labels_dir, images)
+    duplicates = overlap_svc.find_intra_duplicates(dataset)
 
     image_count = len(images)
     present_total = sum(image_counts)
@@ -285,6 +288,11 @@ def analyze_dataset(dataset: Dataset) -> dict:
         )
     ]
 
+    duplicate_extra_images = duplicates["exact_duplicate_extra"] + duplicates["near_duplicate_extra"]
+    duplicate_examples = [
+        group[0]["path"].name for group in (duplicates["exact_groups"] + duplicates["near_groups"])[:5]
+    ]
+
     quality = {
         "orphan_label_files": orphan_count,
         "orphan_examples": orphan_examples,
@@ -292,12 +300,16 @@ def analyze_dataset(dataset: Dataset) -> dict:
         "invalid_class_regions": invalid_class_regions,
         "out_of_bounds_boxes": out_of_bounds_boxes,
         "zero_area_boxes": zero_area_boxes,
+        "duplicate_image_groups": len(duplicates["exact_groups"]) + len(duplicates["near_groups"]),
+        "duplicate_extra_images": duplicate_extra_images,
+        "duplicate_examples": duplicate_examples,
     }
     # `empty_label_files` is excluded: an empty .txt is the YOLO convention for a
     # background/negative image, usually intentional (shown in the summary card),
     # not a defect. issue_total counts genuine errors only.
     quality["issue_total"] = (
         orphan_count + invalid_class_regions + out_of_bounds_boxes + zero_area_boxes
+        + duplicate_extra_images
     )
 
     return {

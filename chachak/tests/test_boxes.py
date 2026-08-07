@@ -207,6 +207,20 @@ class MergeTest(unittest.TestCase):
         merged = boxes.merge_predictions([torch.zeros((0, 6))], 100, 100, nms_iou=0.5)
         self.assertEqual(tuple(merged.shape), (0, 6))
 
+    def test_empty_result_keeps_the_inputs_device(self):
+        """The empty path used to hardcode CPU, which would hand a GPU caller a
+        silently device-mismatched tensor."""
+        for device in ["cpu"] + (["cuda"] if torch.cuda.is_available() else []):
+            with self.subTest(device=device):
+                merged = boxes.merge_predictions(
+                    [torch.zeros((0, 6), device=device)], 100, 100, nms_iou=0.5
+                )
+                self.assertEqual(merged.device.type, device)
+
+    def test_no_inputs_at_all_still_returns_an_empty_result(self):
+        merged = boxes.merge_predictions([], 100, 100, nms_iou=0.5)
+        self.assertEqual(tuple(merged.shape), (0, 6))
+
 
 class CropAndExpandTest(unittest.TestCase):
     def test_crop_returns_offset_and_size(self):

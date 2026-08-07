@@ -481,7 +481,14 @@ def validate(relpath: str, *, load_test: bool = False,
                              "runtime/ + infer.py present"))
 
     # --------------------------------------------------------------- load test
-    if not load_test:
+    foreign = _foreign_build(model_path) if model_path is not None else None
+    if foreign:
+        # Running it would fail, correctly and uselessly. The engine was compiled
+        # somewhere else, so it cannot load here by design — reporting that as a
+        # failure would read as "this bundle is broken" when it is exactly what was
+        # asked for. Say where it belongs instead.
+        checks.append(_check("Load test", "info", f"skipped — {foreign}"))
+    elif not load_test:
         checks.append(_check("Load test", "info", "not run"))
     elif model_path is None:
         checks.append(_check("Load test", "info",
@@ -495,6 +502,34 @@ def validate(relpath: str, *, load_test: bool = False,
         "defaults": defaults,
         "checks": checks,
     }
+
+
+def _foreign_build(model_path: Path) -> str | None:
+    """Why this engine can't be load-tested on this machine, or ``None``.
+
+    A remote build node writes ``built_by: buildnode`` into the engine's
+    ``.engine.json``, along with the GPU and TensorRT version it compiled against.
+    A plan only deserializes on the pair that produced it, so a bundle from a node
+    is not loadable here and never will be — that is the point of having built it
+    there. Only engines are affected; an ONNX bundle runs anywhere.
+    """
+    if model_path.suffix.lower() != ".engine":
+        return None
+    provenance_path = Path(str(model_path) + ".json")
+    if not provenance_path.is_file():
+        return None
+    try:
+        provenance = json.loads(provenance_path.read_text())
+    except (OSError, ValueError):
+        return None
+    if provenance.get("built_by") != "buildnode":
+        return None
+    gpu = provenance.get("gpu_name") or "another machine's GPU"
+    version = provenance.get("tensorrt_version")
+    where = f"built on a build node for {gpu}"
+    if version:
+        where += f" with TensorRT {version}"
+    return f"{where}; a TensorRT engine only loads where it was built"
 
 
 def _model_meta_check(artifact: Path, label: str) -> dict:

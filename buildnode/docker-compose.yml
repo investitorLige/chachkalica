@@ -1,0 +1,50 @@
+# Standalone build node — this is the file you copy to the OTHER machine.
+#
+# It needs the repo present to build the image (the Dockerfile's context is the
+# repo root, and models/people/detector*.onnx must already be generated — see
+# buildnode/README.md). Once built you can push the image to a registry and run
+# remote machines from the image alone, with only this file.
+#
+#   BUILDNODE_TOKEN=$(openssl rand -hex 20) docker compose -f buildnode/docker-compose.yml up -d --build
+#
+# Then register the node in the Django admin (Training -> Build nodes) with this
+# machine's URL and the same token.
+
+services:
+  buildnode:
+    build:
+      # Repo root, not this directory: chachak/bundle_export/vendor.py resolves
+      # its sources relative to the repo layout. See the Dockerfile's header.
+      context: ..
+      dockerfile: buildnode/Dockerfile
+    image: chachkalica-buildnode
+    environment:
+      # REQUIRED. The node refuses every request without it, /health included.
+      # Must match the token on the BuildNode row in Django.
+      BUILDNODE_TOKEN: ${BUILDNODE_TOKEN:?set BUILDNODE_TOKEN — the node will not serve without one}
+      BUILDNODE_PORT: ${BUILDNODE_PORT:-8300}
+      BUILDNODE_BUILD_TTL: ${BUILDNODE_BUILD_TTL:-86400}
+      BUILDNODE_MAX_UPLOAD_MB: ${BUILDNODE_MAX_UPLOAD_MB:-2048}
+    ports:
+      - "${BUILDNODE_HOST_PORT:-8300}:${BUILDNODE_PORT:-8300}"
+    volumes:
+      # Build scratch AND the compiled person-detector cache. Named volume rather
+      # than tmpfs so the person engine — a couple of minutes of compile — survives
+      # a restart, and so a large bundle is never held in RAM.
+      - buildnode-work:/var/lib/buildnode
+    restart: unless-stopped
+
+    # ───────────────────────────────── GPU ─────────────────────────────────
+    # Requires the NVIDIA Container Toolkit on the host. Without it the container
+    # still starts, /health reports "degraded", and builds are refused with a 503
+    # rather than failing several minutes in.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  buildnode-work:

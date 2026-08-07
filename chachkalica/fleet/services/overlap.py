@@ -143,6 +143,109 @@ def find_overlaps(datasets: list[Dataset]) -> list[dict]:
     return reports
 
 
+def _cluster_by_dhash(prints: list[dict]) -> list[list[dict]]:
+    """Group fingerprints into near-duplicate clusters via union-find over dhash bands.
+
+    Unlike ``compare_pair``, this is a self-join: every image is only compared
+    against the others in the same list, so groups (not left/right pairs) are
+    the natural output.
+    """
+    parent = {fp["path"]: fp["path"] for fp in prints}
+
+    def find(path):
+        while parent[path] != path:
+            parent[path] = parent[parent[path]]
+            path = parent[path]
+        return path
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    by_band: dict[tuple[int, int], list[dict]] = {}
+    for fp in prints:
+        for key in _dhash_bands(fp["dhash"]):
+            by_band.setdefault(key, []).append(fp)
+
+    for fp in prints:
+        for hit in _near_hits(fp["dhash"], by_band):
+            if hit["path"] != fp["path"]:
+                union(fp["path"], hit["path"])
+
+    clusters: dict[Path, list[dict]] = {}
+    for fp in prints:
+        clusters.setdefault(find(fp["path"]), []).append(fp)
+    return [
+        sorted(group, key=lambda fp: fp["path"].name)
+        for group in clusters.values() if len(group) > 1
+    ]
+
+
+def find_intra_duplicates(dataset: Dataset) -> dict:
+    """Duplicate/near-duplicate images within a single dataset.
+
+    Groups by exact MD5 first (byte-identical copies), then clusters whatever
+    is left by dhash (re-exported/re-compressed copies of the same photo) —
+    an image already accounted for in an exact-match group is excluded from
+    the dhash pass so it isn't counted twice. Each group's alphabetically
+    first path is treated as the keeper; the rest are reported as prunable.
+    """
+    prints = fingerprint_dataset(dataset)
+
+    by_md5: dict[str, list[dict]] = {}
+    for fp in prints:
+        by_md5.setdefault(fp["md5"], []).append(fp)
+    exact_groups = [
+        sorted(group, key=lambda fp: fp["path"].name)
+        for group in by_md5.values() if len(group) > 1
+    ]
+    exact_paths = {fp["path"] for group in exact_groups for fp in group}
+
+    remaining = [fp for fp in prints if fp["path"] not in exact_paths and fp["dhash"] is not None]
+    near_groups = _cluster_by_dhash(remaining)
+
+    def prunable(groups: list[list[dict]]) -> list[Path]:
+        return [fp["path"] for group in groups for fp in group[1:]]
+
+    return {
+        "dataset": dataset,
+        "image_count": len(prints),
+        "exact_groups": exact_groups,
+        "near_groups": near_groups,
+        "exact_duplicate_extra": sum(len(g) - 1 for g in exact_groups),
+        "near_duplicate_extra": sum(len(g) - 1 for g in near_groups),
+        "prunable_exact": prunable(exact_groups),
+        "prunable_near": prunable(near_groups),
+    }
+
+
+def prune_intra_duplicates(dataset: Dataset) -> dict:
+    """Delete extra copies within one dataset's duplicate/near-duplicate clusters.
+
+    Always re-fingerprints (like :func:`prune_overlaps`) rather than trusting
+    a report computed earlier, since the picture on disk is the only thing
+    safe to prune from. Keeps one image per cluster; every deletion is backed
+    up first.
+    """
+    report = find_intra_duplicates(dataset)
+    result = {"deleted_images": 0, "deleted_labels": 0, "backup_dir": ""}
+    to_prune = report["prunable_exact"] + report["prunable_near"]
+    if not to_prune:
+        return result
+
+    backup_root = source_root() / _PRUNE_BACKUP_DIR / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    seen: set[Path] = set()
+    for path in to_prune:
+        if path not in seen and path.exists():
+            _backup_and_delete(path, dataset, backup_root, result)
+            seen.add(path)
+
+    if result["deleted_images"] or result["deleted_labels"]:
+        result["backup_dir"] = str(backup_root)
+    return result
+
+
 def _backup_one(path: Path, dataset_dir: Path, backup_root: Path, dataset_name: str) -> None:
     try:
         relative = path.relative_to(dataset_dir)

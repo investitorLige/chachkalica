@@ -5,6 +5,9 @@ so we know the YAML we hand friendy_chachkalica has the right shape and paths wi
 needing the trainer itself.
 """
 
+import hashlib
+import json
+import tarfile
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -22,6 +25,8 @@ from training import model_specs
 from training import pipelines
 from training.forms import ExperimentModelForm
 from training.models import (
+    DEFAULT_PERSON_DETECTOR_CHECKPOINT,
+    BuildNode,
     EvalRun,
     Experiment,
     ExperimentDataset,
@@ -33,6 +38,8 @@ from training.models import (
     TrainingSettings,
 )
 from training.services import (
+    buildnode,
+    bundles,
     combine,
     config_gen,
     exports,
@@ -145,18 +152,25 @@ class ConfigGenTests(TestCase):
         self.exp.save()
         self.assertNotIn("num_queries", config_gen.model_entry(m, pipeline_name=self.exp.pipeline))
 
-    def test_min_box_size_only_emitted_for_people_detect_first(self):
-        self.exp.pipeline = pipelines.PEOPLE_DETECT_FIRST
-        self.exp.save()
-        data = config_gen.build_experiment_dict(self.exp, "/out/exp1")
-        self.assertEqual(
-            data["pipeline"]["detector"]["min_box_size"], self.exp.detector_min_box_size
-        )
+    def test_min_box_size_emitted_for_both_person_crop_pipelines(self):
+        """The floor reaches the training YAML for batch_people too.
 
-        self.exp.pipeline = pipelines.BATCH_PEOPLE
-        self.exp.save()
-        data = config_gen.build_experiment_dict(self.exp, "/out/exp1")
-        self.assertNotIn("min_box_size", data["pipeline"]["detector"])
+        It was once scoped to people_detect_first on the theory that
+        batch_people crops fixed-size tiles — but BatchPeoplePipeline only
+        *finds* people in tiles and crops the original frame, so its crops are
+        just as small, and chachak applies the floor for both regardless
+        (``crop_regions`` has no pipeline gate). Scoping it here meant a
+        batch_people model trained with no floor and was served with one.
+        """
+        for pipeline in (pipelines.PEOPLE_DETECT_FIRST, pipelines.BATCH_PEOPLE):
+            with self.subTest(pipeline=pipeline):
+                self.exp.pipeline = pipeline
+                self.exp.save()
+                data = config_gen.build_experiment_dict(self.exp, "/out/exp1")
+                self.assertEqual(
+                    data["pipeline"]["detector"]["min_box_size"],
+                    self.exp.detector_min_box_size,
+                )
 
     def test_label_dir_source_vs_annotator(self):
         ed = self.exp.datasets.first()
@@ -812,6 +826,33 @@ class PipelineMetadataTests(TestCase):
         blob = pipeline_meta.from_experiment(self._experiment(pipeline=""))
         self.assertEqual(blob["pipeline"], pipeline_meta.RAW)
 
+    def test_blank_detector_records_the_default_the_run_actually_used(self):
+        """A blank ``detector_checkpoint`` must freeze as the resolved default.
+
+        ``config_gen.pipeline_block`` substitutes
+        DEFAULT_PERSON_DETECTOR_CHECKPOINT when it writes the training YAML, so
+        freezing the blank recorded a pipeline the model was never trained
+        through. Every consumer then had to re-guess the fallback, and
+        ``build_predict_request`` didn't — it raised, so video/camera inference
+        refused to run any model whose experiment hadn't overridden the default.
+        """
+        blob = pipeline_meta.from_experiment(self._experiment(detector_checkpoint=""))
+        self.assertEqual(blob["detector_checkpoint"], DEFAULT_PERSON_DETECTOR_CHECKPOINT)
+
+    def test_blank_detector_stays_blank_when_the_pipeline_has_no_detector(self):
+        # Nothing crops here, so a detector path on the record would be a lie —
+        # and would leak a detector block into a plain tiling run.
+        blob = pipeline_meta.from_experiment(
+            self._experiment(pipeline=pipelines.BATCH_DETECT, detector_checkpoint="")
+        )
+        self.assertEqual(blob["detector_checkpoint"], "")
+
+    def test_an_explicit_detector_is_never_overridden_by_the_default(self):
+        blob = pipeline_meta.from_experiment(
+            self._experiment(detector_checkpoint="/models/mine.engine")
+        )
+        self.assertEqual(blob["detector_checkpoint"], "/models/mine.engine")
+
     def test_promotion_freezes_the_experiment_pipeline(self):
         model = self._promoted(self._experiment())
 
@@ -995,9 +1036,16 @@ class ExportedDetectorCopyTests(TestCase):
     def _sidecar(self, detector: Path) -> dict:
         # The experiment leaves detector_checkpoint blank, so the copy is driven by
         # DEFAULT_PERSON_DETECTOR_CHECKPOINT — patched to the fixture detector.
+        # That fallback is resolved when the record is frozen
+        # (pipeline_meta.from_experiment), so the metadata is re-frozen here under
+        # the patch: setUp promoted the model before the fixture detector existed.
         with mock.patch(
-            "training.services.exports.DEFAULT_PERSON_DETECTOR_CHECKPOINT", str(detector)
+            "training.models.DEFAULT_PERSON_DETECTOR_CHECKPOINT", str(detector)
         ):
+            self.model.pipeline_metadata = pipeline_meta.from_experiment(
+                pipeline_meta.source_experiment(self.model)
+            )
+            self.model.save(update_fields=["pipeline_metadata"])
             return exports.export_pipeline_sidecar(self.model, self.artifact)
 
     def _pin_detector(self, path: Path) -> None:
@@ -1069,6 +1117,117 @@ class ExportedDetectorCopyTests(TestCase):
         self.assertEqual(list(self.exports_dir.glob("*.detector.*")), [])
 
 
+class BuildPtBundleTests(TestCase):
+    """exports.build_pt_bundle: checkpoint + catalog/pipeline/training provenance,
+    packaged as one self-contained .tar.gz (see docs/pt-bundles.md)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+        self.checkpoint = self.root / "best.pt"
+        self.checkpoint.write_bytes(b"fake checkpoint bytes")
+
+        dataset = Dataset.objects.create(name="ds1")
+        experiment = Experiment.objects.create(
+            name="exp-ptbundle", pipeline=pipelines.BATCH_DETECT,
+            tile_size_px=640, overlap=0.2, eval_score_threshold=0.35, lr=0.0005,
+        )
+        ExperimentModel.objects.create(
+            experiment=experiment, arch=ExperimentModel.YOLOX, pretrained=True,
+            params={"variant": "s"},
+        )
+        ExperimentDataset.objects.create(
+            experiment=experiment, dataset=dataset, role=ExperimentDataset.TRAIN,
+            aug_hflip=True,
+        )
+        config_path = self.root / "exp-ptbundle.yaml"
+        config_path.write_text("name: exp-ptbundle\n")
+        run = TrainingRun.objects.create(
+            experiment=experiment, config_yaml_path=str(config_path))
+        result = RunResult.objects.create(
+            run=run, run_name="r0", model_arch=ExperimentModel.YOLOX,
+            best_checkpoint=str(self.checkpoint), best_epoch=7,
+            val_metrics={"map50": 0.5},
+        )
+        self.model = promote.promote_run_result(result, name="exp-ptbundle")
+        self.model.classes = ["a", "b"]
+        self.model.metrics = {"map50": 0.5}
+        self.model.save()
+
+    def test_bundle_contains_checkpoint_manifest_and_sidecar(self):
+        archive = self.root / "out" / "exp-ptbundle-ptbundle.tar.gz"
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint",
+            return_value={"arch": "yolox", "trained_size": [640, 640]},
+        ):
+            result = exports.build_pt_bundle(self.model, str(self.checkpoint), archive)
+
+        self.assertEqual(result["bundle_path"], str(archive))
+        self.assertTrue(archive.is_file())
+
+        root = "exp-ptbundle-ptbundle"
+        with tarfile.open(archive) as tar:
+            names = set(tar.getnames())
+            self.assertEqual(names, {
+                root, f"{root}/README.md", f"{root}/checkpoint.pipeline.json",
+                f"{root}/checkpoint.pt", f"{root}/manifest.json",
+                f"{root}/training_config.yaml",
+            })
+            manifest = json.loads(tar.extractfile(f"{root}/manifest.json").read())
+            checkpoint_bytes = tar.extractfile(f"{root}/checkpoint.pt").read()
+
+        self.assertEqual(checkpoint_bytes, self.checkpoint.read_bytes())
+        self.assertEqual(manifest["bundle_kind"], "pt_bundle")
+        self.assertEqual(manifest["trained_model"]["name"], "exp-ptbundle")
+        self.assertEqual(manifest["trained_model"]["classes"], ["a", "b"])
+        self.assertEqual(
+            manifest["checkpoint"]["sha256"],
+            hashlib.sha256(self.checkpoint.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(manifest["checkpoint"]["inspected"]["trained_size"], [640, 640])
+        self.assertEqual(manifest["pipeline_metadata"]["pipeline"], pipelines.BATCH_DETECT)
+        self.assertEqual(manifest["provenance"]["run_result"]["best_epoch"], 7)
+        self.assertEqual(manifest["provenance"]["experiment"]["lr"], 0.0005)
+        self.assertEqual(
+            manifest["provenance"]["experiment_models"],
+            [{"arch": ExperimentModel.YOLOX, "num_classes": None,
+              "pretrained": True, "params": {"variant": "s"}}],
+        )
+        self.assertEqual(len(manifest["provenance"]["experiment_datasets"]), 1)
+        self.assertEqual(manifest["provenance"]["experiment_datasets"][0]["dataset_name"], "ds1")
+        self.assertTrue(manifest["provenance"]["training_config_included"])
+
+    def test_missing_checkpoint_raises_without_writing_a_partial_archive(self):
+        archive = self.root / "out" / "gone-ptbundle.tar.gz"
+        with self.assertRaises(FileNotFoundError):
+            exports.build_pt_bundle(self.model, str(self.root / "gone.pt"), archive)
+        self.assertFalse(archive.exists())
+
+    def test_model_with_no_source_run_result_gets_null_provenance(self):
+        bare = TrainedModel.objects.create(
+            name="bare", arch=ExperimentModel.YOLOX, checkpoint_path=str(self.checkpoint))
+        archive = self.root / "out" / "bare-ptbundle.tar.gz"
+
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint", side_effect=RuntimeError("no trainer"),
+        ):
+            result = exports.build_pt_bundle(bare, str(self.checkpoint), archive)
+
+        manifest = result["manifest"]
+        self.assertEqual(manifest["provenance"], {
+            "run_result": None, "training_run": None, "experiment": None,
+            "experiment_models": [], "experiment_datasets": [],
+            "training_config_included": False,
+        })
+        self.assertNotIn("inspected", manifest["checkpoint"])
+        self.assertEqual(manifest["pipeline_metadata"]["pipeline"], pipeline_meta.RAW)
+        with tarfile.open(archive) as tar:
+            names = set(tar.getnames())
+        self.assertNotIn("bare-ptbundle/training_config.yaml", names)
+
+
 class ModelActionPrefillTests(TestCase):
     """The eval and preview forms prefill from the same frozen record.
 
@@ -1117,6 +1276,25 @@ class ModelActionPrefillTests(TestCase):
         self.assertContains(resp, 'value="people_detect_first" selected')
         self.assertContains(resp, 'value="/models/person.engine"')
         self.assertContains(resp, 'value="0.18"')
+
+    def test_evaluate_form_prefills_a_zero_expand_ratio_as_zero(self):
+        """An expand ratio of exactly 0 must survive the render.
+
+        ``0 crops the detector box exactly`` is a documented setting, but the
+        template used ``|default:'0.10'`` and Django's ``default`` filter fires on
+        *any* falsy value — so a model trained with 0 offered the operator 0.10 to
+        confirm, and the eval silently ran 10% wider crops than training.
+        """
+        self.model.pipeline_metadata = pipeline_meta.normalize({
+            "pipeline": pipelines.PEOPLE_DETECT_FIRST,
+            "detector_checkpoint": "/models/person.engine",
+            "detector_expand_ratio": 0.0,
+        })
+        self.model.save(update_fields=["pipeline_metadata"])
+
+        resp = self._open("evaluate")
+        self.assertContains(resp, 'id="detector_expand_ratio"\n           value="0.0"')
+        self.assertNotContains(resp, 'value="0.10"')
 
     def test_both_forms_prefill_merge_nms_iou(self):
         # Recorded all along, but neither form could act on it until
@@ -1252,6 +1430,32 @@ class ExportActionsQueueJobsTests(TestCase):
         ):
             resp = self._post("export_trt")
         self.assertEqual(resp.status_code, 200)
+
+    def test_export_pt_bundle_queues_one_job_and_creates_a_queued_row(self):
+        with mock.patch.object(training_admin, "_queue") as queue:
+            resp = self._post("export_pt_bundle", apply="1", output_dir=str(self.root / "out"))
+
+        self.assertEqual(resp.status_code, 302)
+        queue.return_value.enqueue.assert_called_once()
+        args, kwargs = queue.return_value.enqueue.call_args
+        self.assertEqual(args[0], jobs.run_export_pt_bundle)
+        self.assertEqual(kwargs.get("job_timeout"), jobs.EXPORT_PT_BUNDLE_JOB_TIMEOUT)
+
+        export_run = ExportRun.objects.get()
+        self.assertEqual(export_run.model, self.model)
+        self.assertEqual(export_run.kind, ExportRun.PT)
+        self.assertEqual(export_run.checkpoint_label, "best")
+        self.assertEqual(export_run.checkpoint_path, "/ckpts/best.pt")
+        self.assertEqual(export_run.status, ExportRun.QUEUED)
+        self.assertTrue(export_run.output_path.endswith("export-me-ptbundle.tar.gz"))
+
+    def test_export_pt_bundle_requires_an_output_directory(self):
+        with mock.patch.object(training_admin, "_queue") as queue:
+            resp = self._post("export_pt_bundle", apply="1", output_dir="")
+
+        self.assertEqual(resp.status_code, 302)  # returns None -> redirects to the changelist
+        queue.return_value.enqueue.assert_not_called()
+        self.assertEqual(ExportRun.objects.count(), 0)
 
 
 class ExportJobsTests(TestCase):
@@ -1439,6 +1643,51 @@ class ExportJobsTests(TestCase):
             run.checkpoint_path, run.output_path, precision="fp32", input_hw=None)
 
 
+class PtBundleJobTests(TestCase):
+    """training.jobs.run_export_pt_bundle: a thin status wrapper around
+    exports.build_pt_bundle — no trainer service, no separate sidecar/bundle step."""
+
+    def setUp(self):
+        self.model = TrainedModel.objects.create(
+            name="export-me", arch=ExperimentModel.YOLOX, checkpoint_path="/ckpts/best.pt",
+        )
+        self.run = ExportRun.objects.create(
+            model=self.model, kind=ExportRun.PT, checkpoint_label="best",
+            checkpoint_path="/ckpts/best.pt", output_path="/out/export-me-ptbundle.tar.gz",
+        )
+
+    def test_success_populates_result_and_bundle_dir(self):
+        bundle_result = {"bundle_path": self.run.output_path, "manifest": {"bundle_kind": "pt_bundle"}}
+        with mock.patch(
+            "training.jobs.exports.build_pt_bundle", return_value=bundle_result,
+        ) as build:
+            result = jobs.run_export_pt_bundle(self.run.pk)
+
+        build.assert_called_once_with(self.model, self.run.checkpoint_path, Path(self.run.output_path))
+        self.assertEqual(result, bundle_result)
+
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, ExportRun.OK)
+        self.assertEqual(self.run.result, bundle_result)
+        self.assertEqual(self.run.bundle_dir, self.run.output_path)
+        self.assertIsNotNone(self.run.started_at)
+        self.assertIsNotNone(self.run.finished_at)
+
+    def test_failure_marks_error_and_reraises(self):
+        with mock.patch(
+            "training.jobs.exports.build_pt_bundle",
+            side_effect=FileNotFoundError("Checkpoint not found: /ckpts/best.pt"),
+        ):
+            with self.assertRaises(FileNotFoundError):
+                jobs.run_export_pt_bundle(self.run.pk)
+
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, ExportRun.ERROR)
+        self.assertIn("Checkpoint not found", self.run.last_error)
+        self.assertIsNone(self.run.result)
+        self.assertEqual(self.run.bundle_dir, "")
+
+
 class RunnerInspectCheckpointTests(TestCase):
     """training.services.runner.inspect_checkpoint against a stubbed trainer response."""
 
@@ -1459,3 +1708,396 @@ class RunnerInspectCheckpointTests(TestCase):
         with mock.patch("training.services.runner.requests.post", return_value=response):
             with self.assertRaisesRegex(RuntimeError, "checkpoint not found"):
                 runner.inspect_checkpoint("/ckpts/missing.pt")
+
+
+# ---------------------------------------------------------------- build nodes
+
+
+class BuildNodeHealthTests(TestCase):
+    """``buildnode.record_health`` — the ping behind the admin action.
+
+    It must never raise: an unreachable node is an ordinary thing to show in a
+    changelist, and the action pings a whole queryset.
+    """
+
+    def setUp(self):
+        self.node = BuildNode.objects.create(
+            name="gpu-box-a", base_url="http://10.0.0.9:8300/", token="tok")
+
+    def test_records_snapshot_from_a_healthy_node(self):
+        body = {
+            "status": "ok", "gpu_name": "NVIDIA RTX 4090", "compute_capability": "8.9",
+            "tensorrt_version": "11.2.1.2", "driver_version": "580.173.02",
+            "busy": False, "queue_len": 0,
+            "person_detector": {"present": True, "onnx": True, "trt_graph": True},
+        }
+        response = mock.Mock(status_code=200)
+        response.json.return_value = body
+        with mock.patch("training.services.buildnode.requests.get", return_value=response):
+            returned = buildnode.record_health(self.node)
+
+        self.assertEqual(returned, body)
+        self.node.refresh_from_db()
+        self.assertEqual(self.node.last_status, BuildNode.OK)
+        self.assertEqual(self.node.gpu_name, "NVIDIA RTX 4090")
+        self.assertEqual(self.node.tensorrt_version, "11.2.1.2")
+        self.assertEqual(self.node.last_health, body)
+        self.assertEqual(self.node.last_error, "")
+        self.assertIsNotNone(self.node.last_seen_at)
+
+    def test_unreachable_node_is_recorded_not_raised(self):
+        with mock.patch(
+            "training.services.buildnode.requests.get",
+            side_effect=OSError("connection refused"),
+        ):
+            self.assertEqual(buildnode.record_health(self.node), {})
+
+        self.node.refresh_from_db()
+        self.assertEqual(self.node.last_status, BuildNode.ERROR)
+        self.assertIn("connection refused", self.node.last_error)
+        self.assertIsNone(self.node.last_seen_at)
+        # A failed ping still records that we tried — otherwise the admin can't
+        # distinguish "never pinged" from "pinged, and it's down".
+        self.assertIsNotNone(self.node.last_checked_at)
+
+    def test_degraded_node_is_not_ok(self):
+        """A node that answers but has no GPU must not read as healthy."""
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"status": "degraded", "gpu_name": None,
+                                      "tensorrt_version": None}
+        with mock.patch("training.services.buildnode.requests.get", return_value=response):
+            buildnode.record_health(self.node)
+
+        self.node.refresh_from_db()
+        self.assertEqual(self.node.last_status, BuildNode.ERROR)
+        self.assertIn("degraded", self.node.last_error)
+
+    def test_bearer_token_is_sent(self):
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"status": "ok"}
+        with mock.patch(
+            "training.services.buildnode.requests.get", return_value=response
+        ) as get:
+            buildnode.health(self.node)
+        self.assertEqual(
+            get.call_args.kwargs["headers"], {"Authorization": "Bearer tok"})
+        # base_url's trailing slash must not produce a double slash.
+        self.assertEqual(get.call_args.args[0], "http://10.0.0.9:8300/health")
+
+    def test_poll_treats_404_as_unknown(self):
+        """A node that lost the build is terminal, not an exception."""
+        response = mock.Mock(status_code=404, text="gone")
+        with mock.patch("training.services.buildnode.requests.get", return_value=response):
+            self.assertEqual(buildnode.poll(self.node, "abc"), {"status": "unknown"})
+
+    def test_wait_raises_when_the_node_lost_the_build(self):
+        with mock.patch.object(buildnode, "poll", return_value={"status": "unknown"}):
+            with self.assertRaisesRegex(buildnode.BuildNodeError, "lost build"):
+                buildnode.wait(self.node, "abc")
+
+
+class BuildNodeArchiveTests(TestCase):
+    """``extract_bundle`` — the archive came off another machine, so it's untrusted."""
+
+    def _tar(self, tmp: Path, build) -> Path:
+        import tarfile
+
+        payload = tmp / "payload"
+        payload.mkdir()
+        build(payload)
+        archive = tmp / "bundle.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            for child in payload.iterdir():
+                tar.add(child, arcname=child.name)
+        return archive
+
+    def test_extracts_a_normal_bundle(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+
+            def build(root: Path):
+                bundle = root / "thing-bundle"
+                (bundle / "models").mkdir(parents=True)
+                (bundle / "pipeline.json").write_text("{}")
+                (bundle / "models" / "model.engine").write_bytes(b"x")
+
+            archive = self._tar(tmp, build)
+            dest = tmp / "out"
+            result = buildnode.extract_bundle(archive, dest)
+
+            self.assertEqual(result, dest / "thing-bundle")
+            self.assertTrue((result / "pipeline.json").is_file())
+            self.assertTrue((result / "models" / "model.engine").is_file())
+            # The staging dir must not survive.
+            self.assertEqual([p.name for p in dest.iterdir()], ["thing-bundle"])
+
+    def test_rejects_a_traversing_member(self):
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            escape = tmp / "escape.txt"
+            escape.write_text("pwned")
+            archive = tmp / "evil.tar.gz"
+            with tarfile.open(archive, "w:gz") as tar:
+                tar.add(escape, arcname="../escape.txt")
+
+            with self.assertRaisesRegex(buildnode.BuildNodeError, "outside the destination"):
+                buildnode.extract_bundle(archive, tmp / "out")
+            self.assertFalse((tmp / "out" / "escape.txt").exists())
+
+    def test_rejects_a_symlink_member(self):
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            link = tmp / "link"
+            link.symlink_to("/etc/passwd")
+            archive = tmp / "evil.tar.gz"
+            with tarfile.open(archive, "w:gz") as tar:
+                tar.add(link, arcname="thing-bundle/link")
+
+            with self.assertRaisesRegex(buildnode.BuildNodeError, "contains a link"):
+                buildnode.extract_bundle(archive, tmp / "out")
+
+    def test_rejects_an_archive_without_one_bundle_root(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+
+            def build(root: Path):
+                (root / "a-bundle").mkdir()
+                (root / "b-bundle").mkdir()
+
+            archive = self._tar(tmp, build)
+            with self.assertRaisesRegex(buildnode.BuildNodeError, "exactly one bundle"):
+                buildnode.extract_bundle(archive, tmp / "out")
+
+
+class RemoteExportActionTests(TestCase):
+    """The "Build on" selector routes to the remote job instead of the local one."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+        ts = TrainingSettings.load()
+        ts.exports_root = str(self.root / "exports")
+        ts.bundles_root = str(self.root / "bundles")
+        ts.save()
+
+        self.model = TrainedModel.objects.create(
+            name="export-me", arch=ExperimentModel.YOLOX, checkpoint_path="/ckpts/best.pt")
+        self.node = BuildNode.objects.create(
+            name="gpu-box-a", base_url="http://10.0.0.9:8300", token="tok")
+
+        self.admin_user = User.objects.create_superuser("admin", "a@example.com", "pw")
+        self.client.force_login(self.admin_user)
+
+    def _post(self, **extra):
+        return self.client.post(
+            "/admin/training/trainedmodel/",
+            {"action": "export_trt", ACTION_CHECKBOX_NAME: [str(self.model.pk)],
+             "index": "0", **extra},
+        )
+
+    def test_choosing_a_node_queues_the_remote_job(self):
+        with mock.patch.object(training_admin, "_queue") as queue:
+            resp = self._post(apply="1", output_dir=str(self.root / "out"),
+                              precision="fp16", node=str(self.node.pk))
+
+        self.assertEqual(resp.status_code, 302)
+        args, kwargs = queue.return_value.enqueue.call_args
+        self.assertEqual(args[0], jobs.run_export_remote)
+        self.assertEqual(kwargs.get("job_timeout"), jobs.EXPORT_REMOTE_JOB_TIMEOUT)
+        self.assertEqual(ExportRun.objects.get().node, self.node)
+
+    def test_no_node_still_queues_the_local_job(self):
+        """The pre-existing path must be untouched when nothing is selected."""
+        with mock.patch.object(training_admin, "_queue") as queue:
+            self._post(apply="1", output_dir=str(self.root / "out"),
+                       precision="fp16", node="")
+
+        args, _ = queue.return_value.enqueue.call_args
+        self.assertEqual(args[0], jobs.run_export_trt)
+        self.assertIsNone(ExportRun.objects.get().node)
+
+    def test_a_retired_node_queues_nothing(self):
+        self.node.status = BuildNode.RETIRED
+        self.node.save(update_fields=["status"])
+        with mock.patch.object(training_admin, "_queue") as queue:
+            self._post(apply="1", output_dir=str(self.root / "out"),
+                       precision="fp16", node=str(self.node.pk))
+
+        queue.return_value.enqueue.assert_not_called()
+        self.assertEqual(ExportRun.objects.count(), 0)
+
+    def test_form_lists_active_nodes(self):
+        resp = self._post()
+        self.assertContains(resp, "gpu-box-a")
+        self.assertContains(resp, "Local trainer")
+
+
+class RemoteExportJobTests(TestCase):
+    """``jobs.run_export_remote`` — the whole round trip, with the node mocked out."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+        ts = TrainingSettings.load()
+        ts.exports_root = str(self.root / "exports")
+        ts.bundles_root = str(self.root / "bundles")
+        ts.save()
+
+        # A person-crop model, so the detector branch is exercised.
+        self.model = TrainedModel.objects.create(
+            name="ppe", arch=ExperimentModel.RFDETR, checkpoint_path="/ckpts/best.pt",
+            classes=["helmet", "vest"],
+            pipeline_metadata={"pipeline": "people_detect_first", "chain": [],
+                               "score_threshold": 0.4},
+        )
+        self.node = BuildNode.objects.create(
+            name="gpu-box-a", base_url="http://10.0.0.9:8300", token="tok")
+
+        # The graph the local trainer would have produced.
+        self.graph = self.root / "exports" / "_remote" / "ppe-best.trt.onnx"
+        self.graph.parent.mkdir(parents=True, exist_ok=True)
+        self.graph.write_bytes(b"onnx")
+        self.graph.with_suffix(".meta.json").write_text('{"arch": "rfdetr"}')
+
+        self.run = ExportRun.objects.create(
+            model=self.model, kind=ExportRun.TRT, checkpoint_label="best",
+            checkpoint_path="/ckpts/best.pt",
+            output_path=str(self.root / "out" / "ppe-best.engine"),
+            precision="fp16", node=self.node,
+        )
+
+    def _bundle_on_disk(self, *_args, **_kwargs):
+        """Stand in for extract_bundle: put a bundle where the real one would land."""
+        bundle = bundles.bundles_root() / self.node.name / "ppe-best-bundle"
+        (bundle / "models").mkdir(parents=True, exist_ok=True)
+        return bundle
+
+    def _run(self, status=None):
+        status = status or {"status": "ok", "result": {"gpu_name": "RTX 4090",
+                                                       "tensorrt_version": "11.2.1.2"}}
+        with mock.patch.object(
+            runner, "export_trt_onnx",
+            return_value={"onnx_path": str(self.graph), "prepared": True, "arch": "rfdetr"},
+        ), mock.patch.object(
+            buildnode, "submit_build", return_value="bid123"
+        ) as submit, mock.patch.object(
+            buildnode, "wait", return_value=status
+        ), mock.patch.object(
+            buildnode, "download_artifact"
+        ), mock.patch.object(
+            buildnode, "extract_bundle", side_effect=self._bundle_on_disk
+        ), mock.patch.object(buildnode, "cleanup") as cleanup:
+            try:
+                result = jobs.run_export_remote(self.run.pk)
+            except Exception as exc:  # surfaced to the caller by design
+                result = exc
+        return result, submit, cleanup
+
+    def test_happy_path_records_the_bundle_and_the_node(self):
+        result, submit, cleanup = self._run()
+        self.assertNotIsInstance(result, Exception)
+
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, ExportRun.OK)
+        self.assertEqual(self.run.remote_build_id, "bid123")
+        self.assertTrue(self.run.bundle_dir.endswith("gpu-box-a/ppe-best-bundle"))
+        # output_path points into the bundle: the engine only exists in there.
+        self.assertTrue(self.run.output_path.endswith("ppe-best-bundle/models/model.engine"))
+        self.assertEqual(self.run.result["node"], "gpu-box-a")
+        self.assertEqual(self.run.result["gpu_name"], "RTX 4090")
+        cleanup.assert_called()
+
+    def test_spec_uses_bare_names_and_never_uploads_the_local_detector(self):
+        _, submit, _ = self._run()
+        spec = submit.call_args.args[1]
+        files = submit.call_args.args[2]
+
+        self.assertEqual(spec["request"]["model_checkpoint"], "model.onnx")
+        self.assertTrue(spec["model_prepared"])
+        self.assertEqual(spec["fmt"], "engine")
+
+        # The shipped detector is an engine built for THIS box's GPU. It must never
+        # be uploaded — the node compiles its own from the graph baked into it.
+        detector = spec["request"]["detector"]
+        self.assertEqual(detector["checkpoint"], "builtin")
+        self.assertNotIn("detector", files)
+        blob = json.dumps(spec)
+        self.assertNotIn(DEFAULT_PERSON_DETECTOR_CHECKPOINT, blob)
+        self.assertNotIn("best_ckpt.engine", blob)
+
+        # Only the model graph + its meta go up.
+        self.assertEqual(set(files), {"model", "model_meta"})
+
+    def test_a_failed_remote_build_lands_on_the_row_with_the_node_log(self):
+        result, _, cleanup = self._run(
+            {"status": "error", "error": "TrtBuildError: out of memory",
+             "log_tail": "[build] compiling model.onnx"})
+        self.assertIsInstance(result, Exception)
+
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, ExportRun.ERROR)
+        self.assertIn("out of memory", self.run.last_error)
+        self.assertIn("[build] compiling", self.run.last_error)
+        cleanup.assert_called()
+
+    def test_a_raw_frame_model_is_refused_before_uploading_anything(self):
+        self.model.pipeline_metadata = {"pipeline": "", "chain": []}
+        self.model.save(update_fields=["pipeline_metadata"])
+
+        result, submit, _ = self._run()
+        self.assertIsInstance(result, Exception)
+        submit.assert_not_called()
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, ExportRun.ERROR)
+        self.assertIn("no pipeline geometry", self.run.last_error)
+
+
+class ForeignBundleLoadTestTests(TestCase):
+    """A bundle built on a node must not be reported as broken here.
+
+    Its engine cannot load on this machine by design, so running the load test
+    would fail truthfully but read as "this bundle is bad".
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _engine(self, provenance: dict | None) -> Path:
+        engine = self.root / "model.engine"
+        engine.write_bytes(b"plan")
+        if provenance is not None:
+            Path(str(engine) + ".json").write_text(json.dumps(provenance))
+        return engine
+
+    def test_a_node_built_engine_is_flagged_as_foreign(self):
+        engine = self._engine({"built_by": "buildnode", "gpu_name": "RTX 4090",
+                               "tensorrt_version": "11.2.1.2"})
+        reason = bundles._foreign_build(engine)
+        self.assertIsNotNone(reason)
+        self.assertIn("RTX 4090", reason)
+        self.assertIn("11.2.1.2", reason)
+
+    def test_a_locally_built_engine_is_not_flagged(self):
+        self.assertIsNone(self._foreign({"precision": "fp16", "arch": "rfdetr"}))
+
+    def test_an_engine_without_provenance_is_not_flagged(self):
+        self.assertIsNone(self._foreign(None))
+
+    def test_an_onnx_artifact_is_never_flagged(self):
+        onnx = self.root / "model.onnx"
+        onnx.write_bytes(b"onnx")
+        Path(str(onnx) + ".json").write_text(json.dumps({"built_by": "buildnode"}))
+        self.assertIsNone(bundles._foreign_build(onnx))
+
+    def _foreign(self, provenance):
+        return bundles._foreign_build(self._engine(provenance))

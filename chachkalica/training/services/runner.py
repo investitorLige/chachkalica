@@ -215,6 +215,36 @@ def export_onnx(checkpoint_path, onnx_path, ts: TrainingSettings | None = None) 
     return resp.json()
 
 
+def export_trt_onnx(checkpoint_path, onnx_path, ts: TrainingSettings | None = None) -> dict:
+    """Export one ``.pt`` as a TensorRT-READY ONNX via the trainer service.
+
+    Returns ``{"onnx_path", "meta_path", "arch", "prepared"}``. ``prepared`` is
+    True when the arch needed its baked NMS replaced with an ``EfficientNMS_TRT``
+    node (yolox, retinanet, fasterrcnn) and False when its standard export already
+    compiles (rtdetr, rfdetr) — the remote build passes that flag through so the
+    node knows which kind of graph it received.
+
+    This is what makes an EfficientNMS arch buildable on a remote node at all: the
+    re-export runs off the torch model, so it can only happen here. CPU-only, like
+    :func:`export_onnx` — it shares that timeout and does not touch the GPU.
+    """
+    payload = {"checkpoint_path": str(checkpoint_path), "onnx_path": str(onnx_path)}
+    resp = requests.post(
+        f"{base_url(ts)}/export_trt_onnx", json=payload, timeout=EXPORT_TIMEOUT)
+    if resp.status_code >= 400:
+        detail = resp.text
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and body.get("detail"):
+            detail = str(body["detail"])
+        raise RuntimeError(
+            f"trainer /export_trt_onnx returned HTTP {resp.status_code}: {detail}"
+        )
+    return resp.json()
+
+
 # Building a TensorRT engine (optimize + compile the ONNX graph for the GPU) can
 # take several minutes — well past the ONNX export timeout.
 TRT_BUILD_TIMEOUT = 1800

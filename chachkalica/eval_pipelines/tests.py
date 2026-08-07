@@ -113,26 +113,21 @@ class PipelineRequestTests(PipelineEvalSetup):
         req = config_gen.build_pipeline_request(pe, "/out/pipeline-6")
         self.assertEqual(req["tiling"], {"tile_size_px": 640, "overlap": 0.2})
 
-    def test_min_box_size_emitted_for_people_detect_first_only(self):
-        # Scoped like pipeline_block: batch_people's crops come from fixed-size
-        # tiles and can't shrink to the sizes this floor exists to catch.
-        cropped = self._make(
-            pipeline=PipelineEvalRun.PEOPLE_DETECT_FIRST,
-            detector_checkpoint="/models/person.pt", detector_min_box_size=96,
-        )
-        self.assertEqual(
-            config_gen.build_pipeline_request(cropped, "/out/p")["detector"]["min_box_size"],
-            96,
-        )
-
-        tiled = self._make(
-            pipeline=PipelineEvalRun.BATCH_PEOPLE,
-            detector_checkpoint="/models/person.pt", detector_min_box_size=96,
-        )
-        self.assertNotIn(
-            "min_box_size",
-            config_gen.build_pipeline_request(tiled, "/out/p")["detector"],
-        )
+    def test_min_box_size_emitted_for_both_person_crop_pipelines(self):
+        # Matches pipeline_block: batch_people crops the original frame (it only
+        # *finds* people in tiles), so its crops are as small as
+        # people_detect_first's and chachak applies the floor to both. An eval
+        # that dropped it here measured different geometry than training used.
+        for pipeline in (PipelineEvalRun.PEOPLE_DETECT_FIRST, PipelineEvalRun.BATCH_PEOPLE):
+            with self.subTest(pipeline=pipeline):
+                pe = self._make(
+                    pipeline=pipeline,
+                    detector_checkpoint="/models/person.pt", detector_min_box_size=96,
+                )
+                self.assertEqual(
+                    config_gen.build_pipeline_request(pe, "/out/p")["detector"]["min_box_size"],
+                    96,
+                )
 
     def test_merge_nms_iou_emitted_only_when_set(self):
         # chachak parses it with an unconditional float(), so an explicit null

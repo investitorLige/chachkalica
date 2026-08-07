@@ -649,6 +649,16 @@ class DatasetAdmin(admin.ModelAdmin):
 
         issue = request.POST.get("issue") or ""
         action = request.POST.get("action") or None
+
+        if issue == "duplicate_images":
+            # Unlike the label-file repairs below, pruning duplicates re-hashes
+            # every image in the dataset — that can run long enough to hit the
+            # request timeout, so it's queued the same way as check_overlapping_images.
+            if action not in (None, "", "prune"):
+                return JsonResponse({"error": "duplicate images only support prune"}, status=400)
+            _queue().enqueue(jobs.prune_intra_duplicates, dataset.id)
+            return JsonResponse({"queued": True, "dataset": dataset.name, "issue": issue})
+
         try:
             result = data_quality_solve.solve_dataset_quality(dataset, issue, action)
         except (FileNotFoundError, RuntimeError, ValueError) as exc:

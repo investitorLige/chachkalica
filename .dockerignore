@@ -12,3 +12,13 @@ chachkalica/
 **/runs/
 *.pt
 .env
+
+# Same reasoning for buildnode/Dockerfile, which shares this context. It needs
+# chachak/, onnx_infer/, trt_infer/, part of friendy_chachkalica/, buildnode/ and
+# models/people/detector*.onnx — and nothing else. These are large and are only
+# ever used through a bind mount at runtime (person_model_test holds the person
+# checkpoint that make_person_graphs.py reads), never COPYed into an image.
+person_model_test/
+dist/
+inferlica/
+logs/

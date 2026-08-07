@@ -121,9 +121,23 @@ another parameter:
 present with value `None` raises rather than falling through to the default.
 Every builder omits unset keys instead of emitting nulls — keep that pattern.
 
-`detector.min_box_size` is deliberately emitted only for `people_detect_first`,
-not `batch_people`: the latter's crops come from fixed-size tiles and can't
-shrink to the degenerate sizes the floor exists to catch.
+`detector.min_box_size` is emitted for **both** person-crop pipelines. It was
+once scoped to `people_detect_first` on the theory that `batch_people` crops
+fixed-size tiles and so can't shrink to the degenerate sizes the floor exists to
+catch — but `BatchPeoplePipeline` only *finds* people in tiles and then crops the
+original frame (`chachak.pipeline.BatchPeoplePipeline.process_batch`), so its
+crops are exactly as small. chachak applies the floor for both regardless
+(`crop_regions` has no pipeline gate), so scoping it in the builders meant a
+`batch_people` model trained with no floor and was then served with one.
+
+**A blank `detector_checkpoint` is resolved when the record is frozen**, not by
+each consumer. `config_gen.pipeline_block` substitutes
+`DEFAULT_PERSON_DETECTOR_CHECKPOINT` when it writes the training YAML, so
+`pipeline_meta.from_experiment` must record that same path — otherwise the record
+describes a pipeline the model was never trained through, and every consumer has
+to re-guess the fallback. Three did; `config_gen.build_predict_request` raised
+instead, so video and camera inference refused to run any model whose experiment
+had simply left the field on its default.
 
 ## Adding a parameter
 

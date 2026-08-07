@@ -1,0 +1,34 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Export model <strong>{{ model.name }}</strong> ({{ model.arch }}) as a self-contained
+<code>.pt</code> bundle.</p>
+<p class="help">Packages the best checkpoint (<code>{{ checkpoint_path }}</code>) into
+<code>&lt;dir&gt;/{{ model.name }}-ptbundle.tar.gz</code>, together with the model's catalog
+record, its frozen pipeline metadata (plus the person-detector checkpoint it depends on, if
+any), and every training hyperparameter/dataset/metric on record for the run it came from —
+everything another machine needs to catalog this as a Trained model, in one file. This is a
+plain file operation (no GPU, no trainer service round-trip), so it runs quickly regardless of
+what else is training. Relative paths resolve against the project root.</p>
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="apply" value="1">
+
+  <div class="form-row">
+    <label for="output_dir">Output directory:</label>
+    <input type="text" name="output_dir" id="output_dir" size="80"
+           value="{{ default_output_dir }}" required>
+    <p class="help">Directory the <code>.tar.gz</code> is written into (created if missing).</p>
+  </div>
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Export .pt bundle">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+{% endblock %}

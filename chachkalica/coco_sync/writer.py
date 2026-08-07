@@ -43,6 +43,7 @@ def write_atomic(path: Path, content: str) -> None:
     with _lock_for(path):
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
         try:
+            os.chmod(fd, 0o644)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(content)
             os.replace(tmp, path)
