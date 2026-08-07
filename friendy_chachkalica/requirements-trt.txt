@@ -18,7 +18,13 @@
 # different runtime produces bundles that cannot be deserialized here. Bump both
 # together (see chachkalica/docs/build-nodes.md).
 -r requirements.txt
-tensorrt==11.2.1.2
+# 11.1.0.106 to match nvcr.io/nvidia/tensorrt:26.07-py3 — the newest NGC
+# TensorRT container tag that actually exists (26.08/26.09 don't, and there is
+# no NGC image at all for 11.2.1.2 as of 2026-08-07). Both watchroom
+# deployments' gpu-inference images pin TensorRT via that base image tag (see
+# their docker/Dockerfile.gpu), so this has to track it exactly rather than
+# floating ahead on whatever pip has.
+tensorrt==11.1.0.106
 # Graph surgery to append the EfficientNMS_TRT plugin node for archs whose baked
 # NMS (retinanet, yolox) TensorRT can't compile directly.
 onnx_graphsurgeon

@@ -12,7 +12,7 @@
 # (trt_infer/session.py checks the .engine.json sidecar and fails loudly), so a
 # node on a different version silently produces bundles this stack cannot load.
 # Bump the two files together, and rebuild every cached engine in lockstep.
-tensorrt==11.2.1.2
+tensorrt==11.1.0.106
 
 # Graph surgery for the EfficientNMS_TRT plugin node. Only READ here — the node
 # never performs the surgery (that needs torch); it compiles graphs that already

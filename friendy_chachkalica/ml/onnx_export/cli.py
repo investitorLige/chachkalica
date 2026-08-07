@@ -107,7 +107,12 @@ def export_checkpoint(
     meta_path = onnx_path.with_suffix(".meta.json")
 
     print(f"[export] Loading checkpoint: {checkpoint_path}")
-    state = torch.load(checkpoint_path, map_location="cpu")
+    # weights_only=False: these are this project's own training checkpoints (a
+    # dict of model_name/model_config/state_dict, not an arbitrary third-party
+    # file), and torch >= 2.6's weights_only=True default rejects the numpy
+    # scalars some of them carry (e.g. a metric stashed in model_config) with a
+    # safe-globals error rather than loading them.
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model_name = state["model_name"]
     model_config = state.get("model_config", {}) or {}
     num_classes = model_config.get("num_classes")
