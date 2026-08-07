@@ -360,15 +360,37 @@ def _unpack_efficientnms(ordered: list, batch_size: int) -> list:
 
 
 def _split_passthrough(ordered: list, batch_size: int) -> list:
-    """Slice already-batched passthrough outputs (leading dim = batch_size,
-    e.g. rtdetr/rfdetr, which compile straight from their own batch-aware
-    ONNX graph) into one per-image ``[boxes, scores, labels]`` triple.
+    """Passthrough outputs (rtdetr/rfdetr) -> one ``[boxes, scores, labels]`` triple
+    per image.
 
-    Unlike the EfficientNMS path, this repo doesn't yet build any passthrough
-    arch's engine with a batch profile wider than 1, so this branch is
-    currently only exercised at ``batch_size == 1`` in practice; it's written
-    to generalize correctly (assuming the graph's own batch axis matches the
-    input batch) rather than to special-case that.
+    **These graphs have no batch axis.** Both export wrappers index it away before
+    baking the head math — ``onnx_export/arch/rfdetr.py`` (``boxes_n, logits =
+    boxes_n[0], logits[0]``) and ``arch/rtdetr.py`` (``out.logits[0]`` /
+    ``out.pred_boxes[0]``) — so the graph emits ``boxes[N,4] / scores[N] / labels[N]``
+    where **N is the detection count, not the batch size**. Their engines are built
+    with a batch profile of exactly 1 to match.
+
+    This used to read ``boxes[i], scores[i], labels[i]``, which at ``batch_size == 1``
+    returned detection *zero* — ``(4,) / () / ()`` — and silently discarded every other
+    detection. ``to_friendy`` then reshaped that lone box into a valid ``(1, 6)``, so
+    nothing raised: an RF-DETR engine emitting 300 detections per crop delivered
+    exactly one, and a person could only ever carry a single PPE label. The ONNX path
+    was never affected — ``OnnxModel.run`` returns the graph's outputs untouched, which
+    is what defines the handler contract these have to meet.
+
+    The batch axis is therefore detected by rank rather than assumed: rank-2 ``boxes``
+    means no batch axis (the current exporters), rank-3 means a genuinely batch-aware
+    graph, should one ever be exported.
     """
     boxes, scores, labels = ordered
+    if boxes.ndim <= 2:
+        # No batch axis: the whole output *is* this one image's detections.
+        if batch_size != 1:
+            raise RuntimeError(
+                f"passthrough engine returned un-batched outputs (boxes shape "
+                f"{tuple(boxes.shape)}) for a batch of {batch_size}. Its graph collapses "
+                f"the batch axis, so it must be run one image at a time — build the "
+                f"engine with a batch-1 profile, or lower the inference batch size."
+            )
+        return [[boxes, scores, labels]]
     return [[boxes[i], scores[i], labels[i]] for i in range(batch_size)]

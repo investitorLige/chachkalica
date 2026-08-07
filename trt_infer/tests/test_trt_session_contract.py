@@ -65,6 +65,7 @@ def test_unpack_efficientnms_accepts_flat_plugin_output():
 
 
 def test_split_passthrough_indexes_the_batch_axis():
+    """rank-3 boxes: a genuinely batch-aware graph, should one ever be exported."""
     boxes = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
     scores = torch.arange(2 * 3, dtype=torch.float32).reshape(2, 3)
     labels = torch.arange(2 * 3, dtype=torch.int64).reshape(2, 3)
@@ -76,6 +77,32 @@ def test_split_passthrough_indexes_the_batch_axis():
         torch.testing.assert_close(triples[i][0], boxes[i])
         torch.testing.assert_close(triples[i][1], scores[i])
         torch.testing.assert_close(triples[i][2], labels[i])
+
+
+def test_split_passthrough_keeps_every_detection_when_there_is_no_batch_axis():
+    """rank-2 boxes: what the rfdetr/rtdetr exporters actually emit, since they index
+    the batch away. Indexing it as a batch axis returned detection *zero* and silently
+    dropped the other 299 — and ``to_friendy`` reshaped that lone box into a
+    plausible ``(1, 6)``, so nothing ever raised."""
+    boxes = torch.arange(300 * 4, dtype=torch.float32).reshape(300, 4)
+    scores = torch.arange(300, dtype=torch.float32)
+    labels = torch.arange(300, dtype=torch.int64)
+
+    triples = _split_passthrough([boxes, scores, labels], 1)
+
+    assert len(triples) == 1
+    torch.testing.assert_close(triples[0][0], boxes)
+    torch.testing.assert_close(triples[0][1], scores)
+    torch.testing.assert_close(triples[0][2], labels)
+
+
+def test_split_passthrough_rejects_a_real_batch_it_cannot_split():
+    """Un-batched outputs for B > 1 are unsplittable — there is no axis to index. Better
+    to say so than to hand image 2 a copy of image 1's detections."""
+    with pytest.raises(RuntimeError, match="collapses the batch axis"):
+        _split_passthrough(
+            [torch.zeros(300, 4), torch.zeros(300), torch.zeros(300, dtype=torch.int64)], 2
+        )
 
 
 # ------------------------------------------------------------------ engine plumbing
@@ -275,6 +302,53 @@ def test_repeated_inference_stops_allocating_once_the_buffers_are_warm(model, ba
     torch.cuda.synchronize()
 
     assert torch.cuda.memory_allocated() == baseline
+
+
+def test_a_real_passthrough_engine_returns_every_detection_it_emitted(real_bundle_engines):
+    """The engine-level gate on ``_split_passthrough``, on a trained rfdetr/rtdetr engine.
+
+    ``test_trt_adapter_gpu_parity``'s numpy-route comparison structurally cannot catch
+    this: both routes go through ``_split_passthrough``, so when it dropped 299 of 300
+    detections both sides dropped the same 299 and agreed exactly. Only an absolute
+    count does it — checked against the shape TensorRT itself notified for ``boxes``.
+    """
+    from onnx_infer.meta import ModelMeta
+    from trt_infer.session import TrtModel
+
+    unloadable, checked = [], 0
+    for engine in real_bundle_engines:
+        try:
+            model = TrtModel(engine, ModelMeta.load(engine.with_suffix(".meta.json")), "cuda")
+        except RuntimeError as exc:
+            # A stale artifact built by another TensorRT. Not this test's subject — the
+            # parity test still fails loudly on it, which is where that belongs.
+            unloadable.append(f"{engine.name} ({exc})")
+            continue
+        if model._efficientnms:
+            continue
+
+        canvas = int(model.meta.input.size)
+        triples = model.run_torch(torch.rand(1, 3, canvas, canvas, device="cuda"))
+        emitted = model._allocator.shapes.get("boxes")
+
+        assert len(triples) == 1
+        boxes, scores, labels = triples[0]
+        assert boxes.ndim == 2 and boxes.shape[1] == 4, boxes.shape
+        assert scores.shape == (boxes.shape[0],) and labels.shape == (boxes.shape[0],)
+        # The bug returned exactly one detection, shaped (4,) / () / ().
+        assert boxes.shape[0] > 1, f"{engine.name} returned {boxes.shape[0]} detections"
+        if emitted is not None and len(emitted) == 2:
+            assert boxes.shape[0] == emitted[0], (
+                f"{engine.name}: graph emitted {emitted[0]} detections, "
+                f"run_torch returned {boxes.shape[0]}"
+            )
+        checked += 1
+
+    if not checked:
+        pytest.skip(
+            "no loadable passthrough (rfdetr/rtdetr) bundle engine in this checkout"
+            + (f"; skipped unloadable: {'; '.join(unloadable)}" if unloadable else "")
+        )
 
 
 def test_a_later_call_does_not_overwrite_an_earlier_calls_results(model, batch, profile):
