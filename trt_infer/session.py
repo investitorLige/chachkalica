@@ -22,7 +22,8 @@ Device memory and the CUDA stream are managed with **torch** (present wherever a
 GPU runtime runs), so there is no pycuda / cuda-python dependency: input bytes go
 in a torch CUDA tensor whose ``data_ptr()`` is handed to TensorRT, and outputs —
 whose detection count is data-dependent (NMS / top-k) — are captured through a
-TensorRT output allocator that (re)allocates a torch buffer on demand.
+single TensorRT output allocator, built once per execution context, whose torch
+buffers grow on demand and are then reused for the process's lifetime.
 """
 
 from __future__ import annotations
@@ -61,6 +62,11 @@ def _build_allocator_class(trt, torch):
 
     Defined lazily so importing this module doesn't require tensorrt. Handles both
     the TRT < 10 (``reallocate_output``) and TRT >= 10 (``*_async``) signatures.
+
+    One instance serves an execution context for its whole life: TensorRT's contract
+    is that an allocator resizes its own buffer in place across calls, and *only* the
+    grow path may allocate. See :meth:`TrtModel.run_torch` for why building one of
+    these per call is not a viable alternative.
     """
 
     class _TorchOutputAllocator(trt.IOutputAllocator):
@@ -70,8 +76,17 @@ def _build_allocator_class(trt, torch):
             self.shapes = {}   # name -> resolved output shape (tuple)
 
         def _reallocate(self, tensor_name, size):
-            buf = torch.empty(int(size), dtype=torch.uint8, device="cuda")
-            self.buffers[tensor_name] = buf
+            # Grow-only: keep the buffer we already hold whenever it is big enough,
+            # so a steady-state stream of same-shaped batches stops allocating after
+            # its first call. Reallocating unconditionally here leaks the GPU, badly
+            # — see run_torch.
+            size = int(size)
+            buf = self.buffers.get(tensor_name)
+            if buf is None or buf.numel() < size:
+                # max(size, 1): a 0-byte torch tensor's data_ptr() is 0, and handing
+                # TensorRT a null pointer is how it reports allocation failure.
+                buf = torch.empty(max(size, 1), dtype=torch.uint8, device="cuda")
+                self.buffers[tensor_name] = buf
             return int(buf.data_ptr())
 
         def reallocate_output(self, tensor_name, memory, size, alignment):  # TRT < 10
@@ -164,7 +179,15 @@ class TrtModel:
         # hides it. Checked up front instead.
         self._max_batch = _profile_max_batch(self.engine, self.input_name)
 
-        self._Allocator = _build_allocator_class(trt, torch)
+        # One allocator, registered once, for this context's whole life. TensorRT's
+        # python bindings tie a registered allocator's lifetime to the execution
+        # context, so a per-call allocator is never collected and neither are its
+        # torch buffers: ~18h of continuous inference on a 117MB pair of engines
+        # climbed to 9.45GiB of *live* (not cached) torch allocations and then wedged
+        # permanently, every subsequent call failing on the 4-byte num_detections.
+        self._allocator = _build_allocator_class(trt, torch)()
+        for tname in self._output_names:
+            self.context.set_output_allocator(tname, self._allocator)
 
     @property
     def device(self):
@@ -189,9 +212,9 @@ class TrtModel:
         """``[B,3,H,W]`` CUDA float32 -> a list of ``B`` CUDA ``[boxes, scores, labels]``.
 
         Always a list, never the bare-triple special case — a caller holding real
-        torch tensors has no legacy shape to preserve. The returned tensors are
-        views into the output allocator's buffers, which stay alive through the
-        views' storage; a fresh allocator per call means no aliasing between calls.
+        torch tensors has no legacy shape to preserve. The returned tensors own their
+        memory: the allocator's buffers are reused by the next call, so what comes
+        back here is copied out of them rather than viewing them (see the copy below).
         """
         trt, torch = self._trt, self._torch
 
@@ -201,9 +224,11 @@ class TrtModel:
         self.context.set_input_shape(self.input_name, tuple(int(d) for d in batched.shape))
         self.context.set_tensor_address(self.input_name, int(batched.data_ptr()))
 
-        allocator = self._Allocator()
-        for tname in self._output_names:
-            self.context.set_output_allocator(tname, allocator)
+        # The allocator is registered once, in __init__, and lives as long as this
+        # context — only its per-call shapes are stale. Drop them so an output whose
+        # shape TensorRT doesn't notify this time falls back to the context's own
+        # shape rather than silently reusing the previous call's.
+        self._allocator.shapes.clear()
 
         stream = torch.cuda.current_stream()
         if not self.context.execute_async_v3(stream.cuda_stream):
@@ -212,14 +237,21 @@ class TrtModel:
 
         outputs = {}
         for tname in self._output_names:
-            shape = allocator.shapes.get(tname)
+            shape = self._allocator.shapes.get(tname)
             if shape is None:  # static output: shape known from the context
                 shape = tuple(int(d) for d in self.context.get_tensor_shape(tname))
             dtype = _torch_dtype_for(trt, torch, self.engine.get_tensor_dtype(tname))
             numel = int(np.prod(shape)) if len(shape) else 1
             elem_size = torch.empty(0, dtype=dtype).element_size()
-            buf = allocator.buffers[tname]
-            outputs[tname] = buf[: numel * elem_size].view(dtype).reshape(shape)
+            buf = self._allocator.buffers[tname]
+            # .clone() is what makes buffer reuse safe. Returning views would hand the
+            # caller memory the *next* run_torch overwrites, and callers legitimately
+            # hold results across calls: TrtAdapter.predict runs one batch per distinct
+            # input shape and postprocesses only after every group has run, so views
+            # would give the earlier groups the last group's detections. This is a
+            # device-to-device copy of one batch of already-NMS'd outputs (a few KB) on
+            # a synchronized stream, next to an engine execute.
+            outputs[tname] = buf[: numel * elem_size].view(dtype).reshape(shape).clone()
 
         ordered = [outputs[tname] for tname in self._emit_order]
         if self._efficientnms:

@@ -743,7 +743,10 @@ class TrainedModelAdmin(admin.ModelAdmin):
     list_display = ["name", "stage", "arch", "num_classes", "map50", "map50_95", "created_at"]
     list_filter = ["stage", "arch"]
     search_fields = ["name", "description"]
-    actions = ["evaluate", "preview_on_dataset", "export_onnx", "export_trt", "view_hard_val_images"]
+    actions = [
+        "evaluate", "preview_on_dataset", "export_onnx", "export_trt", "export_pt_bundle",
+        "view_hard_val_images",
+    ]
     readonly_fields = ["source_run_result", "created_at", "updated_at"]
 
     @admin.display(description="mAP50")
@@ -1226,6 +1229,67 @@ class TrainedModelAdmin(admin.ModelAdmin):
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
         }
         return TemplateResponse(request, "admin/training/export_trt.html", context)
+
+    # ------------------------------------------------------------------- .pt bundle export
+    @admin.action(description="Export .pt bundle…")
+    def export_pt_bundle(self, request, queryset):
+        """Package the model's best checkpoint into a self-contained ``.tar.gz``
+        another machine can catalog as a Trained model.
+
+        Unlike ``export_onnx``/``export_trt`` this doesn't touch the trainer
+        service at all — it's a plain-file operation (copy + hash + tar) against
+        the checkpoint already on the shared filesystem, so there's no precision/
+        input-size/build-node choice to make, and only the promoted ``best``
+        checkpoint is bundled (not ``last``). ``exports.build_pt_bundle`` folds in
+        the model's catalog record, its frozen pipeline metadata (plus the
+        person-detector checkpoint it depends on, if any), and every training
+        hyperparameter/dataset/metric on record for the run it came from — see
+        ``docs/pt-bundles.md``.
+        """
+        if queryset.count() != 1:
+            self.message_user(request, "Select exactly one model to export.",
+                              level=messages.WARNING)
+            return None
+        model = queryset.first()
+        best = next(
+            (path for label, path in self._export_checkpoints(model) if label == "best"), None)
+        if not best:
+            self.message_user(
+                request, f"{model.name}: no checkpoint on record to export.",
+                level=messages.WARNING)
+            return None
+
+        if request.POST.get("apply"):
+            output_dir = (request.POST.get("output_dir") or "").strip()
+            if not output_dir:
+                self.message_user(request, "Enter an output directory.",
+                                  level=messages.WARNING)
+                return None
+            out_dir = config_gen._resolve(output_dir)
+            archive_path = out_dir / f"{self._onnx_stem(model.name)}-ptbundle.tar.gz"
+            export_run = ExportRun.objects.create(
+                model=model, kind=ExportRun.PT, checkpoint_label="best",
+                checkpoint_path=best, output_path=str(archive_path),
+            )
+            _queue().enqueue(
+                jobs.run_export_pt_bundle, export_run.pk,
+                job_timeout=jobs.EXPORT_PT_BUNDLE_JOB_TIMEOUT)
+            self.message_user(
+                request,
+                f"Queued .pt bundle export for {model.name} — see Export runs for progress.")
+            return None
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Export {model.name} as a .pt bundle",
+            "model": model,
+            "checkpoint_path": best,
+            "default_output_dir": str(exports.exports_root()),
+            "action": "export_pt_bundle",
+            "selected": [str(model.pk)],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+        }
+        return TemplateResponse(request, "admin/training/export_pt_bundle.html", context)
 
     def get_urls(self):
         custom = [

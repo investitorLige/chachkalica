@@ -6,6 +6,10 @@ now implemented on top of it — and it has out-of-tree callers
 ``inferlica/benchmark/kernel_util.py``) that unpack a bare triple and call
 ``labels.astype(np.int64)``. Those two facts are what this file pins down.
 
+The third contract is the output allocator's lifetime — that it is built once and its
+buffers reused (or the process leaks the GPU until it wedges), and that reuse is
+nonetheless invisible to a caller holding results across calls.
+
 Nothing here compares two engine invocations: the shared fixture's engine is not
 self-consistent across calls (see ``conftest``). The value-level logic —
 ``_unpack_efficientnms``, ``_as_engine_input``, and ``run``'s numpy conversion — is
@@ -205,3 +209,90 @@ def test_a_batch_over_the_profile_is_rejected_not_silently_wrong(model, batch, p
 
     with pytest.raises(ValueError, match="batch profile of at most"):
         model.run(batch(profile + 1))
+
+
+# ------------------------------------------------------------- output buffer lifetime
+
+
+def test_reallocate_only_allocates_when_it_needs_more_room():
+    """The allocator's whole job. Growing is allowed; re-allocating for a request the
+    current buffer already fits is the leak."""
+    trt = pytest.importorskip("tensorrt")
+    if not torch.cuda.is_available():
+        pytest.skip("the allocator's buffers are CUDA tensors")
+
+    from trt_infer.session import _build_allocator_class
+
+    allocator = _build_allocator_class(trt, torch)()
+
+    first = allocator._reallocate("out", 1024)
+    assert allocator._reallocate("out", 512) == first    # smaller request: same memory
+    assert allocator._reallocate("out", 1024) == first   # exact fit: same memory
+
+    grown = allocator._reallocate("out", 4096)
+    assert allocator.buffers["out"].numel() >= 4096
+    assert allocator._reallocate("out", 2048) == grown   # and it never shrinks back
+
+    # A null pointer is how this API reports failure, so even a 0-byte request has to
+    # come back with real memory behind it.
+    assert allocator._reallocate("empty", 0) != 0
+
+
+def test_the_allocator_is_built_once_and_its_buffers_reused(model, batch, profile):
+    """One allocator for the context's life, handing TensorRT the same addresses every
+    call. TensorRT's bindings never release a registered allocator, so building one per
+    call pins its buffers for the process's lifetime."""
+    warm = torch.from_numpy(batch(profile)).cuda()
+
+    model.run_torch(warm)
+    allocator = model._allocator
+    addresses = {name: buf.data_ptr() for name, buf in allocator.buffers.items()}
+    assert addresses, "the engine's outputs never went through the allocator"
+
+    model.run_torch(warm)
+
+    assert model._allocator is allocator
+    assert {name: buf.data_ptr() for name, buf in allocator.buffers.items()} == addresses
+
+
+def test_repeated_inference_stops_allocating_once_the_buffers_are_warm(model, batch, profile):
+    """The regression gate: live GPU memory must be flat across a run of calls, not
+    climbing by one set of output buffers each time.
+
+    Exact equality, not a tolerance — every allocation ``run_torch`` makes in steady
+    state is freed when the call's results are dropped, so a single retained byte here
+    is the bug. Pre-fix this grew by 4 buffers per call and wedged the process at ~9GiB
+    after ~18h of continuous inference.
+    """
+    warm = torch.from_numpy(batch(profile)).cuda()
+    for _ in range(3):
+        model.run_torch(warm)  # let every output buffer reach its final size
+    torch.cuda.synchronize()
+
+    baseline = torch.cuda.memory_allocated()
+    for _ in range(50):
+        model.run_torch(warm)
+    torch.cuda.synchronize()
+
+    assert torch.cuda.memory_allocated() == baseline
+
+
+def test_a_later_call_does_not_overwrite_an_earlier_calls_results(model, batch, profile):
+    """What reusing the buffers costs, and why ``run_torch`` copies out of them.
+
+    ``TrtAdapter.predict`` groups images by input shape, runs one batch per group, and
+    postprocesses only after every group has finished — so it genuinely holds one
+    call's results while the next call runs. Returning views into the reused buffers
+    would silently hand the earlier groups the last group's detections.
+
+    Compares the first call against its own snapshot, so the engine's non-determinism
+    across invocations (see ``conftest``) doesn't come into it.
+    """
+    first = model.run_torch(torch.from_numpy(batch(2, seed=1)).cuda())
+    snapshot = [[tensor.clone() for tensor in triple] for triple in first]
+
+    model.run_torch(torch.from_numpy(batch(profile, seed=2)).cuda())
+
+    for triple, expected in zip(first, snapshot):
+        for tensor, want in zip(triple, expected):
+            torch.testing.assert_close(tensor, want)

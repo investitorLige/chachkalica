@@ -315,6 +315,35 @@ def run_export_onnx(export_id: int) -> dict:
     return _finish_export(run, result, fmt="onnx")
 
 
+EXPORT_PT_BUNDLE_JOB_TIMEOUT = 300  # pure file I/O + hashing; no trainer/GPU round-trip
+
+
+def run_export_pt_bundle(export_id: int) -> dict:
+    """Package one checkpoint + its catalog/pipeline/training provenance into a
+    self-contained ``.tar.gz``. See ``ExportRun`` / ``exports.build_pt_bundle``.
+
+    Unlike ``run_export_onnx``/``run_export_trt`` there is no ``_finish_export``
+    step afterward: the pipeline sidecar (and person-detector copy) are already
+    folded into ``build_pt_bundle`` itself, staged inside the archive rather than
+    written beside a loose artifact, so this job is just a status wrapper.
+    """
+    run = ExportRun.objects.get(pk=export_id)
+    run.status, run.started_at = ExportRun.RUNNING, timezone.now()
+    run.save(update_fields=["status", "started_at"])
+
+    try:
+        result = exports.build_pt_bundle(run.model, run.checkpoint_path, Path(run.output_path))
+    except Exception as exc:  # noqa: BLE001 - surface service/network errors on the row
+        run.status, run.last_error, run.finished_at = ExportRun.ERROR, str(exc), timezone.now()
+        run.save(update_fields=["status", "last_error", "finished_at"])
+        raise
+
+    run.status, run.result, run.bundle_dir, run.finished_at = (
+        ExportRun.OK, result, result["bundle_path"], timezone.now())
+    run.save(update_fields=["status", "result", "bundle_dir", "finished_at"])
+    return result
+
+
 def run_export_trt(export_id: int) -> dict:
     """Build one checkpoint's TensorRT engine, then sidecar + bundle it. See ``ExportRun``."""
     run = ExportRun.objects.get(pk=export_id)

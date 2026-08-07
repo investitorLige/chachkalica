@@ -5,7 +5,9 @@ so we know the YAML we hand friendy_chachkalica has the right shape and paths wi
 needing the trainer itself.
 """
 
+import hashlib
 import json
+import tarfile
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -1115,6 +1117,117 @@ class ExportedDetectorCopyTests(TestCase):
         self.assertEqual(list(self.exports_dir.glob("*.detector.*")), [])
 
 
+class BuildPtBundleTests(TestCase):
+    """exports.build_pt_bundle: checkpoint + catalog/pipeline/training provenance,
+    packaged as one self-contained .tar.gz (see docs/pt-bundles.md)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+        self.checkpoint = self.root / "best.pt"
+        self.checkpoint.write_bytes(b"fake checkpoint bytes")
+
+        dataset = Dataset.objects.create(name="ds1")
+        experiment = Experiment.objects.create(
+            name="exp-ptbundle", pipeline=pipelines.BATCH_DETECT,
+            tile_size_px=640, overlap=0.2, eval_score_threshold=0.35, lr=0.0005,
+        )
+        ExperimentModel.objects.create(
+            experiment=experiment, arch=ExperimentModel.YOLOX, pretrained=True,
+            params={"variant": "s"},
+        )
+        ExperimentDataset.objects.create(
+            experiment=experiment, dataset=dataset, role=ExperimentDataset.TRAIN,
+            aug_hflip=True,
+        )
+        config_path = self.root / "exp-ptbundle.yaml"
+        config_path.write_text("name: exp-ptbundle\n")
+        run = TrainingRun.objects.create(
+            experiment=experiment, config_yaml_path=str(config_path))
+        result = RunResult.objects.create(
+            run=run, run_name="r0", model_arch=ExperimentModel.YOLOX,
+            best_checkpoint=str(self.checkpoint), best_epoch=7,
+            val_metrics={"map50": 0.5},
+        )
+        self.model = promote.promote_run_result(result, name="exp-ptbundle")
+        self.model.classes = ["a", "b"]
+        self.model.metrics = {"map50": 0.5}
+        self.model.save()
+
+    def test_bundle_contains_checkpoint_manifest_and_sidecar(self):
+        archive = self.root / "out" / "exp-ptbundle-ptbundle.tar.gz"
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint",
+            return_value={"arch": "yolox", "trained_size": [640, 640]},
+        ):
+            result = exports.build_pt_bundle(self.model, str(self.checkpoint), archive)
+
+        self.assertEqual(result["bundle_path"], str(archive))
+        self.assertTrue(archive.is_file())
+
+        root = "exp-ptbundle-ptbundle"
+        with tarfile.open(archive) as tar:
+            names = set(tar.getnames())
+            self.assertEqual(names, {
+                root, f"{root}/README.md", f"{root}/checkpoint.pipeline.json",
+                f"{root}/checkpoint.pt", f"{root}/manifest.json",
+                f"{root}/training_config.yaml",
+            })
+            manifest = json.loads(tar.extractfile(f"{root}/manifest.json").read())
+            checkpoint_bytes = tar.extractfile(f"{root}/checkpoint.pt").read()
+
+        self.assertEqual(checkpoint_bytes, self.checkpoint.read_bytes())
+        self.assertEqual(manifest["bundle_kind"], "pt_bundle")
+        self.assertEqual(manifest["trained_model"]["name"], "exp-ptbundle")
+        self.assertEqual(manifest["trained_model"]["classes"], ["a", "b"])
+        self.assertEqual(
+            manifest["checkpoint"]["sha256"],
+            hashlib.sha256(self.checkpoint.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(manifest["checkpoint"]["inspected"]["trained_size"], [640, 640])
+        self.assertEqual(manifest["pipeline_metadata"]["pipeline"], pipelines.BATCH_DETECT)
+        self.assertEqual(manifest["provenance"]["run_result"]["best_epoch"], 7)
+        self.assertEqual(manifest["provenance"]["experiment"]["lr"], 0.0005)
+        self.assertEqual(
+            manifest["provenance"]["experiment_models"],
+            [{"arch": ExperimentModel.YOLOX, "num_classes": None,
+              "pretrained": True, "params": {"variant": "s"}}],
+        )
+        self.assertEqual(len(manifest["provenance"]["experiment_datasets"]), 1)
+        self.assertEqual(manifest["provenance"]["experiment_datasets"][0]["dataset_name"], "ds1")
+        self.assertTrue(manifest["provenance"]["training_config_included"])
+
+    def test_missing_checkpoint_raises_without_writing_a_partial_archive(self):
+        archive = self.root / "out" / "gone-ptbundle.tar.gz"
+        with self.assertRaises(FileNotFoundError):
+            exports.build_pt_bundle(self.model, str(self.root / "gone.pt"), archive)
+        self.assertFalse(archive.exists())
+
+    def test_model_with_no_source_run_result_gets_null_provenance(self):
+        bare = TrainedModel.objects.create(
+            name="bare", arch=ExperimentModel.YOLOX, checkpoint_path=str(self.checkpoint))
+        archive = self.root / "out" / "bare-ptbundle.tar.gz"
+
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint", side_effect=RuntimeError("no trainer"),
+        ):
+            result = exports.build_pt_bundle(bare, str(self.checkpoint), archive)
+
+        manifest = result["manifest"]
+        self.assertEqual(manifest["provenance"], {
+            "run_result": None, "training_run": None, "experiment": None,
+            "experiment_models": [], "experiment_datasets": [],
+            "training_config_included": False,
+        })
+        self.assertNotIn("inspected", manifest["checkpoint"])
+        self.assertEqual(manifest["pipeline_metadata"]["pipeline"], pipeline_meta.RAW)
+        with tarfile.open(archive) as tar:
+            names = set(tar.getnames())
+        self.assertNotIn("bare-ptbundle/training_config.yaml", names)
+
+
 class ModelActionPrefillTests(TestCase):
     """The eval and preview forms prefill from the same frozen record.
 
@@ -1318,6 +1431,32 @@ class ExportActionsQueueJobsTests(TestCase):
             resp = self._post("export_trt")
         self.assertEqual(resp.status_code, 200)
 
+    def test_export_pt_bundle_queues_one_job_and_creates_a_queued_row(self):
+        with mock.patch.object(training_admin, "_queue") as queue:
+            resp = self._post("export_pt_bundle", apply="1", output_dir=str(self.root / "out"))
+
+        self.assertEqual(resp.status_code, 302)
+        queue.return_value.enqueue.assert_called_once()
+        args, kwargs = queue.return_value.enqueue.call_args
+        self.assertEqual(args[0], jobs.run_export_pt_bundle)
+        self.assertEqual(kwargs.get("job_timeout"), jobs.EXPORT_PT_BUNDLE_JOB_TIMEOUT)
+
+        export_run = ExportRun.objects.get()
+        self.assertEqual(export_run.model, self.model)
+        self.assertEqual(export_run.kind, ExportRun.PT)
+        self.assertEqual(export_run.checkpoint_label, "best")
+        self.assertEqual(export_run.checkpoint_path, "/ckpts/best.pt")
+        self.assertEqual(export_run.status, ExportRun.QUEUED)
+        self.assertTrue(export_run.output_path.endswith("export-me-ptbundle.tar.gz"))
+
+    def test_export_pt_bundle_requires_an_output_directory(self):
+        with mock.patch.object(training_admin, "_queue") as queue:
+            resp = self._post("export_pt_bundle", apply="1", output_dir="")
+
+        self.assertEqual(resp.status_code, 302)  # returns None -> redirects to the changelist
+        queue.return_value.enqueue.assert_not_called()
+        self.assertEqual(ExportRun.objects.count(), 0)
+
 
 class ExportJobsTests(TestCase):
     """training.jobs.run_export_onnx/run_export_trt: export -> sidecar -> bundle,
@@ -1502,6 +1641,51 @@ class ExportJobsTests(TestCase):
 
         export_trt.assert_called_once_with(
             run.checkpoint_path, run.output_path, precision="fp32", input_hw=None)
+
+
+class PtBundleJobTests(TestCase):
+    """training.jobs.run_export_pt_bundle: a thin status wrapper around
+    exports.build_pt_bundle — no trainer service, no separate sidecar/bundle step."""
+
+    def setUp(self):
+        self.model = TrainedModel.objects.create(
+            name="export-me", arch=ExperimentModel.YOLOX, checkpoint_path="/ckpts/best.pt",
+        )
+        self.run = ExportRun.objects.create(
+            model=self.model, kind=ExportRun.PT, checkpoint_label="best",
+            checkpoint_path="/ckpts/best.pt", output_path="/out/export-me-ptbundle.tar.gz",
+        )
+
+    def test_success_populates_result_and_bundle_dir(self):
+        bundle_result = {"bundle_path": self.run.output_path, "manifest": {"bundle_kind": "pt_bundle"}}
+        with mock.patch(
+            "training.jobs.exports.build_pt_bundle", return_value=bundle_result,
+        ) as build:
+            result = jobs.run_export_pt_bundle(self.run.pk)
+
+        build.assert_called_once_with(self.model, self.run.checkpoint_path, Path(self.run.output_path))
+        self.assertEqual(result, bundle_result)
+
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, ExportRun.OK)
+        self.assertEqual(self.run.result, bundle_result)
+        self.assertEqual(self.run.bundle_dir, self.run.output_path)
+        self.assertIsNotNone(self.run.started_at)
+        self.assertIsNotNone(self.run.finished_at)
+
+    def test_failure_marks_error_and_reraises(self):
+        with mock.patch(
+            "training.jobs.exports.build_pt_bundle",
+            side_effect=FileNotFoundError("Checkpoint not found: /ckpts/best.pt"),
+        ):
+            with self.assertRaises(FileNotFoundError):
+                jobs.run_export_pt_bundle(self.run.pk)
+
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, ExportRun.ERROR)
+        self.assertIn("Checkpoint not found", self.run.last_error)
+        self.assertIsNone(self.run.result)
+        self.assertEqual(self.run.bundle_dir, "")
 
 
 class RunnerInspectCheckpointTests(TestCase):

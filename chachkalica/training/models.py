@@ -596,18 +596,23 @@ class TrainedModel(models.Model):
 
 
 class ExportRun(models.Model):
-    """One queued ONNX/TensorRT export of a single checkpoint (best or last).
+    """One queued ONNX/TensorRT/``.pt`` export of a single checkpoint (best or last).
 
     Covers the whole per-checkpoint pipeline the admin export actions drive —
     primary export, pipeline sidecar, and (best-effort) infer bundle — as one
-    row, so ``training.jobs.run_export_onnx``/``run_export_trt`` can run it on
-    the ``django_rq`` worker instead of blocking the admin request (see
-    ``TrainedModelAdmin.export_onnx``/``export_trt``).
+    row, so ``training.jobs.run_export_onnx``/``run_export_trt``/
+    ``run_export_pt_bundle`` can run it on the ``django_rq`` worker instead of
+    blocking the admin request (see ``TrainedModelAdmin.export_onnx``/
+    ``export_trt``/``export_pt_bundle``). A ``kind="pt"`` row is the odd one out:
+    it doesn't call the trainer service at all (pure file I/O against the
+    checkpoint already on the shared filesystem), so ``precision``/``input_hw``/
+    ``node`` stay blank/null for it, same as they do for an ONNX row.
     """
 
     ONNX = "onnx"
     TRT = "trt"
-    KIND_CHOICES = [(ONNX, "onnx"), (TRT, "trt")]
+    PT = "pt"
+    KIND_CHOICES = [(ONNX, "onnx"), (TRT, "trt"), (PT, "pt")]
 
     QUEUED = "queued"
     RUNNING = "running"
