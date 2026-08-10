@@ -10,9 +10,9 @@ own input-pixel frame (Contract A). This module only:
   3. converts to normalized ``(x_center, y_center, width, height)`` and appends
      ``(confidence, class_id)`` — matching ``friendy_chachkalica.formats``.
 
-Deliberately does **not** clip boxes to image bounds: the training adapters'
-``xyxy_prediction_to_friendy`` doesn't either (the models clip internally), so
-clipping here would break parity.
+Clipping to image bounds is opt-in per arch via the meta's ``clip_boxes``:
+``xyxy_prediction_to_friendy`` does not clip, so this must clip exactly for the
+archs whose adapter clips before calling it, and no others.
 """
 
 from __future__ import annotations
@@ -44,11 +44,22 @@ def to_friendy(
         to Friendy xywhn (matches the torch path, where scaling to the original
         size and re-normalizing cancels out).
 
-    ``clip_boxes`` clamps boxes to ``[0, orig_w] x [0, orig_h]`` after the inverse,
-    to match archs whose torch path clips (YOLOX; RF-DETR under its letterbox
-    canvas, since padded-margin predictions can land outside the original
-    image). Left False for archs that don't (RT-DETR); a no-op for archs
-    already in-bounds (RetinaNet). Only meaningful for ``input_pixels``.
+    ``clip_boxes`` clamps boxes to the original image's bounds, to match archs
+    whose torch path clips (YOLOX; RF-DETR under its letterbox canvas, since
+    padded-margin predictions can land outside the original image; RT-DETR and
+    ECDet, whose sigmoid-decoded centres can put a box past the canvas edge with
+    no padding involved). A no-op for archs already in-bounds (RetinaNet).
+
+    It applies under **both** ``box_coords``, in whichever frame the boxes are
+    then normalized against: ``[0, orig_w] x [0, orig_h]`` after the inverse for
+    ``input_pixels``, and ``[0, 1]`` for ``input_normalized`` — which is the same
+    clamp, since for the normalized archs the model input's frame *is* the
+    original image's (they stretch, so there is no padding to offset). Skipping
+    it for ``input_normalized`` used to make the flag a silent no-op for
+    RT-DETR/ECDet, whose torch paths do clip: the exported graph then kept boxes
+    the torch path had clamped, so the same checkpoint scored differently per
+    format — an unclipped box has a larger area, so IoU against an edge-touching
+    ground truth drops and near-threshold matches flip to misses.
     """
     boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
     scores = np.asarray(scores, dtype=np.float32).reshape(-1)
@@ -72,6 +83,8 @@ def to_friendy(
             boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0.0, transform.orig_h)
         norm_w, norm_h = transform.orig_w, transform.orig_h
     else:  # input_normalized — already [0,1] over the model input.
+        if clip_boxes:
+            boxes = np.clip(boxes, 0.0, 1.0)
         norm_w = norm_h = 1.0
 
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]

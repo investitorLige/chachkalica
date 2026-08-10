@@ -85,6 +85,10 @@ def to_friendy_torch(
             boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0.0, transform.orig_w)
             boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0.0, transform.orig_h)
     # else: input_normalized — already [0,1] over the model input, norm_* are 1.0.
+    # The clamp is to [0,1] there, which is the same bound in that frame (these
+    # archs stretch, so the model input's frame is the original image's).
+    elif clip_boxes:
+        boxes = boxes.clamp(0.0, 1.0)
 
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
     width = x2 - x1

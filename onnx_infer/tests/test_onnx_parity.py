@@ -30,6 +30,7 @@ from friendy_chachkalica.ml.onnx_export.arch.retinanet import export_retinanet  
 from friendy_chachkalica.ml.onnx_export.arch.yolox import export_yolox  # noqa: E402
 from friendy_chachkalica.ml.onnx_export.arch.rtdetr import export_rtdetr  # noqa: E402
 from friendy_chachkalica.ml.onnx_export.arch.rfdetr import export_rfdetr  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.ecdet import export_ecdet  # noqa: E402
 from onnx_infer import load_onnx_adapter  # noqa: E402
 
 
@@ -287,4 +288,79 @@ def test_rfdetr_parity(rfdetr_export, hw):
     # RF-DETR always applies an aspect-changing square resize, so parity leans on
     # the service's numpy resize matching torch's bilinear F.interpolate; allow the
     # same looser tol as the RT-DETR resized cases.
+    _assert_parity(torch_pred, onnx_pred, min_dets=20, atol=5e-3)
+
+
+# --------------------------------------------------------------------------- ECDet
+
+
+@pytest.fixture(scope="module")
+def ecdet_export(tmp_path_factory):
+    torch.manual_seed(0)
+    # From scratch, offline, smallest variant at a small canvas for speed. 320 is a
+    # multiple of 32, which the stride-8/16/32 encoder requires.
+    adapter = build_model(
+        "ecdet", num_classes=3, variant="ecdet-s", weights=False, input_max_size=320
+    )
+    # Like RT-DETR (and unlike RF-DETR), a random-init ECDet needs its score heads
+    # de-tied: upstream zero-inits every bbox-head output layer and prior-biases the
+    # class heads, so the flattened top-k over `queries * classes` runs on a nearly
+    # tied field and torch/onnxruntime pick different — equally valid — rows, which
+    # reads as scrambled boxes rather than the export defect it is not. Spreading
+    # the per-layer heads separates the scores enough to be backend-stable.
+    with torch.no_grad():
+        for head in adapter.model.decoder.dec_score_head:
+            if hasattr(head, "weight"):
+                torch.nn.init.normal_(head.weight, mean=0.0, std=0.2)
+                torch.nn.init.normal_(head.bias, mean=0.0, std=0.5)
+    adapter.eval()
+    out_dir = tmp_path_factory.mktemp("ecdet")
+    onnx_path = out_dir / "model.onnx"
+    meta = export_ecdet(
+        adapter, num_classes=3, params={},
+        class_map={0: "a", 1: "b", 2: "c"}, onnx_path=onnx_path,
+    )
+    onnx_path.with_suffix(".meta.json").write_text(json.dumps(meta))
+    return adapter, onnx_path
+
+
+def test_ecdet_export_does_not_mutate_the_adapter(ecdet_export):
+    """``deploy()`` folds conv blocks and swaps the heads past ``eval_idx`` for
+    ``nn.Identity``, so the exporter must run on a deepcopy — otherwise exporting
+    silently truncates the model the trainer would go on to use."""
+    adapter, _ = ecdet_export
+    heads = adapter.model.decoder.dec_score_head
+    assert all(hasattr(head, "weight") for head in heads), (
+        "export replaced the adapter's score heads with Identity — deploy() leaked"
+    )
+
+
+@pytest.mark.parametrize(
+    "hw",
+    [
+        (320, 320),  # already on the canvas: no resize at all
+        (240, 320),  # landscape: per-axis stretch (one axis already on the canvas)
+        (256, 256),  # square: uniform upscale
+        (400, 300),  # both axes stretched, one down and one up
+    ],
+)
+def test_ecdet_parity(ecdet_export, hw):
+    adapter, onnx_path = ecdet_export
+    onnx_adapter, info = load_onnx_adapter(onnx_path, "cpu")
+    assert info["num_classes"] == 3
+
+    torch.manual_seed(1)
+    image = torch.rand(3, *hw)
+    # Compare the full post-top-k set: it is a much richer check of box decode +
+    # top-k + the normalized-coords contract than the handful of boxes that clear a
+    # positive floor, and it is the set the exported graph actually emits.
+    threshold = 0.0
+    torch_pred = adapter.predict([image], score_threshold=threshold)[0].detach().cpu().numpy()
+    onnx_pred = onnx_adapter.predict([image], score_threshold=threshold)[0].detach().cpu().numpy()
+
+    # ECDet stretches onto its square canvas like RT-DETR, so parity leans on the
+    # service's numpy resize matching torch's bilinear F.interpolate — same looser
+    # tolerance. This also guards the clip contract: the graph emits normalized
+    # boxes whose sigmoid-decoded centres can push past the canvas edge, and
+    # to_friendy must clamp them to [0,1] exactly as the adapter's clip_xyxy does.
     _assert_parity(torch_pred, onnx_pred, min_dets=20, atol=5e-3)
