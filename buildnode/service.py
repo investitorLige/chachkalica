@@ -139,6 +139,9 @@ def _parse_spec(raw: str) -> Dict[str, Any]:
         "request": request,
         "model_file": "model.onnx",
         "model_prepared": bool(spec.get("model_prepared", False)),
+        # This dict is rebuilt by hand, so a key not named here never reaches the build --
+        # a node without this line accepts the request and quietly omits infer_gpu.py.
+        "gpu_infer": bool(spec.get("gpu_infer", False)),
         "detector_file": None,
         "detector_prepared": bool(spec.get("detector_prepared", False)),
     }

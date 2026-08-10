@@ -46,6 +46,8 @@ def render_readme(manifest: Dict[str, Any], exported: Dict[str, Dict[str, Any]])
     classes = class_map(manifest)
     artifacts = manifest["artifacts"]
     fmt = bundle["default_format"]
+    # Set only when the bundle was exported with the GPU entrypoint (see build_manifest).
+    gpu_infer = bool(bundle.get("gpu_infer"))
 
     lines = [
         f"# {bundle['name']}",
@@ -186,10 +188,34 @@ def render_readme(manifest: Dict[str, Any], exported: Dict[str, Dict[str, Any]])
         "models/           the exported weights + their preprocessing sidecars",
         "runtime/          the inference code (vendored; no install needed)",
         "requirements.txt",
+    ] + ([
+        "infer_gpu.py      GPU-only entrypoint (optional, see below)",
+        "requirements-gpu.txt",
+    ] if gpu_infer else []) + [
         "```",
         "",
         "`pipeline.json` also records, under `provenance`, the checkpoints and request",
         "this bundle was built from.",
         "",
-    ]
+    ] + ([
+        "## GPU inference",
+        "",
+        "`infer_gpu.py` runs this same pipeline entirely on the GPU: frames stay in device",
+        "memory from decode to detections, and engine work is submitted without blocking",
+        "between calls. It needs a CUDA GPU and the `.engine` artifacts.",
+        "",
+        "```",
+        "pip install -r requirements.txt -r requirements-gpu.txt",
+        f"python infer_gpu.py path/to/images --conf {defaults['conf']}",
+        "```",
+        "",
+        "Output is identical to `infer.py`'s, byte for byte, so switching needs no",
+        "re-validation. `infer.py` still works exactly as documented above and is the one",
+        "to use without a GPU.",
+        "",
+        "One flag deviates deliberately: `--gpu-decode` decodes JPEGs with nvJPEG, which is",
+        "faster but *not* byte-identical to PIL (on 4:2:0 content the median pixel difference",
+        "is 0, but ~12% of pixels differ by at least 1/255). It is off unless asked for.",
+        "",
+    ] if gpu_infer else [])
     return "\n".join(lines)

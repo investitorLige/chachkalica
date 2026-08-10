@@ -298,7 +298,8 @@ BUNDLE_TIMEOUT = TRT_BUILD_TIMEOUT
 def export_bundle(
     request: dict, output_dir, *,
     fmt: str = "onnx", conf: float | None = None, precision: str = "auto",
-    overwrite: bool = True, ts: TrainingSettings | None = None,
+    overwrite: bool = True, gpu_infer: bool = False,
+    ts: TrainingSettings | None = None,
 ) -> dict:
     """Bundle an already-exported artifact as a self-contained pipeline.
 
@@ -315,6 +316,7 @@ def export_bundle(
         "conf": conf,
         "precision": precision,
         "overwrite": overwrite,
+        "gpu_infer": gpu_infer,
     }
     resp = requests.post(
         f"{base_url(ts)}/export_bundle", json=payload, timeout=BUNDLE_TIMEOUT)

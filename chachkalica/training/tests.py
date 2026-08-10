@@ -1384,6 +1384,27 @@ class ExportActionsQueueJobsTests(TestCase):
         self.assertEqual(export_run.input_hw, [640, 480])
         self.assertEqual(export_run.status, ExportRun.QUEUED)
 
+    def test_export_trt_persists_the_gpu_infer_opt_in(self):
+        with mock.patch.object(training_admin, "_queue"):
+            self._post(
+                "export_trt", apply="1", output_dir=str(self.root / "out"), gpu_infer="1",
+            )
+        self.assertTrue(ExportRun.objects.get().gpu_infer)
+
+    def test_export_trt_defaults_gpu_infer_off_when_the_box_is_unchecked(self):
+        """An unchecked checkbox posts nothing at all, so absence must read as False.
+
+        This is the regression test for "an export that did not ask for the GPU extra is
+        exactly the export it was before the option existed".
+        """
+        with mock.patch.object(training_admin, "_queue"):
+            self._post("export_trt", apply="1", output_dir=str(self.root / "out"))
+        self.assertFalse(ExportRun.objects.get().gpu_infer)
+
+    def test_export_trt_form_offers_the_gpu_infer_checkbox(self):
+        resp = self._post("export_trt")
+        self.assertContains(resp, 'name="gpu_infer"')
+
     def test_export_trt_rejects_invalid_input_size_without_queuing(self):
         from django.contrib.messages import get_messages
 
@@ -1605,6 +1626,67 @@ class ExportJobsTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.status, ExportRun.OK)
         self.assertEqual(run.bundle_dir, "")
+
+    def test_run_export_trt_forwards_gpu_infer_to_the_bundle(self):
+        run = self._export_run(
+            kind=ExportRun.TRT, output_path="/out/export-me-best.engine", gpu_infer=True,
+        )
+        with mock.patch(
+            "training.jobs.runner.export_trt", return_value={"engine_path": run.output_path},
+        ), mock.patch(
+            "training.jobs.exports.export_pipeline_sidecar",
+        ), mock.patch(
+            "training.jobs.exports.build_bundle_request", return_value={"pipeline": "x"},
+        ), mock.patch(
+            "training.jobs.runner.export_bundle", return_value={"bundle_dir": ""},
+        ) as export_bundle:
+            jobs.run_export_trt(run.pk)
+
+        self.assertTrue(export_bundle.call_args.kwargs["gpu_infer"])
+
+    def test_an_onnx_export_never_requests_gpu_infer(self):
+        """Guards the "strictly additive for ONNX" claim: that path never passes the flag."""
+        run = self._export_run()
+        with mock.patch(
+            "training.jobs.runner.export_onnx", return_value={"onnx_path": run.output_path},
+        ), mock.patch(
+            "training.jobs.exports.export_pipeline_sidecar",
+        ), mock.patch(
+            "training.jobs.exports.build_bundle_request", return_value={"pipeline": "x"},
+        ), mock.patch(
+            "training.jobs.runner.export_bundle", return_value={"bundle_dir": ""},
+        ) as export_bundle:
+            jobs.run_export_onnx(run.pk)
+
+        self.assertFalse(export_bundle.call_args.kwargs["gpu_infer"])
+
+    def test_a_bundle_without_infer_gpu_reports_a_skewed_service(self):
+        """An older trainer accepts the flag and ignores it -- pydantic has no extra="forbid".
+
+        Nothing additive can make an old peer honour an unknown field, so the bundle on disk is
+        the only honest signal. It must land on the row's non-fatal channel, not fail the export.
+        """
+        import shutil
+
+        empty = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, empty, True)
+        run = self._export_run(
+            kind=ExportRun.TRT, output_path="/out/export-me-best.engine", gpu_infer=True,
+        )
+        with mock.patch(
+            "training.jobs.runner.export_trt", return_value={"engine_path": run.output_path},
+        ), mock.patch(
+            "training.jobs.exports.export_pipeline_sidecar",
+        ), mock.patch(
+            "training.jobs.exports.build_bundle_request", return_value={"pipeline": "x"},
+        ), mock.patch(
+            "training.jobs.runner.export_bundle", return_value={"bundle_dir": empty},
+        ):
+            jobs.run_export_trt(run.pk)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, ExportRun.OK)
+        self.assertIn("older than this option", run.bundle_error)
 
     def test_run_export_trt_passes_precision_and_input_hw_through(self):
         run = self._export_run(
@@ -2035,6 +2117,16 @@ class RemoteExportJobTests(TestCase):
 
         # Only the model graph + its meta go up.
         self.assertEqual(set(files), {"model", "model_meta"})
+
+    def test_spec_carries_the_gpu_infer_flag(self):
+        self.run.gpu_infer = True
+        self.run.save(update_fields=["gpu_infer"])
+        _, submit, _ = self._run()
+        self.assertTrue(submit.call_args.args[1]["gpu_infer"])
+
+    def test_spec_defaults_gpu_infer_off(self):
+        _, submit, _ = self._run()
+        self.assertFalse(submit.call_args.args[1]["gpu_infer"])
 
     def test_a_failed_remote_build_lands_on_the_row_with_the_node_log(self):
         result, _, cleanup = self._run(

@@ -1152,6 +1152,9 @@ class TrainedModelAdmin(admin.ModelAdmin):
             precision = (request.POST.get("precision") or "fp16").strip()
             if precision not in ("fp16", "fp32"):
                 precision = "fp16"
+            # An unchecked box posts nothing, so absence *is* the False -- no whitelist
+            # needed here, unlike precision above.
+            gpu_infer = bool(request.POST.get("gpu_infer"))
             # Optional static input size ("640" or "640x640"): pins a fixed engine
             # profile (min==opt==max), which is how Faster R-CNN gets FP16.
             input_size = (request.POST.get("input_size") or "").strip()
@@ -1197,6 +1200,7 @@ class TrainedModelAdmin(admin.ModelAdmin):
                     model=model, kind=ExportRun.TRT, checkpoint_label=label,
                     checkpoint_path=checkpoint, output_path=str(engine_path),
                     precision=precision, input_hw=list(input_hw) if input_hw else None,
+                    gpu_infer=gpu_infer,
                     node=node,
                 )
                 if node is None:
@@ -1526,7 +1530,7 @@ class ExportRunAdmin(admin.ModelAdmin):
     list_filter = ["kind", "status", "node", "model"]
     readonly_fields = [
         "model", "kind", "checkpoint_label", "checkpoint_path", "output_path",
-        "precision", "input_hw", "node", "remote_build_id", "status", "result",
+        "precision", "input_hw", "gpu_infer", "node", "remote_build_id", "status", "result",
         "bundle_dir", "bundle_error", "last_error", "started_at", "finished_at",
         "created_at",
     ]

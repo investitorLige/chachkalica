@@ -372,6 +372,114 @@ class RoleFormatSelectionTest(unittest.TestCase):
         self.assertEqual(contract.batch_caps(mixed)["detector"], 1)
 
 
+class GpuInferOptOutTest(unittest.TestCase):
+    """The GPU entrypoint is opt-in, and an unflagged bundle is unchanged by its existence.
+
+    Deliberately a separate fixture from VendoredRuntimeTest: gpu_infer needs a CUDA torch
+    stack, so it must never enter the directory that test's import-closure check walks — the
+    same reason trt_infer is not in it.
+    """
+
+    def _runtime(self):
+        return Path(tempfile.mkdtemp()) / "runtime"
+
+    def test_absent_by_default_and_the_entry_list_is_unchanged(self):
+        runtime = self._runtime()
+        entries = vendor.vendor_runtime(runtime, include_trt=False)
+        self.assertEqual(entries, ["bundle_manifest.py", "chachak", "onnx_infer"])
+        self.assertFalse((runtime / "gpu_infer").exists())
+
+    def test_vendored_and_listed_when_requested(self):
+        runtime = self._runtime()
+        entries = vendor.vendor_runtime(runtime, include_trt=True, include_gpu=True)
+        self.assertIn("gpu_infer", entries)
+        self.assertTrue((runtime / "gpu_infer" / "__init__.py").exists())
+
+    def test_its_tests_are_not_vendored(self):
+        """They import chachak and would fail a bundle's import closure immediately."""
+        runtime = self._runtime()
+        vendor.vendor_runtime(runtime, include_trt=True, include_gpu=True)
+        self.assertFalse((runtime / "gpu_infer" / "tests").exists())
+
+    def test_the_manifest_omits_the_key_entirely_when_off(self):
+        """Not `false` — absent, so an unflagged pipeline.json is byte-for-byte unchanged."""
+        manifest = _manifest()
+        self.assertNotIn("gpu_infer", manifest["bundle"])
+        self.assertNotIn("gpu_infer", manifest)
+
+    def test_the_manifest_records_it_under_bundle_when_on(self):
+        manifest = contract.build_manifest(
+            _config(),
+            artifacts=ARTIFACTS,
+            default_format="onnx",
+            default_conf=0.42,
+            provenance={"source_request": None},
+            created_utc="2026-01-01T00:00:00Z",
+            gpu_infer=True,
+        )
+        self.assertIs(manifest["bundle"]["gpu_infer"], True)
+        # Must never migrate to the top level: ManifestFieldCoverageTest asserts that key
+        # set exactly against PipelineConfig's fields, and nothing pins `bundle`'s keys.
+        self.assertNotIn("gpu_infer", manifest)
+
+    def test_a_flagged_manifest_still_loads(self):
+        path = Path(tempfile.mkdtemp()) / "pipeline.json"
+        manifest = contract.build_manifest(
+            _config(),
+            artifacts=ARTIFACTS,
+            default_format="onnx",
+            default_conf=0.42,
+            provenance={"source_request": None},
+            created_utc="2026-01-01T00:00:00Z",
+            gpu_infer=True,
+        )
+        path.write_text(json.dumps(manifest))
+        self.assertIs(contract.load_manifest(path)["bundle"]["gpu_infer"], True)
+
+    def test_the_readme_mentions_it_only_when_set(self):
+        from chachak.bundle_export.readme import render_readme
+
+        exported = {
+            "model": {"source": "/x/best.pt", "arch": "rfdetr", "classes": {0: "helmet"},
+                      "paths": {}, "tensorrt_version": None},
+        }
+        plain = render_readme(_manifest(), exported)
+        for marker in ("infer_gpu.py", "requirements-gpu.txt", "GPU inference"):
+            self.assertNotIn(marker, plain, marker)
+
+        flagged = contract.build_manifest(
+            _config(), artifacts=ARTIFACTS, default_format="onnx", default_conf=0.42,
+            provenance={"source_request": None}, created_utc="2026-01-01T00:00:00Z",
+            gpu_infer=True,
+        )
+        with_gpu = render_readme(flagged, exported)
+        for marker in ("infer_gpu.py", "requirements-gpu.txt", "GPU inference"):
+            self.assertIn(marker, with_gpu, marker)
+
+    def test_the_shared_requirements_template_is_not_the_gpu_one(self):
+        """Adding torchvision to the shared template would change every future bundle."""
+        from chachak.bundle_export import cli as export_cli
+
+        shared = (export_cli._TEMPLATES / "requirements.txt").read_text()
+        self.assertNotIn("torchvision", shared)
+        # tensorrt appears in the shared file only as a commented-out note, so a substring
+        # check for it would pass for the wrong reason. The load-bearing property is that the
+        # GPU-only dependency lives in the GPU-only file.
+        gpu = (export_cli._TEMPLATES / "requirements-gpu.txt").read_text()
+        self.assertIn("torchvision", gpu)
+        self.assertIn("tensorrt", gpu)
+
+    def test_both_gpu_templates_exist_and_are_valid_python_where_applicable(self):
+        import ast
+
+        from chachak.bundle_export import cli as export_cli
+
+        script = export_cli._TEMPLATES / "infer_gpu.py"
+        self.assertTrue(script.exists())
+        ast.parse(script.read_text(), filename=str(script))
+        self.assertTrue((export_cli._TEMPLATES / "requirements-gpu.txt").exists())
+
+
 class SchemaGuardTest(unittest.TestCase):
     def _write(self, body):
         path = Path(tempfile.mkdtemp()) / "pipeline.json"

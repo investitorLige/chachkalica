@@ -1,0 +1,22 @@
+# Extra dependencies for infer_gpu.py, ON TOP OF requirements.txt.
+#
+#   pip install -r requirements.txt -r requirements-gpu.txt
+#
+# infer_gpu.py needs a CUDA GPU and this bundle's .engine artifacts. It does not
+# replace infer.py — that one still runs the same pipeline on the same artifacts
+# and needs nothing from this file.
+#
+# tensorrt: pin the version this bundle's engines were BUILT with, which is
+# recorded in pipeline.json under provenance.models.*.tensorrt_version. An engine
+# plan only deserializes on that exact version — a mismatch fails loudly rather
+# than silently mis-decoding, but it does fail. Pick the wheel matching the CUDA
+# major of the installed torch build (torch cu12.x -> tensorrt-cu12,
+# cu13.x -> tensorrt-cu13).
+tensorrt
+
+# torchvision: OPTIONAL, and only for --gpu-decode (nvJPEG frame decoding). Leave
+# it out and infer_gpu.py decodes with PIL, which is what it does by default
+# anyway — nvJPEG is not byte-identical to libjpeg-turbo (median pixel delta 0,
+# but ~12% of pixels differ by >=1/255 on 4:2:0 content), so it is off unless
+# asked for. Everything else about the run is unaffected.
+torchvision

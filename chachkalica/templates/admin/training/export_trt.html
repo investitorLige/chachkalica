@@ -85,6 +85,22 @@ trainer's exact GPU + TensorRT version (not portable to other hardware).</p>
     {% endif %}
   </div>
 
+  <div class="form-row">
+    <label for="gpu_infer">
+      <input type="checkbox" name="gpu_infer" id="gpu_infer" value="1">
+      Also ship the GPU inference script
+    </label>
+    <p class="help">Adds <code>infer_gpu.py</code>, a vendored <code>gpu_infer/</code> runtime
+    and <code>requirements-gpu.txt</code> to the exported bundle, alongside the ordinary
+    <code>infer.py</code>. It runs the same pipeline entirely on the GPU — frames stay in device
+    memory and engine work is submitted without blocking between calls — and its detections are
+    <strong>byte-identical</strong> to <code>infer.py</code>'s, so switching needs no
+    re-validation. Needs a CUDA GPU at run time.
+    <br>Nothing else about the bundle changes; leave it off for a bundle identical to what this
+    action produced before. Requires a trainer service (or build node) new enough to know the
+    option — if it silently didn't happen, the export run says so on <code>bundle error</code>.</p>
+  </div>
+
   <div class="submit-row">
     <input type="submit" class="default" value="Export to TensorRT">
     <a href="../" class="button cancel-link">Cancel</a>

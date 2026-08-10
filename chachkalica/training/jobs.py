@@ -242,7 +242,10 @@ EXPORT_ONNX_JOB_TIMEOUT = runner.EXPORT_TIMEOUT + runner.BUNDLE_TIMEOUT + 60
 EXPORT_TRT_JOB_TIMEOUT = runner.TRT_BUILD_TIMEOUT + runner.BUNDLE_TIMEOUT + 60
 
 
-def _bundle_after_export(run: ExportRun, artifact_path: Path, *, fmt: str, precision: str = "auto"):
+def _bundle_after_export(
+    run: ExportRun, artifact_path: Path, *, fmt: str, precision: str = "auto",
+    gpu_infer: bool = False,
+):
     """Best-effort infer bundle next to ``artifact_path``, mirroring what
     ``TrainedModelAdmin._export_bundle`` used to do synchronously in the admin
     request. A bundle failure is recorded on ``run.bundle_error`` but does not
@@ -257,14 +260,29 @@ def _bundle_after_export(run: ExportRun, artifact_path: Path, *, fmt: str, preci
         if bundle_request is None:
             return
         bundle_dir = artifact_path.parent / f"{artifact_path.stem}-bundle"
-        result = runner.export_bundle(bundle_request, bundle_dir, fmt=fmt, precision=precision)
+        result = runner.export_bundle(
+            bundle_request, bundle_dir, fmt=fmt, precision=precision, gpu_infer=gpu_infer
+        )
     except Exception as exc:  # noqa: BLE001 - non-fatal, recorded on the row
         run.bundle_error = str(exc)
         return
     run.bundle_dir = result.get("bundle_dir", "")
+    if gpu_infer and run.bundle_dir and not (Path(run.bundle_dir) / "infer_gpu.py").exists():
+        # A trainer service predating this option accepts the request and ignores the field --
+        # ExportBundleRequest is a plain pydantic model with no extra="forbid", so the POST
+        # succeeds with 200 and the bundle simply lacks the script. Nothing additive can make
+        # an old peer honour a flag it has never heard of, so the bundle on disk is the only
+        # honest answer. Non-fatal: everything else about the export is fine.
+        run.bundle_error = (
+            "GPU inference was requested but the bundle has no infer_gpu.py -- the trainer "
+            "service is older than this option. Redeploy it and re-export."
+        )
 
 
-def _finish_export(run: ExportRun, result: dict, *, fmt: str, precision: str = "auto") -> dict:
+def _finish_export(
+    run: ExportRun, result: dict, *, fmt: str, precision: str = "auto",
+    gpu_infer: bool = False,
+) -> dict:
     """Run the post-export steps, then mark ``run`` terminal. Never raises.
 
     Everything here happens *after* the artifact is already on disk, so none of it
@@ -287,7 +305,9 @@ def _finish_export(run: ExportRun, result: dict, *, fmt: str, precision: str = "
         problems.append(f"pipeline sidecar: {exc}")
 
     try:
-        _bundle_after_export(run, artifact_path, fmt=fmt, precision=precision)
+        _bundle_after_export(
+            run, artifact_path, fmt=fmt, precision=precision, gpu_infer=gpu_infer
+        )
     except Exception as exc:  # noqa: BLE001 - belt and braces; the helper guards itself
         problems.append(f"bundle: {exc}")
     if run.bundle_error:
@@ -359,7 +379,9 @@ def run_export_trt(export_id: int) -> dict:
         run.save(update_fields=["status", "last_error", "finished_at"])
         raise
 
-    return _finish_export(run, result, fmt="engine", precision=run.precision)
+    return _finish_export(
+        run, result, fmt="engine", precision=run.precision, gpu_infer=run.gpu_infer
+    )
 
 
 # ── remote builds ────────────────────────────────────────────────────────────
@@ -425,6 +447,7 @@ def _remote_spec(run: ExportRun, graph: Path, prepared: bool) -> dict:
         "name": Path(run.output_path).stem,
         "fmt": "engine",
         "precision": run.precision or "fp16",
+        "gpu_infer": run.gpu_infer,
         "conf": request.get("score_threshold"),
         "input_hw": list(run.input_hw) if run.input_hw else None,
         "model_prepared": prepared,
@@ -448,8 +471,23 @@ def _finish_remote_export(run: ExportRun, bundle_dir: Path, status: dict) -> dic
     run.result = result
     run.status = ExportRun.OK
     run.finished_at = timezone.now()
-    run.save(update_fields=[
-        "bundle_dir", "output_path", "result", "status", "finished_at"])
+
+    # `bundle_error` is added to update_fields only when there is something to report.
+    # Listing it unconditionally would make every remote export write that column, clobbering
+    # whatever a previous attempt left there -- a real behaviour change for exports that never
+    # asked for the GPU extra. This is the one place in this feature that is not purely
+    # additive, so it is built conditionally rather than appended.
+    fields = ["bundle_dir", "output_path", "result", "status", "finished_at"]
+    if run.gpu_infer and not (bundle_dir / "infer_gpu.py").exists():
+        node_name = run.node.name if run.node else "the build node"
+        run.bundle_error = (
+            f"GPU inference was requested but {node_name} returned a bundle without "
+            f"infer_gpu.py -- that node is older than this option, so its spec whitelist "
+            f"dropped the flag. Update the node and re-export."
+        )
+        fields.append("bundle_error")
+
+    run.save(update_fields=fields)
     return result
 
 

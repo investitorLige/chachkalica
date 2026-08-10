@@ -75,6 +75,7 @@ def build_manifest(
     default_conf: float,
     provenance: Dict[str, Any],
     created_utc: str,
+    gpu_infer: bool = False,
 ) -> Dict[str, Any]:
     """Assemble ``pipeline.json`` from a :class:`chachak.config.PipelineConfig`.
 
@@ -86,6 +87,13 @@ def build_manifest(
     below); the manifest never nests artifacts by format.
     ``default_conf`` is the model-stage confidence the bundle ships with — what
     ``infer.py`` uses when the consumer passes no ``--conf``.
+
+    ``gpu_infer`` records that this bundle also carries the GPU-only ``infer_gpu.py``
+    entrypoint. It is written under ``bundle`` rather than at the top level because
+    ``test_bundle_export.py`` asserts the top-level key set exactly (against ``PipelineConfig``'s
+    fields) while nothing pins ``bundle``'s keys — and it is **omitted entirely when false**, so
+    an ordinary bundle's ``pipeline.json`` is byte-for-byte what it was before this option
+    existed.
     """
     from dataclasses import asdict
 
@@ -151,6 +159,8 @@ def build_manifest(
         "score_threshold": float(default_conf),
         "provenance": _plain(provenance),
     }
+    if gpu_infer:
+        manifest["bundle"]["gpu_infer"] = True
     manifest.update(pipeline)
     return manifest
 

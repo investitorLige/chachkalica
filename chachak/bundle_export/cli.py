@@ -270,6 +270,7 @@ def export_bundle(
     conf: Optional[float] = None,
     precision: str = "auto",
     overwrite: bool = False,
+    gpu_infer: bool = False,
 ) -> Path:
     """Export the pipeline described by ``request`` (a chachak YAML) as a bundle.
 
@@ -286,6 +287,7 @@ def export_bundle(
     config: PipelineConfig = load_pipeline_config(request)
     return export_bundle_for_config(
         config, output_dir, fmt=fmt, conf=conf, precision=precision, overwrite=overwrite,
+        gpu_infer=gpu_infer,
         source=str(Path(request).resolve()),
     )
 
@@ -298,6 +300,7 @@ def export_bundle_for_config(
     conf: Optional[float] = None,
     precision: str = "auto",
     overwrite: bool = False,
+    gpu_infer: bool = False,
     source: Optional[str] = None,
 ) -> Path:
     """Export the pipeline described by an in-memory ``config`` as a bundle.
@@ -308,6 +311,12 @@ def export_bundle_for_config(
     what ``fmt`` and ``conf`` do. ``source`` is recorded under the manifest's
     ``provenance.source_request`` — a request YAML path, or ``None`` when there
     isn't one (e.g. a config built from a database record).
+
+    ``gpu_infer`` additionally ships the GPU-only ``infer_gpu.py`` entrypoint, the vendored
+    ``gpu_infer`` package and ``requirements-gpu.txt``. Defaults off, and when off every byte of
+    the bundle — ``pipeline.json`` and ``requirements.txt`` included — is what it was before the
+    option existed. Only meaningful for a bundle carrying ``.engine`` artifacts; the script
+    itself refuses an ONNX bundle at run time.
     """
     bundle_dir = Path(output_dir) if output_dir else config.output_dir / "bundle"
     bundle_dir = bundle_dir.resolve()
@@ -426,17 +435,27 @@ def export_bundle_for_config(
             },
         },
         created_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        gpu_infer=gpu_infer,
     )
     (bundle_dir / "pipeline.json").write_text(json.dumps(manifest, indent=2))
 
     # Vendor the TensorRT runtime whenever *any* role runs on an engine, not just
     # when the bundle's own format is "engine" — a mixed bundle needs both loaders.
-    runtime_entries = vendor_runtime(bundle_dir / "runtime", include_trt=bool(engine_roles))
+    runtime_entries = vendor_runtime(
+        bundle_dir / "runtime", include_trt=bool(engine_roles), include_gpu=gpu_infer
+    )
 
     entrypoint = bundle_dir / "infer.py"
     shutil.copy2(_TEMPLATES / "infer.py", entrypoint)
     entrypoint.chmod(entrypoint.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
     shutil.copy2(_TEMPLATES / "requirements.txt", bundle_dir / "requirements.txt")
+    if gpu_infer:
+        gpu_entrypoint = bundle_dir / "infer_gpu.py"
+        shutil.copy2(_TEMPLATES / "infer_gpu.py", gpu_entrypoint)
+        gpu_entrypoint.chmod(gpu_entrypoint.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+        shutil.copy2(
+            _TEMPLATES / "requirements-gpu.txt", bundle_dir / "requirements-gpu.txt"
+        )
     (bundle_dir / "README.md").write_text(render_readme(manifest, exported))
 
     print(f"[bundle] Wrote {bundle_dir}")
@@ -447,7 +466,14 @@ def export_bundle_for_config(
     print(f"[bundle]   formats           "
           + ", ".join(f"{role}={fmt_}" for role, fmt_ in sorted(role_format.items()))
           + f" (bundle format {default_format})")
+    if gpu_infer:
+        print("[bundle]   infer_gpu.py      GPU-only entrypoint (requirements-gpu.txt)")
     print(f"[bundle] Run it with: cd {bundle_dir} && python infer.py IMAGES --conf {default_conf}")
+    if gpu_infer and not engine_roles:
+        print(
+            "[bundle] NOTE: infer_gpu.py was requested but this bundle carries no .engine "
+            "artifacts, so it will refuse to run. Re-export with --format engine."
+        )
     return bundle_dir
 
 
@@ -474,6 +500,12 @@ def main() -> None:
     parser.add_argument("--precision", choices=["auto", "fp16", "fp32"], default="auto",
                         help="TensorRT precision, for --format engine")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing bundle")
+    parser.add_argument(
+        "--gpu-infer",
+        action="store_true",
+        help="Also ship the GPU-only infer_gpu.py entrypoint + vendored gpu_infer package. "
+             "Needs --format engine to be useful; the ordinary infer.py is unaffected",
+    )
     args = parser.parse_args()
 
     export_bundle(
@@ -483,6 +515,7 @@ def main() -> None:
         conf=args.conf,
         precision=args.precision,
         overwrite=args.overwrite,
+        gpu_infer=args.gpu_infer,
     )
 
 

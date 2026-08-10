@@ -63,6 +63,15 @@ class SpecValidationTests(unittest.TestCase):
         spec.update(overrides)
         return service._parse_spec(json.dumps(spec))
 
+    def test_gpu_infer_defaults_to_false(self):
+        self.assertFalse(self._parse()["gpu_infer"])
+
+    def test_gpu_infer_survives_the_spec_whitelist(self):
+        """``_parse_spec`` rebuilds its return dict by hand, so an un-added key is silently
+        dropped -- the node would then accept the request and quietly build a bundle without
+        ``infer_gpu.py``. This is the test that catches that regression."""
+        self.assertTrue(self._parse(gpu_infer=True)["gpu_infer"])
+
     def test_a_valid_spec_parses(self):
         parsed = self._parse()
         self.assertEqual(parsed["name"], "thing")

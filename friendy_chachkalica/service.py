@@ -223,6 +223,11 @@ class ExportBundleRequest(BaseModel):
     conf: Optional[float] = None
     precision: str = "auto"
     overwrite: bool = True
+    # Opt-in extra: also ship the GPU-only infer_gpu.py entrypoint and the vendored
+    # gpu_infer package alongside the ordinary infer.py. Absent from an older caller's
+    # payload, which pydantic reads as False -- so the bundle it gets is exactly the
+    # bundle it got before this field existed.
+    gpu_infer: bool = False
 
 
 class PromoteLabelsRequest(BaseModel):
@@ -914,6 +919,7 @@ def export_bundle(req: ExportBundleRequest):
             bundle_dir = export_bundle_for_config(
                 config, req.output_dir, fmt=req.fmt, conf=req.conf,
                 precision=req.precision, overwrite=req.overwrite,
+                gpu_infer=req.gpu_infer,
             )
         except HTTPException:
             raise

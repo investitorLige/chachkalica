@@ -235,6 +235,7 @@ def _run(record: BuildRecord, spec: Dict[str, Any]) -> None:
             conf=spec.get("conf"),
             precision=precision,
             overwrite=True,
+            gpu_infer=bool(spec.get("gpu_infer")),
         )
     )
 
@@ -249,6 +250,9 @@ def _run(record: BuildRecord, spec: Dict[str, Any]) -> None:
         "requested_precision": precision,
         "precision": engine_precision or precision,
         "node_version": NODE_VERSION,
+        # A positive acknowledgement, so the caller can tell "this node honoured the flag"
+        # from "this node is too old to know it" without inspecting the bundle.
+        "gpu_infer": bool(spec.get("gpu_infer")),
         "gpu_name": identity["gpu_name"],
         "compute_capability": identity["compute_capability"],
         "driver_version": identity["driver_version"],

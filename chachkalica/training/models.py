@@ -634,6 +634,10 @@ class ExportRun(models.Model):
     # TensorRT-only knobs (blank/null for an ONNX row).
     precision = models.CharField(max_length=8, blank=True)
     input_hw = models.JSONField(null=True, blank=True)  # [H, W] or null (dynamic profile)
+    # Ship the GPU-only infer_gpu.py entrypoint in the bundle this export produces, next
+    # to the ordinary infer.py. False on every historical row, which is exactly what those
+    # bundles hold.
+    gpu_infer = models.BooleanField(default=False)
 
     # Where the build ran. NULL means the local trainer — the only possibility
     # before build nodes existed, so every historical row reads correctly. A row

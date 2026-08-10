@@ -66,8 +66,15 @@ def _copy_package(source: Path, destination: Path) -> None:
     )
 
 
-def vendor_runtime(runtime_dir: Path, *, include_trt: bool) -> List[str]:
-    """Populate ``runtime_dir``; returns the top-level entries written."""
+def vendor_runtime(
+    runtime_dir: Path, *, include_trt: bool, include_gpu: bool = False
+) -> List[str]:
+    """Populate ``runtime_dir``; returns the top-level entries written.
+
+    ``include_gpu`` adds the ``gpu_infer`` package, which backs the optional
+    ``infer_gpu.py`` entrypoint. Defaults off, so a bundle exported without the option has a
+    byte-for-byte unchanged ``runtime/``.
+    """
     runtime_dir.mkdir(parents=True, exist_ok=True)
 
     chachak_dir = runtime_dir / "chachak"
@@ -94,6 +101,13 @@ def vendor_runtime(runtime_dir: Path, *, include_trt: bool) -> List[str]:
     if include_trt:
         _copy_package(_REPO_ROOT / "trt_infer", runtime_dir / "trt_infer")
         entries.append("trt_infer")
+
+    # gpu_infer runs the same pipelines fully GPU-resident (infer_gpu.py). Opt-in, and only
+    # useful alongside trt_infer since it is engine-only. _copy_package strips its tests/,
+    # which matters: those import chachak and would fail the bundle's import-closure check.
+    if include_gpu:
+        _copy_package(_REPO_ROOT / "gpu_infer", runtime_dir / "gpu_infer")
+        entries.append("gpu_infer")
 
     # The manifest contract, shared by the exporter and the bundle's infer.py so
     # pipeline.json has exactly one definition.
