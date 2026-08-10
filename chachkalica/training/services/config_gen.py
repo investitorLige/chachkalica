@@ -129,8 +129,9 @@ def model_entry(exp_model: ExperimentModel, pipeline_name: str | None = None) ->
 
     The ``pretrained`` checkbox maps to ``weights: true`` — every adapter reads
     ``weights=True`` as "load the published COCO-pretrained weights" (retinanet,
-    rtdetr, yolox, rfdetr, fasterrcnn). An explicit ``weights`` in ``params`` (e.g. a
-    path or URL) is left untouched and wins over the checkbox.
+    rtdetr, yolox, rfdetr, fasterrcnn, ecdet). An explicit ``weights`` in ``params``
+    (e.g. a path, URL, or ecdet's ``backbone`` sentinel) is left untouched and wins
+    over the checkbox.
 
     ``pipeline_name`` is the owning experiment's pipeline, passed by
     :func:`build_experiment_dict` (``None`` for standalone/test callers, which

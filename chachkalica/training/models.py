@@ -413,12 +413,14 @@ class ExperimentModel(models.Model):
     RTDETR = "rtdetr"
     RFDETR = "rfdetr"
     FASTERRCNN = "fasterrcnn"
+    ECDET = "ecdet"
     ARCH_CHOICES = [
         (RETINANET, "retinanet"),
         (YOLOX, "yolox"),
         (RTDETR, "rtdetr"),
         (RFDETR, "rfdetr"),
         (FASTERRCNN, "fasterrcnn"),
+        (ECDET, "ecdet"),
     ]
 
     experiment = models.ForeignKey(Experiment, on_delete=models.CASCADE, related_name="models")

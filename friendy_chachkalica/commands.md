@@ -17,6 +17,8 @@ pip install -r requirements-rtdetr.txt
 ```
 
 YOLOX model code is vendored in `vendor/yolox`, so no external YOLOX package is needed.
+ECDet likewise is vendored in `vendor/edgecrafter`; it needs only scipy, via
+`pip install -r requirements-ecdet.txt`.
 
 
 

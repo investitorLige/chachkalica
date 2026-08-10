@@ -4,7 +4,7 @@ Answers "what input size will this checkpoint export at" without doing an
 actual export — no model build, no forward pass, no file write, just the
 ``torch.load`` every exporter already does first (see ``ml/onnx_export/cli.py``
 / ``ml/trt_export/cli.py``) plus the same per-arch size math each exporter
-applies before tracing anything (``adapters/rtdetr.py``'s ``_ceil_to_multiple``,
+applies before tracing anything (``adapters/rtdetr.py``'s and ``adapters/ecdet.py``'s ``_ceil_to_multiple``,
 ``adapters/yolox.py``'s ``_make_divisible``, ``adapters/rfdetr.py``'s
 ``resolution`` field). Reusing those helpers keeps the size math defined once.
 
@@ -48,6 +48,20 @@ def resolve_trained_size(arch: str, params: dict) -> Optional[Tuple[int, int]]:
         multiple = _int_or_default(params.get("input_size_multiple"), _RTDETR_YOLOX_DEFAULT_MULTIPLE)
         if max_size <= 0:
             return None  # resizing disabled -- no fixed canvas (ONNX export itself refuses this)
+        side = _ceil_to_multiple(max_size, multiple)
+        return (side, side)
+
+    if arch == "ecdet":
+        from .adapters.ecdet import (
+            ECDET_NATIVE_SIZE,
+            ECDET_SIZE_MULTIPLE,
+            _ceil_to_multiple,
+        )
+
+        max_size = _int_or_default(params.get("input_max_size"), ECDET_NATIVE_SIZE)
+        multiple = _int_or_default(params.get("input_size_multiple"), ECDET_SIZE_MULTIPLE)
+        if max_size <= 0:
+            return None
         side = _ceil_to_multiple(max_size, multiple)
         return (side, side)
 

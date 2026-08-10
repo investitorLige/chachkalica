@@ -743,10 +743,11 @@ def export_trt_onnx(req: ExportTrtOnnxRequest):
     """Produce the TensorRT-ready ONNX for a checkpoint, without building anything.
 
     This exists for the remote build nodes (``buildnode/``). A node compiles
-    engines without torch, which works for rtdetr/rfdetr — they compile straight
-    from their standard ONNX — but not for yolox, retinanet or fasterrcnn, whose
-    graphs must first be re-exported as raw outputs plus an ``EfficientNMS_TRT``
-    node. That re-export runs off the torch model, so it has to happen here.
+    engines without torch, which works for rtdetr/rfdetr/ecdet — they compile
+    straight from their standard ONNX — but not for yolox, retinanet or
+    fasterrcnn, whose graphs must first be re-exported as raw outputs plus an
+    ``EfficientNMS_TRT`` node. That re-export runs off the torch model, so it has
+    to happen here.
 
     CPU-only and GPU-free, exactly like ``/export_onnx``: this is a torch ONNX
     export, not a compile. It takes ``_export_lock`` rather than

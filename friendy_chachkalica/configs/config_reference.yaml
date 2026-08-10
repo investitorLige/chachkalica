@@ -90,6 +90,22 @@ models:
     # resolution: 560       # optional; defaults to the variant's native resolution
     # params: {}
 
+  # ECDet (EdgeCrafter) via vendored vendor/edgecrafter code — Apache-2.0.
+  # NMS-free, and every variant trains at a square 640 (1280 also supported).
+  - name: ecdet
+    num_classes: auto
+    variant: ecdet-l       # ecdet-s | ecdet-m | ecdet-l | ecdet-x
+    # weights is four-state:
+    #   true       COCO-pretrained fine-tune (the variant's ecdet_<size>.pth)
+    #   backbone   the distilled ECViT backbone only, fresh detector heads
+    #   false/null from scratch
+    #   <str>      an explicit checkpoint URL or path
+    weights: true
+    score_threshold: 0.5
+    input_max_size: 640
+    input_size_multiple: 32
+    # params: {}
+
 # Optional. Training settings.
 training:
   epochs: 100
@@ -172,8 +188,21 @@ evaluation:
 # - variant: yolox-x
 # - act and other extra direct keys or params entries are passed to the vendored YOLOX builder.
 #
+# ECDet variants (all Apache-2.0, all native 640):
+# - variant: ecdet-s     51.7 COCO AP, 10M params
+# - variant: ecdet-m     54.3 COCO AP, 18M params
+# - variant: ecdet-l     57.0 COCO AP, 31M params
+# - variant: ecdet-x     57.9 COCO AP, 49M params
+# - input_max_size is the square canvas every image is stretched onto (aspect not
+#   preserved — upstream's own Resize). It is structural: the decoder builds its
+#   anchors from it, so a warm start must keep it unchanged.
+# - extra direct keys or params entries are merged into the vendored config before
+#   the model is created, so any ECDet config block can be overridden, e.g.
+#   params: {ECTransformer: {num_queries: 100}}.
+#
 # Models:
-# - name selects an adapter registered in registry.py. Currently: retinanet, yolox, rtdetr, rfdetr.
+# - name selects an adapter registered in registry.py.
+#   Currently: retinanet, fasterrcnn, yolox, rtdetr, rfdetr, ecdet.
 # - num_classes: auto uses the current train dataset class count for each run.
 # - num_classes can also be a positive integer when every train dataset uses the same class count.
 # - params can hold adapter-specific keyword arguments. Direct extra model keys are also accepted
@@ -184,7 +213,8 @@ evaluation:
 # - weights: false or null builds from config without pretrained weights.
 # - nms_threshold: IoU used by the trainer to NMS this model's predictions for the
 #   operating-point val/test metrics only (predict stays NMS-free, mAP unaffected).
-#   Overrides evaluation.operating_nms_threshold for this model. Same for rfdetr.
+#   Overrides evaluation.operating_nms_threshold for this model. Same for rfdetr
+#   and ecdet, which are also NMS-free.
 # - id2label and label2id are supported as mappings if you need custom class names.
 # - extra direct keys or params entries are passed to RTDetrConfig or from_pretrained.
 #

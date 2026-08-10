@@ -11,7 +11,8 @@ models can be trained and compared fairly from a single YAML experiment file.
   datasets and models; every model is trained once per train dataset (2 datasets ×
   3 models = 6 runs).
 - **Pluggable architectures via adapters** — each model lives in `ml/adapters/` and is
-  registered by name. Currently supported: `retinanet`, `rtdetr`, `rfdetr`, `yolox`.
+  registered by name. Currently supported: `retinanet`, `fasterrcnn`, `rtdetr`, `rfdetr`,
+  `yolox`, `ecdet`.
 - **Shared everything else** — YOLO dataset loading, box/NMS postprocessing,
   detection metrics (P/R, mAP50, mAP50-95, per-class AP), and a normalized output
   format are model-agnostic, so comparisons are apples-to-apples.
@@ -43,6 +44,7 @@ python -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt          # core (torch, torchvision, fastapi…)
 .venv/bin/python -m pip install -r requirements-rfdetr.txt   # RF-DETR extras
 .venv/bin/python -m pip install -r requirements-yolox.txt    # YOLOX extras
+.venv/bin/python -m pip install -r requirements-ecdet.txt    # ECDet extras
 ```
 
 > Note: install the plain `rfdetr` package (Apache-2.0). Do **not** install
@@ -155,6 +157,9 @@ models:
   - name: yolox
     num_classes: auto
     variant: yolox-s
+  - name: ecdet
+    num_classes: auto
+    variant: ecdet-l
 
 training:
   epochs: 100
@@ -180,7 +185,7 @@ evaluation:
 | `formats.py` | Shared label/prediction data structures + conversions |
 | `export.py` | Prediction export helpers |
 | `registry.py` | Maps model names to adapter builders |
-| `ml/adapters/` | Architecture-specific code (retinanet, rtdetr, rfdetr, yolox) |
+| `ml/adapters/` | Architecture-specific code (retinanet, fasterrcnn, rtdetr, rfdetr, yolox, ecdet) |
 | `ml/eval_checkpoint.py` | Standalone checkpoint evaluation |
 | `preprocess/` | Batch cropping/tiling + coordinate re-mapping for train-time transforms |
 | `service.py` | FastAPI service wrapping train/eval as background jobs |

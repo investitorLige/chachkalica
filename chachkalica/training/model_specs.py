@@ -213,6 +213,57 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
             "help": "Max final detections kept per image. Blank = torchvision default (100).",
         },
     ],
+    "ecdet": [
+        # ECDet's geometry is RT-DETR's exactly (stretch to a square canvas, no
+        # padding), so these mirror the rtdetr specs above — but its size IS a
+        # variant kwarg, unlike RT-DETR whose size is its checkpoint.
+        {
+            "key": "variant", "label": "Size / variant", "kind": "choice",
+            "choices": [
+                ("ecdet-s", "ecdet-s — 51.7 COCO AP, 10M params (fastest)"),
+                ("ecdet-m", "ecdet-m — 54.3 COCO AP, 18M params"),
+                ("ecdet-l", "ecdet-l — 57.0 COCO AP, 31M params"),
+                ("ecdet-x", "ecdet-x — 57.9 COCO AP, 49M params (most accurate)"),
+            ],
+            "default": "ecdet-l",
+            "help": "ECDet size (all Apache-2.0). The variant picks the distilled "
+                    "ECViT backbone plus the encoder/decoder widths. Every variant "
+                    "is trained at a square 640 — unlike RF-DETR there is no "
+                    "per-variant native resolution to match.",
+        },
+        {
+            "key": "score_threshold", "label": "Score threshold", "kind": "float",
+            "default": 0.5, "help": "Default confidence cutoff used at prediction time.",
+        },
+        {
+            "key": "nms_threshold", "label": "val_metrics_nms_iou_threshold", "kind": "float",
+            "help": "IoU for deduplicating this model's boxes in val/test "
+                    "precision/recall/F1 only — inference stays NMS-free and mAP is "
+                    "unaffected. Blank = the experiment's operating NMS threshold.",
+        },
+        {
+            "key": "input_max_size", "label": "Input max size", "kind": "int",
+            "default": 640, "help": "Working resolution: every input is resized "
+                    "(up OR down) to exactly this square, aspect ratio NOT "
+                    "preserved and no padding — that is upstream ECDet's own "
+                    "preprocessing. Keep it at the native 640 unless you have a "
+                    "reason; upstream also supports 1280 for high-resolution "
+                    "training. Changing it changes the model: the decoder builds "
+                    "its anchors from this size, so a warm start must keep it.",
+        },
+        {
+            "key": "input_size_multiple", "label": "Input size multiple", "kind": "int",
+            "default": 32, "help": "Round the canvas up to this multiple. The ECViT "
+                    "patch embed is stride-16 and the encoder consumes strides "
+                    "8/16/32, so 32 is the floor.",
+        },
+        {
+            "key": "trainable_backbone_layers", "label": "Trainable backbone layers",
+            "kind": "int",
+            "help": "How many of 5 backbone groups to fine-tune (0 freezes the whole "
+                    "ECViT, 5 leaves it fully trainable). Blank = fully trainable.",
+        },
+    ],
     "yolox": [
         {
             "key": "variant", "label": "Size / variant", "kind": "choice",
@@ -321,12 +372,17 @@ def friendy_checkpoint_from_value(value: str) -> str | None:
 
 # Archs whose published default is variant-resolved by the adapter when it gets
 # ``weights=True`` (torchvision COCO enum / YOLOX per-variant URL / RF-DETR
-# per-variant default). RT-DETR is excluded: its size *is* its checkpoint, so it
-# lists explicit repo ids instead of a single "default".
-WEIGHTS_DEFAULT_ARCHS = {"retinanet", "fasterrcnn", "yolox", "rfdetr"}
+# per-variant default / ECDet per-variant release asset). RT-DETR is excluded:
+# its size *is* its checkpoint, so it lists explicit repo ids instead of a single
+# "default".
+WEIGHTS_DEFAULT_ARCHS = {"retinanet", "fasterrcnn", "yolox", "rfdetr", "ecdet"}
 
 # torchvision accepts weight-enum names, not arbitrary checkpoint paths/URLs.
-# Its published defaults already have dedicated options.
+# Its published defaults already have dedicated options. ECDet is excluded by
+# choice, not by capability — ``build_ecdet`` does accept an arbitrary URL/path,
+# but the three curated tiers (COCO / distilled backbone / scratch) cover every
+# intended use and a free-text field here would mostly invite mismatched
+# checkpoints. Add "ecdet" here if that changes.
 WEIGHTS_CUSTOM_ARCHS = {"yolox", "rtdetr", "rfdetr"}
 
 # Published, appropriately-licensed checkpoints offered per arch *beyond* the
@@ -347,6 +403,18 @@ WEIGHTS_CATALOG: dict[str, list[dict]] = {
             "label": "Objects365 (base) — broader pretrain",
             "variant": "base",
             "train_res": "560",  # base's native square resolution
+        },
+    ],
+    "ecdet": [
+        {
+            # The middle tier, and upstream's own default recipe (`train.py` with
+            # no `-t`): load the per-variant distilled ECViT backbone and leave the
+            # encoder/decoder fresh. `build_ecdet` reads this sentinel and resolves
+            # which ecvit*.pth the selected variant needs, so it is not tagged to
+            # one variant. No `train_res` — a backbone carries no detection
+            # resolution to match.
+            "value": "backbone",
+            "label": "Distilled ECViT backbone only (no detector head)",
         },
     ],
     "rtdetr": [
@@ -383,6 +451,8 @@ WEIGHTS_DEFAULT_TRAIN_RES: dict[str, object] = {
     },
     # RF-DETR's default is each variant's native square resolution.
     "rfdetr": {variant: str(res) for variant, res in RFDETR_NATIVE_RESOLUTIONS.items()},
+    # Every ECDet variant's COCO checkpoint is trained at a square 640.
+    "ecdet": "640",
     # torchvision COCO recipes: 800 shorter-side multi-scale, except the dedicated
     # low-res mobilenet_v3_large_320 variant (320 shorter side, ≤640).
     "retinanet": _TORCHVISION_MULTISCALE,

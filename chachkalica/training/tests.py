@@ -491,10 +491,79 @@ class WeightsDropdownTests(TestCase):
         self.assertFalse(form.is_valid())
         self.assertIn("weights_custom", form.errors)
 
-    def test_torchvision_arches_do_not_offer_unsupported_custom_paths(self):
-        for arch in (ExperimentModel.RETINANET, ExperimentModel.FASTERRCNN):
+    def test_arches_without_a_custom_reference_do_not_offer_one(self):
+        # retinanet/fasterrcnn cannot take one (torchvision accepts weight-enum
+        # names only); ecdet is excluded by choice — its three curated tiers cover
+        # the intended uses. See model_specs.WEIGHTS_CUSTOM_ARCHS.
+        for arch in (
+            ExperimentModel.RETINANET,
+            ExperimentModel.FASTERRCNN,
+            ExperimentModel.ECDET,
+        ):
             choices = dict(model_specs.weights_base_choices(arch))
             self.assertNotIn(model_specs.WEIGHTS_CUSTOM, choices)
+
+    def test_ecdet_offers_exactly_scratch_coco_and_backbone(self):
+        choices = model_specs.weights_base_choices(ExperimentModel.ECDET)
+        self.assertEqual(
+            [value for value, _ in choices],
+            [model_specs.WEIGHTS_NONE, model_specs.WEIGHTS_DEFAULT, "backbone"],
+        )
+
+    def test_ecdet_backbone_option_passes_through_as_sentinel(self):
+        # build_ecdet reads "backbone" as "distilled ECViT backbone only", so it
+        # must reach params["weights"] verbatim and must not set `pretrained`
+        # (which config_gen would turn into weights=true, i.e. the COCO tier).
+        obj = self._save(ExperimentModel.ECDET, "backbone")
+        self.assertEqual(obj.params["weights"], "backbone")
+        self.assertFalse(obj.pretrained)
+
+    def test_ecdet_default_option_sets_weights_true(self):
+        obj = self._save(ExperimentModel.ECDET, model_specs.WEIGHTS_DEFAULT)
+        self.assertIs(obj.params["weights"], True)
+        self.assertTrue(obj.pretrained)
+
+    def test_ecdet_backbone_option_is_not_variant_tagged(self):
+        # One sentinel serves all four variants — build_ecdet resolves which
+        # ecvit*.pth the selected variant needs — so the JS must never hide it.
+        self.assertEqual(model_specs.weights_variant_map(ExperimentModel.ECDET), {})
+
+    def test_ecdet_spec_fields_round_trip_into_params(self):
+        obj = self._save(
+            ExperimentModel.ECDET,
+            model_specs.WEIGHTS_DEFAULT,
+            extra={
+                model_specs.field_name(ExperimentModel.ECDET, "variant"): "ecdet-s",
+                model_specs.field_name(ExperimentModel.ECDET, "input_max_size"): "640",
+            },
+        )
+        self.assertEqual(obj.params["variant"], "ecdet-s")
+        self.assertEqual(obj.params["input_max_size"], 640)
+
+    def test_switching_away_from_ecdet_strips_its_kwargs(self):
+        # ALL_SPEC_KEYS must cover ecdet's keys, or a row switched to another arch
+        # would keep input_max_size/variant and the new adapter would reject them.
+        instance = self._save(
+            ExperimentModel.ECDET,
+            model_specs.WEIGHTS_DEFAULT,
+            extra={
+                model_specs.field_name(ExperimentModel.ECDET, "variant"): "ecdet-x",
+            },
+        )
+        self.assertEqual(instance.params["variant"], "ecdet-x")
+        wfield = model_specs.weights_field_name(ExperimentModel.FASTERRCNN)
+        form = ExperimentModelForm(
+            data={
+                "arch": ExperimentModel.FASTERRCNN,
+                "params": "{}",
+                wfield: model_specs.WEIGHTS_NONE,
+            },
+            instance=instance,
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        switched = form.save(commit=False)
+        self.assertNotIn("input_max_size", switched.params)
+        self.assertNotEqual(switched.params.get("variant"), "ecdet-x")
 
     def test_rtdetr_has_no_default_option_but_lists_v1_and_v2(self):
         choices = dict(model_specs.weights_base_choices(ExperimentModel.RTDETR))

@@ -533,6 +533,11 @@ _WARM_START_STRUCTURAL_PARAMS = {
     "rfdetr": ("variant", "resolution"),
     # RT-DETR's repository id selects the model topology (r18/r50/v1/v2).
     "rtdetr": ("weights",),
+    # ECDet's variant picks the backbone/encoder/decoder widths, and
+    # input_max_size is structural too: ECTransformer pre-generates its anchors
+    # from eval_spatial_size at build time, so the same weights at a different
+    # canvas is a differently-shaped model, not a resize.
+    "ecdet": ("variant", "input_max_size"),
 }
 
 
