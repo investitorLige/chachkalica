@@ -1,10 +1,12 @@
 try:
+    from .ml.adapters.ecdet import build_ecdet
     from .ml.adapters.fasterrcnn import build_fasterrcnn
     from .ml.adapters.retinanet import build_retinanet
     from .ml.adapters.rfdetr import build_rfdetr
     from .ml.adapters.rtdetr import build_rtdetr
     from .ml.adapters.yolox import build_yolox
 except ImportError:
+    from ml.adapters.ecdet import build_ecdet
     from ml.adapters.fasterrcnn import build_fasterrcnn
     from ml.adapters.retinanet import build_retinanet
     from ml.adapters.rfdetr import build_rfdetr
@@ -13,6 +15,7 @@ except ImportError:
 
 
 MODEL_REGISTRY = {
+    "ecdet": build_ecdet,
     "fasterrcnn": build_fasterrcnn,
     "retinanet": build_retinanet,
     "rfdetr": build_rfdetr,
@@ -43,6 +46,9 @@ def build_model(name, **kwargs):
         build_model("rfdetr", num_classes=3, variant="base")
         build_model("yolox", num_classes=3)
         build_model("yolox", num_classes=3, variant="yolox-s")
+        build_model("ecdet", num_classes=3)
+        build_model("ecdet", num_classes=3, variant="ecdet-s")
+        build_model("ecdet", num_classes=3, weights="backbone")
     """
     try:
         builder = MODEL_REGISTRY[name]

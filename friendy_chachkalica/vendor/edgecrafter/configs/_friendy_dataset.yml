@@ -1,0 +1,17 @@
+# Stand-in for upstream configs/dataset/coco.yml.
+#
+# The variant configs __include__ a dataset config for exactly three values that
+# reach the model: `task`, `num_classes` and `remap_mscoco_category`. Upstream's
+# coco.yml also declares `evaluator` and a full train/val DataLoader pair with
+# hard-coded /path/to/COCO2017 paths — we never build those (the adapter only
+# touches the model, criterion and postprocessor), but leaving them in the merged
+# config is a trap waiting for someone to call cfg['train_dataloader'].
+#
+# num_classes is a `__share__` value: `create` fans it out to ECTransformer's
+# score heads and denoising embedding, to ECCriterion, and to PostProcessor. The
+# 80 here is only a placeholder — build_ecdet always overrides it with the
+# experiment's real class count.
+task: detection
+
+num_classes: 80
+remap_mscoco_category: False

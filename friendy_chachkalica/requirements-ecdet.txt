@@ -1,0 +1,11 @@
+-r requirements.txt
+# ECDet (EdgeCrafter, Apache-2.0) model code is vendored under
+# vendor/edgecrafter — upstream ships no installable package, so there is
+# nothing to pip install for the model itself.
+#
+# scipy is the only extra dependency the vendored subtree adds:
+# edgecrafter/matcher.py uses scipy.optimize.linear_sum_assignment for the
+# Hungarian matcher. Everything else it imports (torch, torchvision, numpy,
+# pyyaml) is already in requirements.txt. Note requirements-rtdetr.txt also
+# installs scipy, so a combined image gets it either way.
+scipy
