@@ -6,8 +6,8 @@ exporters), compiles it to a TensorRT engine (``trt_export``), then asserts the
 
 All registered archs build and run:
 
-* **rtdetr, rfdetr** — compile straight from the standard ONNX (fixed-size DETR
-  top-k).
+* **rtdetr, rfdetr, ecdet** — compile straight from the standard ONNX (fixed-size
+  DETR top-k, no NMS node to replace).
 * **retinanet, yolox** — their standard ONNX bakes data-dependent NMS that TRT
   can't compile, so ``trt_export`` re-exports a raw-output graph and appends the
   ``EfficientNMS_TRT`` plugin; the runtime auto-detects the plugin outputs.
@@ -52,6 +52,7 @@ from friendy_chachkalica.ml.onnx_export.arch.retinanet import export_retinanet  
 from friendy_chachkalica.ml.onnx_export.arch.yolox import export_yolox  # noqa: E402
 from friendy_chachkalica.ml.onnx_export.arch.rtdetr import export_rtdetr  # noqa: E402
 from friendy_chachkalica.ml.onnx_export.arch.rfdetr import export_rfdetr  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.ecdet import export_ecdet  # noqa: E402
 from friendy_chachkalica.ml.trt_export.cli import build_engine  # noqa: E402
 from trt_infer import load_trt_adapter  # noqa: E402
 
@@ -214,6 +215,59 @@ def test_rfdetr_parity(rfdetr_engine):
     torch_pred = adapter.predict([image], score_threshold=0.0)[0].detach().cpu().numpy()
     trt_pred = trt_adapter.predict([image], score_threshold=0.0)[0].detach().cpu().numpy()
     _assert_topk_parity(torch_pred, trt_pred, k=10, atol=5e-3)
+
+
+# --------------------------------------------------------------------------- ECDet
+
+
+@pytest.fixture(scope="module")
+def ecdet_engine(tmp_path_factory):
+    torch.manual_seed(0)
+    # Like rtdetr, the adapter stretches onto a square input_max_size canvas, so
+    # the engine's static profile is that canvas — 320 keeps the build small while
+    # staying a multiple of the encoder's stride 32.
+    adapter = build_model(
+        "ecdet", num_classes=3, variant="ecdet-s", weights=False, input_max_size=320
+    )
+    # De-tie the score heads so the flattened top-k is backend-stable; see the
+    # matching comment in onnx_infer/tests/test_onnx_parity.py::ecdet_export.
+    with torch.no_grad():
+        for head in adapter.model.decoder.dec_score_head:
+            if hasattr(head, "weight"):
+                torch.nn.init.normal_(head.weight, mean=0.0, std=0.2)
+                torch.nn.init.normal_(head.bias, mean=0.0, std=0.5)
+    adapter.eval()
+    out_dir = tmp_path_factory.mktemp("ecdet")
+    onnx_path = _export(adapter, export_ecdet, out_dir)
+    # adapter=None: ECDet is NMS-free, so it is a passthrough arch — no
+    # EfficientNMS prep, the standard ONNX compiles directly.
+    return adapter, _build(onnx_path, out_dir, adapter=None, static_hw=(320, 320))
+
+
+def test_ecdet_parity(ecdet_engine):
+    adapter, engine = ecdet_engine
+    trt_adapter, info = load_trt_adapter(engine, "cuda")
+    assert info["num_classes"] == 3
+    torch.manual_seed(1)
+    image = torch.rand(3, 320, 320)
+    torch_pred = adapter.predict([image], score_threshold=0.0)[0].detach().cpu().numpy()
+    trt_pred = trt_adapter.predict([image], score_threshold=0.0)[0].detach().cpu().numpy()
+    _assert_topk_parity(torch_pred, trt_pred, k=10, atol=5e-3)
+
+
+def test_ecdet_engine_is_passthrough_batch1(ecdet_engine):
+    """The provenance records ecdet on the passthrough side of the TRT split.
+
+    ``efficientnms: false`` and a batch-1 profile are two halves of the same fact:
+    the export wrapper indexes the batch axis away, so there is no prep to run and
+    nothing wider than batch 1 to build. gpu_infer/loader.py reads batchability off
+    the engine's own profile rather than the arch name, so this is what makes crop
+    batching fall back to one-at-a-time for ecdet.
+    """
+    _, engine = ecdet_engine
+    provenance = json.loads(Path(str(engine) + ".json").read_text())
+    assert provenance["arch"] == "ecdet"
+    assert provenance["efficientnms"] is False
 
 
 # --------------------------------------------------------------------------- Faster R-CNN

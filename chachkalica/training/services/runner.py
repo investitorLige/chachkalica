@@ -221,8 +221,8 @@ def export_trt_onnx(checkpoint_path, onnx_path, ts: TrainingSettings | None = No
     Returns ``{"onnx_path", "meta_path", "arch", "prepared"}``. ``prepared`` is
     True when the arch needed its baked NMS replaced with an ``EfficientNMS_TRT``
     node (yolox, retinanet, fasterrcnn) and False when its standard export already
-    compiles (rtdetr, rfdetr) — the remote build passes that flag through so the
-    node knows which kind of graph it received.
+    compiles (rtdetr, rfdetr, ecdet) — the remote build passes that flag through so
+    the node knows which kind of graph it received.
 
     This is what makes an EfficientNMS arch buildable on a remote node at all: the
     re-export runs off the torch model, so it can only happen here. CPU-only, like

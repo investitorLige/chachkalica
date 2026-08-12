@@ -9,6 +9,7 @@ from friendy_chachkalica.ml.adapters.retinanet import (
     RetinaNetAdapter,
     _build_retinanet_model,
 )
+from friendy_chachkalica.ml.adapters.ecdet import ECDetAdapter
 from friendy_chachkalica.ml.adapters.rfdetr import RFDETRAdapter
 from friendy_chachkalica.ml.adapters.rtdetr import RTDETRAdapter
 from friendy_chachkalica.ml.adapters.yolox import YOLOXAdapter, yolox_detection_to_friendy
@@ -229,6 +230,26 @@ class _FixedRTPostprocess:
         }]
 
 
+class _FixedECDetHead(_DummyDetector):
+    """Stands in for the ECDet decoder: fixed ``pred_logits``/``pred_boxes``.
+
+    ``pred_boxes`` is normalized ``cxcywh`` over the model input, exactly what
+    ``ECTransformer`` emits, so ``predict``'s sigmoid + top-k + clip is exercised
+    against known values.
+    """
+
+    def __init__(self, logits, boxes):
+        super().__init__()
+        self.logits = logits
+        self.boxes = boxes
+
+    def forward(self, batch, targets=None):
+        return {
+            "pred_logits": self.logits.to(batch.device),
+            "pred_boxes": self.boxes.to(batch.device),
+        }
+
+
 class AdapterResizeRoundTripTests(unittest.TestCase):
     IMAGE_H = 333
     IMAGE_W = 1000
@@ -321,6 +342,58 @@ class AdapterResizeRoundTripTests(unittest.TestCase):
         self.assertTrue(all(0.0 <= v <= 1.0 for v in (cx, cy, w, h)), pred[0, :4])
         # Clipped to [90, 90, 100, 100] of a 100x100 image.
         self.assertTrue(torch.allclose(pred[0, :4], torch.tensor([0.95, 0.95, 0.1, 0.1])))
+
+    def test_ecdet_stretches_to_a_square_canvas_with_no_padding(self):
+        adapter = ECDetAdapter(
+            model=_DummyDetector(), criterion=None, num_classes=1, input_max_size=640
+        )
+        image = torch.zeros(3, self.IMAGE_H, self.IMAGE_W)
+        resized, _targets = adapter._resize_training_inputs([image], [self._target()])
+        self.assertEqual(tuple(resized[0].shape[-2:]), (640, 640))
+
+    def test_ecdet_labels_normalize_over_the_model_input(self):
+        adapter = ECDetAdapter(
+            model=_DummyDetector(), criterion=None, num_classes=1, input_max_size=640
+        )
+        image = torch.zeros(3, self.IMAGE_H, self.IMAGE_W)
+        resized, targets = adapter._resize_training_inputs([image], [self._target()])
+        labels = adapter._prepare_labels(targets, resized[0].shape[-2:])
+        # Same identity RT-DETR relies on: stretching to the square canvas leaves
+        # normalized coordinates equal to the original image's own fractions, which
+        # is what makes the exported graph's `box_coords: "input_normalized"` hold.
+        self.assertTrue(torch.allclose(
+            labels[0]["boxes"],
+            torch.tensor([[0.3, 175.0 / 333.0, 0.4, 250.0 / 333.0]]),
+        ))
+
+    def test_ecdet_predict_round_trips_normalized_boxes_and_clips_the_overflow(self):
+        # Two queries: one comfortably inside the frame, one whose sigmoid-decoded
+        # centre puts its right/bottom edge past the canvas (cx + w/2 = 1.05). The
+        # first must round-trip exactly; the second must come back clipped, matching
+        # the exported graph's clip_boxes=True.
+        boxes = torch.tensor([[[0.3, 0.5, 0.4, 0.2], [0.95, 0.95, 0.2, 0.2]]])
+        logits = torch.tensor([[[4.0], [3.0]]])
+        adapter = ECDetAdapter(
+            model=_FixedECDetHead(logits, boxes),
+            criterion=None,
+            num_classes=1,
+            input_max_size=640,
+            num_top_queries=2,
+        )
+        pred = adapter.predict([torch.zeros(3, self.IMAGE_H, self.IMAGE_W)], score_threshold=0.0)
+
+        rows = pred[0]
+        self.assertEqual(rows.shape, (2, 6))
+        by_score = rows[rows[:, 4].argsort(descending=True)]
+        self.assertTrue(torch.allclose(
+            by_score[0, :4], torch.tensor([0.3, 0.5, 0.4, 0.2]), atol=1e-6
+        ))
+        # x2/y2 clipped from 1.05 to 1.0, so the box becomes 0.15 wide/high and its
+        # centre shifts to 0.925 — never normalizing past 1.0 against the image.
+        self.assertTrue(torch.allclose(
+            by_score[1, :4], torch.tensor([0.925, 0.925, 0.15, 0.15]), atol=1e-6
+        ))
+        self.assertTrue((rows[:, :4] <= 1.0 + 1e-6).all())
 
 
 if __name__ == "__main__":

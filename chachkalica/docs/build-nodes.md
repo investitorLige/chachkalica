@@ -214,7 +214,7 @@ likely to be looking.
 
 | Arch | From | Why |
 | --- | --- | --- |
-| rtdetr, rfdetr | the standard ONNX | Fixed-size top-k; TensorRT compiles it directly |
+| rtdetr, rfdetr, ecdet | the standard ONNX | Fixed-size top-k, NMS-free; TensorRT compiles it directly |
 | yolox, retinanet, fasterrcnn | a **prepared** graph | Their standard ONNX bakes a data-dependent NMS TensorRT rejects; it must be re-exported as raw outputs + `EfficientNMS_TRT`, which needs the `.pt` and torch |
 
 You do not have to think about this. `jobs.run_export_remote` calls the trainer's

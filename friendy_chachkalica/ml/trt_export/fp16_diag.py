@@ -45,6 +45,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import torch  # noqa: E402
 
+from friendy_chachkalica.ml.onnx_export.arch.ecdet import export_ecdet  # noqa: E402
 from friendy_chachkalica.ml.onnx_export.arch.fasterrcnn import export_fasterrcnn  # noqa: E402
 from friendy_chachkalica.ml.onnx_export.arch.retinanet import export_retinanet  # noqa: E402
 from friendy_chachkalica.ml.onnx_export.arch.rfdetr import export_rfdetr  # noqa: E402
@@ -135,8 +136,25 @@ def _setup_fasterrcnn():
     return a, export_fasterrcnn, (320, 320), True, 0.05
 
 
+def _setup_ecdet():
+    torch.manual_seed(0)
+    a = build_model("ecdet", num_classes=3, variant="ecdet-s", weights=False, input_max_size=320)
+    # De-tie the per-layer score heads so the flattened top-k is backend-stable;
+    # otherwise this random-init fixture measures selection ties, not fp16 error
+    # (the same trap documented at the top of trained_fp16_gate.py).
+    with torch.no_grad():
+        for head in a.model.decoder.dec_score_head:
+            if hasattr(head, "weight"):
+                torch.nn.init.normal_(head.weight, mean=0.0, std=0.2)
+                torch.nn.init.normal_(head.bias, mean=0.0, std=0.5)
+    a.eval()
+    # Passthrough arch (NMS-free): build_engine needs no adapter.
+    return a, export_ecdet, (320, 320), False, 0.0
+
+
 SETUPS = {
     "yolox": _setup_yolox,
+    "ecdet": _setup_ecdet,
     "rfdetr": _setup_rfdetr,
     "rtdetr": _setup_rtdetr,
     "retinanet": _setup_retinanet,

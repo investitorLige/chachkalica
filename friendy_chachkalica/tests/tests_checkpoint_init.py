@@ -211,6 +211,91 @@ class NativePretrainedFailureTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "refusing to silently train"):
                 build_rfdetr(num_classes=2, variant="base", weights=True)
 
+    def test_ecdet_requested_weights_fail_instead_of_falling_back(self):
+        from friendy_chachkalica.ml.adapters.ecdet import build_ecdet
+
+        with self.assertRaisesRegex(RuntimeError, "refusing to silently train"):
+            build_ecdet(
+                num_classes=2, variant="ecdet-s", weights="/nonexistent/ecdet.pth",
+                input_max_size=320,
+            )
+
+    def test_ecdet_rejects_a_friendy_checkpoint_as_native_weights(self):
+        """A promoted Friendy checkpoint must be selected as 'Your model' so the
+        checked warm-start loader runs, not fed to the native loader."""
+        from friendy_chachkalica.ml.adapters.ecdet import build_ecdet
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "best.pt"
+            torch.save({"model_name": "ecdet", "model_state_dict": {}}, path)
+            with self.assertRaises(RuntimeError) as ctx:
+                build_ecdet(
+                    num_classes=2, variant="ecdet-s", weights=str(path), input_max_size=320,
+                )
+            self.assertIn("Friendy training checkpoint", str(ctx.exception.__cause__))
+
+    def test_ecdet_unknown_variant_is_rejected(self):
+        from friendy_chachkalica.ml.adapters.ecdet import build_ecdet
+
+        with self.assertRaisesRegex(ValueError, "Unknown ECDet variant"):
+            build_ecdet(num_classes=2, variant="ecdet-xl")
+
+
+class ECDetWarmStartStructuralParamsTests(unittest.TestCase):
+    """ECDet's structural params must include input_max_size, not just variant.
+
+    ECTransformer bakes its anchors from ``eval_spatial_size`` at build time, so
+    warm-starting the same weights onto a different canvas is a shape mismatch, not
+    a resize — and a missing entry in the table silently disables the check
+    (``.get(name, ())``).
+    """
+
+    def test_variant_and_input_max_size_are_both_structural(self):
+        from friendy_chachkalica.ml.train import _WARM_START_STRUCTURAL_PARAMS
+
+        self.assertEqual(
+            set(_WARM_START_STRUCTURAL_PARAMS["ecdet"]), {"variant", "input_max_size"}
+        )
+
+    def test_mismatched_canvas_is_refused(self):
+        from friendy_chachkalica.config import ModelConfig
+        from friendy_chachkalica.ml.train import _warm_start_build_params
+
+        checkpoint = {
+            "model_config": {
+                "name": "ecdet",
+                "num_classes": 3,
+                "params": {"variant": "ecdet-s", "input_max_size": 640},
+            }
+        }
+        config = ModelConfig(
+            name="ecdet", num_classes=3,
+            params={"variant": "ecdet-s", "input_max_size": 1280},
+        )
+        with self.assertRaisesRegex(ValueError, "input_max_size"):
+            _warm_start_build_params(config, checkpoint)
+
+    def test_matching_topology_is_reused_without_redownloading(self):
+        from friendy_chachkalica.config import ModelConfig
+        from friendy_chachkalica.ml.train import _warm_start_build_params
+
+        checkpoint = {
+            "model_config": {
+                "name": "ecdet",
+                "num_classes": 3,
+                "params": {"variant": "ecdet-s", "input_max_size": 640, "weights": True},
+            }
+        }
+        config = ModelConfig(
+            name="ecdet", num_classes=3, params={"variant": "ecdet-s"},
+        )
+        build_params = _warm_start_build_params(config, checkpoint)
+        self.assertEqual(build_params["variant"], "ecdet-s")
+        self.assertEqual(build_params["input_max_size"], 640)
+        # ecdet's topology comes from the variant, so the pretrained download is
+        # skipped and the Friendy state is restored on top instead.
+        self.assertIs(build_params["weights"], False)
+
 
 if __name__ == "__main__":
     unittest.main()

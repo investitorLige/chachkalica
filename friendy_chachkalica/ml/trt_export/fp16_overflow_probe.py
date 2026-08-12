@@ -52,6 +52,21 @@ def _setup(arch):
         a = build_model("rfdetr", num_classes=3, variant="nano", weights=False, resolution=224)
         a.eval()
         return a, export_rfdetr, (224, 224)
+    if arch == "ecdet":
+        # ecdet is the one arch currently in UNTRUSTED_FP16 (its trained-checkpoint
+        # fp16 parity fails the gate, and fp16_cast reports one out-of-fp16-range
+        # constant in this graph), so this is the branch to reach for. Mirrors
+        # fp16_diag._setup_ecdet, including the score-head de-tying.
+        from friendy_chachkalica.ml.onnx_export.arch.ecdet import export_ecdet
+        a = build_model("ecdet", num_classes=3, variant="ecdet-s", weights=False,
+                        input_max_size=320)
+        with torch.no_grad():
+            for head in a.model.decoder.dec_score_head:
+                if hasattr(head, "weight"):
+                    torch.nn.init.normal_(head.weight, mean=0.0, std=0.2)
+                    torch.nn.init.normal_(head.bias, mean=0.0, std=0.5)
+        a.eval()
+        return a, export_ecdet, (320, 320)
     if arch == "fasterrcnn":
         # NOTE: probes the STANDARD onnx (pre-EfficientNMS-surgery). The prep'd
         # trt.onnx has a TRT plugin node ORT can't run, but the box-delta decode /

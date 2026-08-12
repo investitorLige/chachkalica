@@ -32,6 +32,22 @@ class ResolveTrainedSizeTests(unittest.TestCase):
     def test_rfdetr_falls_back_to_the_adapter_default(self):
         self.assertEqual(resolve_trained_size("rfdetr", {}), (560, 560))
 
+    def test_ecdet_uses_input_max_size_rounded_up_to_the_multiple(self):
+        self.assertEqual(
+            resolve_trained_size("ecdet", {"input_max_size": 700, "input_size_multiple": 32}),
+            (704, 704),
+        )
+
+    def test_ecdet_falls_back_to_the_native_640(self):
+        self.assertEqual(resolve_trained_size("ecdet", {}), (640, 640))
+
+    def test_ecdet_supports_the_high_resolution_variant(self):
+        # Upstream documents 1280 as the high-res alternative to the native 640.
+        self.assertEqual(resolve_trained_size("ecdet", {"input_max_size": 1280}), (1280, 1280))
+
+    def test_ecdet_resize_disabled_has_no_fixed_size(self):
+        self.assertIsNone(resolve_trained_size("ecdet", {"input_max_size": 0}))
+
     def test_fasterrcnn_has_no_single_trained_size(self):
         self.assertIsNone(resolve_trained_size("fasterrcnn", {"min_size": 800, "max_size": 1333}))
 

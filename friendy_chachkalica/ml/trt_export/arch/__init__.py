@@ -125,7 +125,27 @@ ARCH_FP16_NODE_BLOCK = {
 # rtdetr is unaffected: it exports ``resize_mode: square``, which profile.py already
 # turns into a fully-static min==opt==max profile. TODO: consider a
 # static/narrow fasterrcnn default in profile.py so auto-fp16 materializes unpinned.
-UNTRUSTED_FP16: set[str] = set()
+#
+# ecdet IS genuinely fp16-fragile on trained weights — measured the way this comment
+# demands, with ``trained_fp16_gate.py`` on the upstream COCO ECDet-S checkpoint over 8
+# real images at a static 640² profile (so the fasterrcnn shape-op caveat above does not
+# apply; ecdet exports ``resize_mode: square``, already static):
+#
+#     worst confident L1(fp16 vs fp32) = inf   (gate 0.05)  -> FAIL
+#
+# ``inf`` means a confident fp32 detection had no same-label twin in the fp16 engine's
+# output, on 5 of 8 images; the 3 images that did match scored 0.052/0.077/0.088, all
+# past the gate. Detection counts diverge too (fp32=3 vs fp16=5 on one image). This is
+# not the random-init selection-tie artifact that misled us on rtdetr/fasterrcnn — the
+# checkpoint is trained and its scores are well separated. ``fp16_cast`` also reports
+# "clamped 1 out-of-fp16-range constant(s) to ±65504" for this graph, so there is a
+# concrete overflow to chase: ``_setup_ecdet`` is wired into ``fp16_diag.py`` and
+# ``fp16_overflow_probe.py`` for whoever picks it up. Until then auto floors to fp32.
+#
+# NOTE this floor only binds ``precision="auto"``. The admin's TensorRT export form
+# passes fp16/fp32 explicitly, so an operator who picks FP16 there still gets an fp16
+# ecdet engine — and a degraded one.
+UNTRUSTED_FP16: set[str] = {"ecdet"}
 
 
 def get_fp16_op_block(arch: str):
