@@ -237,8 +237,16 @@ def main() -> None:
                 raise SystemExit(
                     f"[gen] refusing to merge into {out_path}: it was generated on "
                     f"{previous_device!r} but this run is on {device_label!r}. Latency and memory "
-                    f"are not comparable across devices — re-sweep every arch, or pass "
-                    f"--force-merge if you accept a mixed table."
+                    f"are not comparable across devices.\n"
+                    f"  Two ways this bites, and they need different fixes:\n"
+                    f"  - Genuinely different GPU: re-sweep every arch on one machine.\n"
+                    f"  - Same GPU name plus an extra annotation (the published envelopes carry a\n"
+                    f"    hand-added '(idle)' that _device_label never emits): the label is telling\n"
+                    f"    you those numbers were taken on a quiet GPU. Free the GPU and re-run so\n"
+                    f"    the new rows are comparable, then set the label to match — do NOT just\n"
+                    f"    force it through while other containers are holding VRAM.\n"
+                    f"  --force-merge overrides, and rewrites the label to this run's device, which\n"
+                    f"  will then no longer describe the rows carried over."
                 )
             merged = dict(existing)
             merged["data"] = {**existing.get("data", {}), **data}
