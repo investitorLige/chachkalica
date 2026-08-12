@@ -194,6 +194,12 @@
         badge):</b> fasterrcnn/retinanet/yolox ONNX (the shared fp16-cast graph is accepted by TensorRT but rejected
         by onnxruntime's session loader &rarr; fp32-on-GPU), and rtdetr PT (its adapter sets
         <code>supports_amp=False</code> for a documented decoder/GIoU fp16 overflow).</li>
+      <li><b>ecdet's fp16 numbers are speed-only, not shippable.</b> Its fp16 engine builds and runs fine &mdash;
+        which is what this page times &mdash; but it fails the trained-checkpoint parity gate
+        (<code>trained_fp16_gate.py</code> on the upstream COCO ECDet-S: confident detections drop or shift past the
+        0.05 L1 gate, and <code>fp16_cast</code> reports an out-of-fp16-range constant in the graph). ecdet is
+        therefore in <code>UNTRUSTED_FP16</code>, so an auto-precision export ships <em>fp32</em>. Read ecdet's fp16
+        row as "what fp16 would cost/save if the overflow gets fixed", not as a deployable configuration.</li>
       <li><b>ONNX &Delta;mem is arena reservation, not working set</b> &mdash; onnxruntime grabs a pool on first Run()
         and reuses it, so ONNX reads high and flat (~526&nbsp;MB floor at &le;640, up to 2&ndash;4&nbsp;GB for the
         DETRs at 960 as feature maps grow). Compare ONNX-to-ONNX only.</li>
@@ -267,6 +273,7 @@ const ARCH_META = {
   rfdetr: { title: 'RF-DETR', tag: 'DETR · nms-free', note: 'fp16 clean on all three formats. Its exported (ONNX/ENGINE) throughput falls off a cliff above ~640 while PT stays flat — resolution-driven, see limitations. ENGINE memory reads a flat ~90 MB where variants share the ViT-S encoder.' },
   rtdetr: { title: 'RT-DETR', tag: 'DETR · nms-free', note: 'ENGINE: static profile takes all four variants from fp32 to fp16, memory scales cleanly with backbone (r18vd → r101vd). ONNX: fp16 clean too. PT stays fp32 on purpose — its adapter documents a decoder/GIoU overflow under fp16 autocast.' },
   yolox: { title: 'YOLOX', tag: 'single-stage', note: 'ENGINE: fp16 clean, memory scales monotonically with variant size (nano → x). PT: fp16 via autocast. ONNX: same fp16-cast-won’t-load issue as fasterrcnn/retinanet.' },
+  ecdet: { title: 'ECDet', tag: 'DETR · nms-free', note: 'Distilled compact-ViT backbone + RT-DETR-style encoder and D-FINE-style decoder; the highest COCO AP per parameter here (51.7/54.3/57.0/57.9 for s/m/l/x at 10–49M). ENGINE compiles straight from the standard ONNX like the other DETRs, batch-1. <strong>fp16 timings are speed-only</strong>: ecdet is in UNTRUSTED_FP16 because its fp16 engine fails the trained-checkpoint parity gate, so an auto-precision build ships fp32 — see limitations.' },
 };
 
 function renderArch(archKey) {
@@ -322,7 +329,7 @@ function renderArch(archKey) {
 }
 
 const container = document.getElementById('tables');
-['fasterrcnn', 'retinanet', 'rfdetr', 'rtdetr', 'yolox'].forEach(a => {
+['fasterrcnn', 'retinanet', 'rfdetr', 'rtdetr', 'yolox', 'ecdet'].forEach(a => {
   const el = renderArch(a);
   if (el) container.appendChild(el);
 });

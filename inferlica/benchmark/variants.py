@@ -43,6 +43,7 @@ NMS_STATUS: Dict[str, str] = {
     "yolox": "baked-in (vendored YOLOX postprocess() / EfficientNMS_TRT plugin for .engine)",
     "rtdetr": "nms-free (DETR set-prediction)",
     "rfdetr": "nms-free (DETR set-prediction)",
+    "ecdet": "nms-free (DETR set-prediction)",
 }
 
 # Backbone block size (patch_size * num_windows) that each rfdetr variant's
@@ -91,6 +92,26 @@ def yolox_variant_specs(image_size: int) -> List["VariantSpec"]:
     """
     specs = []
     for spec in ARCH_VARIANTS["yolox"]:
+        kwargs = dict(spec.build_kwargs)
+        kwargs["input_max_size"] = image_size
+        specs.append(VariantSpec(spec.name, kwargs))
+    return specs
+
+
+def ecdet_variant_specs(image_size: int) -> List["VariantSpec"]:
+    """ecdet VariantSpecs with the export canvas set to ``image_size``.
+
+    Like yolox (and unlike rfdetr, whose resolution is constrained per variant),
+    ecdet's canvas is a single ``input_max_size`` that every variant shares — all
+    four are published at a square 640, and upstream documents 1280 as the
+    high-resolution alternative. It is architectural rather than a runtime input
+    size: ``ECTransformer`` generates its anchors from ``eval_spatial_size`` at
+    build time and the ONNX export is static in H/W, so benchmarking ecdet at
+    320/960 means *building* at that size, not feeding a different input.
+    ``image_size`` must be a multiple of 32 (the encoder's stride).
+    """
+    specs = []
+    for spec in ARCH_VARIANTS["ecdet"]:
         kwargs = dict(spec.build_kwargs)
         kwargs["input_max_size"] = image_size
         specs.append(VariantSpec(spec.name, kwargs))
@@ -170,5 +191,16 @@ ARCH_VARIANTS: Dict[str, List[VariantSpec]] = {
         VariantSpec("yolox-m", {"variant": "yolox-m", "weights": False}),
         VariantSpec("yolox-l", {"variant": "yolox-l", "weights": False}),
         VariantSpec("yolox-x", {"variant": "yolox-x", "weights": False}),
+    ],
+    "ecdet": [
+        # weights=False keeps the sweep offline: the distilled ECViT backbone and
+        # the COCO detector checkpoints are both downloads, and neither changes
+        # shape or speed. Every variant is published at a square 640, which is the
+        # adapter default, so no explicit input_max_size here — ecdet_variant_specs
+        # overrides it when the sweep follows --image-size.
+        VariantSpec("ecdet-s", {"variant": "ecdet-s", "weights": False}),
+        VariantSpec("ecdet-m", {"variant": "ecdet-m", "weights": False}),
+        VariantSpec("ecdet-l", {"variant": "ecdet-l", "weights": False}),
+        VariantSpec("ecdet-x", {"variant": "ecdet-x", "weights": False}),
     ],
 }

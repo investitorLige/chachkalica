@@ -87,11 +87,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--follow-image-size", action="store_true",
-        help="Make rfdetr AND yolox follow --image-size too. Both have an architectural input size "
-        "(rfdetr's per-variant resolution, yolox's fixed canvas) that otherwise ignores --image-size; "
-        "with this flag rfdetr is rebuilt at the nearest valid resolution (multiples of 32, or 56 for "
-        "base) and yolox at the size directly (multiple of 32). fasterrcnn/rtdetr/retinanet follow via "
-        "their static engine profile regardless. Leave off to keep native sizes.",
+        help="Make rfdetr, yolox AND ecdet follow --image-size too. All three have an architectural "
+        "input size (rfdetr's per-variant resolution, yolox's and ecdet's fixed canvas) that otherwise "
+        "ignores --image-size; with this flag rfdetr is rebuilt at the nearest valid resolution "
+        "(multiples of 32, or 56 for base) and yolox/ecdet at the size directly (multiple of 32). "
+        "fasterrcnn/rtdetr/retinanet follow via their static engine profile regardless. Leave off to "
+        "keep native sizes.",
     )
     args = parser.parse_args()
 

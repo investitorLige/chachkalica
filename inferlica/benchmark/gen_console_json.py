@@ -9,6 +9,15 @@ and the console's size switcher picks them up with no code change.
     python inferlica/benchmark/gen_console_json.py OUTPUT_DIR
     python inferlica/benchmark/gen_console_json.py chachkalica/data/benchmarks --sizes 320 640 960
 
+To add or refresh ONE arch without re-timing the rest (the other archs' published
+numbers then stay byte-identical rather than drifting with driver/thermal state):
+
+    python inferlica/benchmark/gen_console_json.py chachkalica/data/benchmarks \
+        --archs ecdet --merge --sizes 320 640 960
+
+``--merge`` refuses a device mismatch, because latency and memory are not
+comparable across GPUs.
+
 rfdetr handling: its resolution is architectural, not a runtime input size. At
 the reference size (640 by default) it runs at each variant's NATIVE resolution
 (base 672, large 704); at every other size it follows the image size via the
@@ -156,6 +165,22 @@ def main() -> None:
         help="Rebuild cached .onnx/.engine artifacts (per-size scratch dir) even if present",
     )
     parser.add_argument(
+        "--archs", nargs="+", default=None, choices=ALL_ARCHS,
+        help="Limit the sweep to these archs (default: all). Pair with --merge to add or refresh "
+        "one arch without re-timing — and so without churning — the others.",
+    )
+    parser.add_argument(
+        "--merge", action="store_true",
+        help="Update only the swept archs inside an existing <size>.json instead of replacing the "
+        "whole envelope. Refuses if the existing file was generated on a different device, since "
+        "mixing numbers across GPUs would make the table lie (override with --force-merge).",
+    )
+    parser.add_argument(
+        "--force-merge", action="store_true",
+        help="Allow --merge across a device mismatch. The envelope's device label is then rewritten "
+        "to the current device, which no longer describes the rows carried over.",
+    )
+    parser.add_argument(
         "--csv-dir", type=Path, default=None,
         help="Where the per-size .onnx/.engine/.csv artifacts are cached (default: OUTPUT_DIR/_artifacts/<size>). "
         "Reused across runs so re-generating is fast unless --force-rebuild.",
@@ -167,6 +192,10 @@ def main() -> None:
     device = resolve_device(args.device)
     device_label = _device_label(device)
     today = datetime.date.today().isoformat()
+    archs = list(args.archs) if args.archs else list(ALL_ARCHS)
+    if args.archs and not args.merge:
+        print(f"[gen] WARNING: sweeping only {archs} without --merge — every other arch will be "
+              f"DROPPED from the output files.")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     written = []
@@ -175,7 +204,7 @@ def main() -> None:
         artifact_dir = (args.csv_dir / str(size)) if args.csv_dir else (args.output_dir / "_artifacts" / str(size))
         print(f"\n[gen] === image size {size} (rfdetr {'follows' if follow else 'native'}) ===")
         result = run_sweep(
-            ALL_ARCHS,
+            archs,
             FORMATS,
             output_dir=artifact_dir,
             num_classes=args.num_classes,
@@ -191,15 +220,37 @@ def main() -> None:
             min_duration_s=args.gpu_util_min_duration_s,
             follow_image_size=follow,
         )
+        data = _build_data(result["dataframes"])
+        out_path = args.output_dir / f"{size}.json"
         envelope = {
             "image_size": size,
             "label": f"{size}×{size}",
             "device": device_label,
             "rfdetr_note": _rfdetr_note(size, follow),
             "generated": today,
-            "data": _build_data(result["dataframes"]),
+            "data": data,
         }
-        out_path = args.output_dir / f"{size}.json"
+        if args.merge and out_path.is_file():
+            existing = json.loads(out_path.read_text())
+            previous_device = existing.get("device")
+            if previous_device != device_label and not args.force_merge:
+                raise SystemExit(
+                    f"[gen] refusing to merge into {out_path}: it was generated on "
+                    f"{previous_device!r} but this run is on {device_label!r}. Latency and memory "
+                    f"are not comparable across devices — re-sweep every arch, or pass "
+                    f"--force-merge if you accept a mixed table."
+                )
+            merged = dict(existing)
+            merged["data"] = {**existing.get("data", {}), **data}
+            # rfdetr_note describes rfdetr's resolution handling for this size; keep the
+            # existing one unless rfdetr was actually re-swept.
+            if "rfdetr" not in data:
+                merged["rfdetr_note"] = existing.get("rfdetr_note")
+            merged["device"] = device_label
+            merged["generated"] = today
+            envelope = merged
+            print(f"[gen] merged {sorted(data)} into {out_path} "
+                  f"(kept {sorted(set(existing.get('data', {})) - set(data))})")
         out_path.write_text(json.dumps(envelope, separators=(",", ":")))
         written.append(out_path)
         print(f"[gen] wrote {out_path}  (summary: {result['summary']})")

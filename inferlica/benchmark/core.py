@@ -29,11 +29,13 @@ import torch
 try:
     from .gpu_monitor import GpuMonitor, own_usage_delta_mb, read_current_mem_mb, snapshot_process_mem_mb
     from .kernel_util import native_kernel_busy_pct
-    from .variants import ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec, rfdetr_variant_specs, yolox_variant_specs
+    from .variants import (ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec,
+                           ecdet_variant_specs, rfdetr_variant_specs, yolox_variant_specs)
 except ImportError:  # run as a flat script
     from gpu_monitor import GpuMonitor, own_usage_delta_mb, read_current_mem_mb, snapshot_process_mem_mb  # type: ignore
     from kernel_util import native_kernel_busy_pct  # type: ignore
-    from variants import ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec, rfdetr_variant_specs, yolox_variant_specs  # type: ignore
+    from variants import (ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec,  # type: ignore
+                          ecdet_variant_specs, rfdetr_variant_specs, yolox_variant_specs)
 
 METRIC_ROW_ORDER = [
     "status",
@@ -853,15 +855,17 @@ def run_sweep(
     dataframes: Dict[str, Any] = {}
     summary: Dict[str, Any] = {}
     for arch in archs:
-        # rfdetr's resolution and yolox's canvas are architectural, so they
+        # rfdetr's resolution and yolox's/ecdet's canvas are architectural, so they
         # normally ignore --image-size; when asked to follow it, rebuild each at
-        # the size (rfdetr snapped to the nearest valid resolution, yolox at the
-        # size directly). retinanet/fasterrcnn/rtdetr follow via the static
+        # the size (rfdetr snapped to the nearest valid resolution, yolox and ecdet
+        # at the size directly). retinanet/fasterrcnn/rtdetr follow via the static
         # profile in ARCHS_NEEDING_STATIC_FP16_PROFILE regardless of this flag.
         if arch == "rfdetr" and follow_image_size:
             variants = rfdetr_variant_specs(image_size)
         elif arch == "yolox" and follow_image_size:
             variants = yolox_variant_specs(image_size)
+        elif arch == "ecdet" and follow_image_size:
+            variants = ecdet_variant_specs(image_size)
         else:
             variants = ARCH_VARIANTS[arch]
         if variant_names:
