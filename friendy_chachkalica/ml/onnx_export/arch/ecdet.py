@@ -88,7 +88,17 @@ def export_ecdet(adapter, *, num_classes, params, class_map, onnx_path: str | Pa
 
             num_cls = logits.shape[1]
             scores = torch.sigmoid(logits)  # focal-loss path (ECDet default)
-            top_scores, top_idx = torch.topk(scores.flatten(), num_top_queries)
+            # Clamped exactly as ECDetAdapter.predict clamps it. num_top_queries
+            # (300) normally sits below queries*classes, but a config that lowers
+            # ECTransformer.num_queries can invert that — config_gen already does
+            # precisely this for rtdetr in the people_detect_first pipeline
+            # (num_queries: 25), and the same params on ecdet would otherwise make
+            # topk raise here while the torch path quietly returned fewer rows.
+            # This traces to a constant (torch warns), which is what we want: the
+            # graph is static-shaped anyway — fixed canvas, fixed query count — so
+            # the detection count is a property of the export, not of the input.
+            top_k = min(num_top_queries, logits.shape[0] * num_cls)
+            top_scores, top_idx = torch.topk(scores.flatten(), top_k)
             labels = top_idx % num_cls
             box_idx = top_idx // num_cls
             return xyxy[box_idx], top_scores, labels.to(torch.int64)

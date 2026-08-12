@@ -492,7 +492,6 @@ def _ensure_backbone_weights(backbone_name: str) -> str:
     import os
     from pathlib import Path
 
-    core, _ = _load_edgecrafter()
     try:
         from ...vendor.edgecrafter.edgecrafter.ecvit import ViTAdapter
     except ImportError:

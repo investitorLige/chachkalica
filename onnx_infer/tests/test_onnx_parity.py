@@ -324,6 +324,37 @@ def ecdet_export(tmp_path_factory):
     return adapter, onnx_path
 
 
+def test_ecdet_exports_when_num_queries_is_below_the_top_k(tmp_path):
+    """A config that lowers ``num_queries`` must still export.
+
+    ``num_top_queries`` (300) normally sits below ``queries * classes``, but
+    ``config_gen`` already injects ``num_queries: 25`` for rtdetr in the
+    people_detect_first pipeline, and the same params on ecdet invert it
+    (25 * 3 = 75 < 300). The adapter clamps; the exporter has to clamp the same way
+    or ``topk`` raises mid-trace.
+    """
+    torch.manual_seed(0)
+    adapter = build_model(
+        "ecdet", num_classes=3, variant="ecdet-s", weights=False, input_max_size=320,
+        ECTransformer={"num_queries": 25},
+    )
+    adapter.eval()
+    onnx_path = tmp_path / "model.onnx"
+    meta = export_ecdet(
+        adapter, num_classes=3, params={},
+        class_map={0: "a", 1: "b", 2: "c"}, onnx_path=onnx_path,
+    )
+    onnx_path.with_suffix(".meta.json").write_text(json.dumps(meta))
+
+    onnx_adapter, _ = load_onnx_adapter(onnx_path, "cpu")
+    torch.manual_seed(1)
+    image = torch.rand(3, 320, 320)
+    torch_pred = adapter.predict([image], score_threshold=0.0)[0].detach().cpu().numpy()
+    onnx_pred = onnx_adapter.predict([image], score_threshold=0.0)[0].detach().cpu().numpy()
+    assert torch_pred.shape[0] == 75, torch_pred.shape
+    _assert_parity(torch_pred, onnx_pred, min_dets=20, atol=5e-3)
+
+
 def test_ecdet_export_does_not_mutate_the_adapter(ecdet_export):
     """``deploy()`` folds conv blocks and swaps the heads past ``eval_idx`` for
     ``nn.Identity``, so the exporter must run on a deepcopy — otherwise exporting
