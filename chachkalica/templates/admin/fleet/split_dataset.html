@@ -1,0 +1,84 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Split <strong>{{ dataset.name }}</strong> ({{ image_count }} image{{ image_count|pluralize }}{% if has_labels %}, labeled{% else %}, unlabeled{% endif %}) into two new datasets:</p>
+
+<p class="help">
+  Each new dataset gets the canonical YOLO layout (<code>images/</code> +
+  {% if has_labels %}<code>labels/</code>, carrying over each image's annotations{% else %}<code>labels/</code> — the source has no labels, so both sides are images only{% endif %})
+  and a copy of <code>classes.txt</code>. Once both are built, <strong>{{ dataset.name }}</strong>
+  is removed — its files deleted and its dataset record gone — so nothing is duplicated.
+</p>
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="apply" value="1">
+
+  <div class="form-row">
+    <label for="split-slider">Split</label>
+    <div style="display: flex; align-items: center; gap: 10px; margin: 4px 0;">
+      <input type="range" id="split-slider" name="left_percent" min="1" max="99" step="1" value="80"
+             style="flex: 0 0 240px;">
+      <output id="split-readout" for="split-slider" style="font-variant-numeric: tabular-nums; font-weight: 700;">
+        80% / 20%
+      </output>
+    </div>
+  </div>
+
+  <p>
+    <label for="left_name">Left dataset name (<span id="left-pct-label">80%</span>):</label>
+    <input type="text" name="left_name" id="left_name"
+           pattern="[A-Za-z0-9][A-Za-z0-9._-]*"
+           title="Letters, digits, '.', '_', '-'; no spaces or path separators." required>
+    — <span id="left-count">{{ image_count }}</span> image(s)
+  </p>
+  <p>
+    <label for="right_name">Right dataset name (<span id="right-pct-label">20%</span>):</label>
+    <input type="text" name="right_name" id="right_name"
+           pattern="[A-Za-z0-9][A-Za-z0-9._-]*"
+           title="Letters, digits, '.', '_', '-'; no spaces or path separators." required>
+    — <span id="right-count">0</span> image(s)
+  </p>
+
+  <p>
+    <label for="shuffle"><input type="checkbox" name="shuffle" id="shuffle" value="1"> Shuffle images randomly before splitting</label>
+    <br><span class="help">Unchecked keeps the dataset's existing image order (first share left, rest right).</span>
+  </p>
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Split dataset">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+
+<script>
+(function () {
+  var total = {{ image_count }};
+  var slider = document.getElementById("split-slider");
+  var readout = document.getElementById("split-readout");
+  var leftPct = document.getElementById("left-pct-label");
+  var rightPct = document.getElementById("right-pct-label");
+  var leftCount = document.getElementById("left-count");
+  var rightCount = document.getElementById("right-count");
+
+  function update() {
+    var left = parseInt(slider.value, 10);
+    var right = 100 - left;
+    var leftN = Math.round(total * left / 100);
+    var rightN = total - leftN;
+    readout.textContent = left + "% / " + right + "%";
+    leftPct.textContent = left + "%";
+    rightPct.textContent = right + "%";
+    leftCount.textContent = leftN;
+    rightCount.textContent = rightN;
+  }
+
+  slider.addEventListener("input", update);
+  update();
+})();
+</script>
+{% endblock %}

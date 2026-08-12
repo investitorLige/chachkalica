@@ -16,6 +16,7 @@ from fleet.services import grounding_sam as grounding_sam_svc
 from fleet.services import merge as merge_svc
 from fleet.services import overlap as overlap_svc
 from fleet.services import provisioning, sync as sync_svc
+from fleet.services import split as split_svc
 
 
 def _mark_running(obj, action: str | None):
@@ -127,6 +128,14 @@ def merge_datasets(dataset_ids: list[int], new_name: str) -> dict:
     # Preserve a deterministic order (by name) regardless of pk ordering.
     datasets.sort(key=lambda d: d.name)
     return merge_svc.merge_datasets(datasets, new_name)
+
+
+def split_dataset(
+    dataset_id: int, left_name: str, right_name: str, left_percent: int, *, shuffle: bool
+) -> dict:
+    """Split a dataset into two new datasets by percentage, then delete the source."""
+    dataset = Dataset.objects.get(pk=dataset_id)
+    return split_svc.split_by_percentage(dataset, left_name, right_name, left_percent, shuffle=shuffle)
 
 
 def prune_overlaps(left_id: int, right_id: int, *, prune_left: bool, prune_right: bool) -> dict:

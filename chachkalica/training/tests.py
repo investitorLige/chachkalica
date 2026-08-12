@@ -1513,6 +1513,54 @@ class ExportActionsQueueJobsTests(TestCase):
             resp = self._post("export_trt")
         self.assertContains(resp, 'value=""')
 
+    def test_export_trt_form_defaults_to_fp16_for_a_trusted_arch(self):
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint",
+            return_value={"arch": "yolox", "trained_size": [640, 640], "fp16_trusted": True},
+        ):
+            resp = self._post("export_trt")
+        self.assertContains(resp, '<option value="fp16" selected>', html=False)
+        self.assertNotContains(resp, "Defaulted to FP32")
+
+    def test_export_trt_form_defaults_to_fp32_for_an_fp16_untrusted_arch(self):
+        # ecdet's fp16 engine fails the trained-checkpoint parity gate. build_engine
+        # floors precision="auto" to fp32, but this form names a precision
+        # explicitly, so without this the operator would silently get the bad one.
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint",
+            return_value={"arch": "ecdet", "trained_size": [640, 640], "fp16_trusted": False},
+        ):
+            resp = self._post("export_trt")
+        self.assertContains(resp, '<option value="fp32" selected>', html=False)
+        self.assertContains(resp, "Defaulted to FP32")
+
+    def test_export_trt_missing_precision_follows_the_fp16_trusted_flag(self):
+        # A post with no precision field must not fall back to fp16 for an
+        # untrusted arch (the old `or "fp16"` default did exactly that).
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint",
+            return_value={"arch": "ecdet", "trained_size": [640, 640], "fp16_trusted": False},
+        ):
+            with mock.patch.object(training_admin, "_queue") as queue:
+                self._post("export_trt", apply="1", output_dir=str(self.root / "out"))
+        self.assertEqual(ExportRun.objects.count(), 1)
+        self.assertEqual(ExportRun.objects.first().precision, "fp32")
+        queue.return_value.enqueue.assert_called()
+
+    def test_export_trt_explicit_fp16_still_wins_for_an_untrusted_arch(self):
+        # The floor is a default, not a prohibition — a deliberate fp16 build (e.g.
+        # for the benchmark) must still go through.
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint",
+            return_value={"arch": "ecdet", "trained_size": [640, 640], "fp16_trusted": False},
+        ):
+            with mock.patch.object(training_admin, "_queue"):
+                self._post(
+                    "export_trt", apply="1", output_dir=str(self.root / "out"),
+                    precision="fp16",
+                )
+        self.assertEqual(ExportRun.objects.first().precision, "fp16")
+
     def test_export_trt_form_survives_a_trainer_service_hiccup(self):
         with mock.patch(
             "training.services.runner.inspect_checkpoint",

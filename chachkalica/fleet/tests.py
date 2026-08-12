@@ -15,6 +15,7 @@ from fleet.services import lsapi
 from fleet.services import merge as merge_svc
 from fleet.services import overlap as overlap_svc
 from fleet.services import shape_split
+from fleet.services import split as split_svc
 
 _PPE_NAMES = [
     "gloves", "goggles", "helmet", "no_gloves",
@@ -211,6 +212,109 @@ class MergeDatasetsTests(TestCase):
             (self.src / "merged" / "labels" / "alpha__a1.txt").read_text(encoding="utf-8"),
             "640 480\n0 0.1 0.1 0.2 0.2\n",
         )
+
+
+class SplitByPercentageTests(TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = Path(self.tmp.name)
+        fs = FleetSettings.load()
+        fs.source_dir = str(self.src)  # absolute -> used verbatim by source_root()
+        fs.save()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_split_partitions_images_in_sorted_order_and_deletes_source(self):
+        ds = _make_dataset(
+            self.src, "alpha", "# tools: bbox\n", ["person", "vest"],
+            ["a1.jpg", "a2.jpg", "a3.jpg", "a4.jpg", "a5.jpg"],
+        )
+
+        result = split_svc.split_by_percentage(ds, "alpha-left", "alpha-right", 80)
+
+        self.assertEqual(result["left_images"], 4)
+        self.assertEqual(result["right_images"], 1)
+
+        left_imgs = sorted(p.name for p in (self.src / "alpha-left" / "images").iterdir())
+        right_imgs = sorted(p.name for p in (self.src / "alpha-right" / "images").iterdir())
+        self.assertEqual(left_imgs, ["a1.jpg", "a2.jpg", "a3.jpg", "a4.jpg"])
+        self.assertEqual(right_imgs, ["a5.jpg"])
+
+        # classes.txt is copied verbatim (no remap needed — same class space).
+        self.assertEqual(
+            (self.src / "alpha-left" / "classes.txt").read_text(encoding="utf-8"),
+            "# tools: bbox\nperson\nvest\n",
+        )
+        self.assertEqual(
+            (self.src / "alpha-right" / "classes.txt").read_text(encoding="utf-8"),
+            "# tools: bbox\nperson\nvest\n",
+        )
+
+        self.assertTrue(Dataset.objects.filter(name="alpha-left").exists())
+        self.assertTrue(Dataset.objects.filter(name="alpha-right").exists())
+
+        # The source dataset is gone — no duplicate copy left behind.
+        self.assertFalse(self.src.joinpath("alpha").exists())
+        self.assertFalse(Dataset.objects.filter(name="alpha").exists())
+
+    def test_split_carries_each_images_own_label_file(self):
+        ds = _make_dataset(
+            self.src, "alpha", "", ["person"], ["a1.jpg", "a2.jpg"],
+            labels={"a1.jpg.txt": "0 0.1 0.1 0.2 0.2\n", "a2.jpg.txt": "0 0.3 0.3 0.2 0.2\n"},
+        )
+
+        result = split_svc.split_by_percentage(ds, "alpha-left", "alpha-right", 50)
+
+        self.assertEqual(result["left_labels"], 1)
+        self.assertEqual(result["right_labels"], 1)
+        self.assertTrue((self.src / "alpha-left" / "labels" / "a1.jpg.txt").exists())
+        self.assertTrue((self.src / "alpha-right" / "labels" / "a2.jpg.txt").exists())
+        self.assertTrue(Dataset.objects.get(name="alpha-left").has_labels)
+        self.assertTrue(Dataset.objects.get(name="alpha-right").has_labels)
+
+    def test_shuffle_still_partitions_by_requested_percentage(self):
+        ds = _make_dataset(
+            self.src, "alpha", "", ["person"],
+            [f"a{i}.jpg" for i in range(10)],
+        )
+
+        result = split_svc.split_by_percentage(ds, "alpha-left", "alpha-right", 70, shuffle=True)
+
+        self.assertEqual(result["left_images"], 7)
+        self.assertEqual(result["right_images"], 3)
+
+    def test_invalid_percentage_aborts_and_leaves_source_intact(self):
+        ds = _make_dataset(self.src, "alpha", "", ["person"], ["a1.jpg"])
+        with self.assertRaises(RuntimeError):
+            split_svc.split_by_percentage(ds, "alpha-left", "alpha-right", 0)
+        self.assertTrue(self.src.joinpath("alpha").exists())
+        self.assertTrue(Dataset.objects.filter(name="alpha").exists())
+
+    def test_duplicate_name_aborts(self):
+        ds = _make_dataset(self.src, "alpha", "", ["person"], ["a1.jpg", "a2.jpg"])
+        Dataset.objects.create(name="taken", storage_type=Dataset.LOCAL)
+        with self.assertRaises(RuntimeError):
+            split_svc.split_by_percentage(ds, "taken", "alpha-right", 50)
+        self.assertFalse((self.src / "taken" / "images").exists())
+        self.assertTrue(self.src.joinpath("alpha").exists())
+
+    def test_same_name_on_both_sides_aborts(self):
+        ds = _make_dataset(self.src, "alpha", "", ["person"], ["a1.jpg", "a2.jpg"])
+        with self.assertRaises(RuntimeError):
+            split_svc.split_by_percentage(ds, "same", "same", 50)
+
+    def test_cloud_dataset_aborts(self):
+        ds = _make_dataset(self.src, "alpha", "", ["person"], ["a1.jpg"])
+        ds.storage_type = Dataset.CLOUD
+        ds.save()
+        with self.assertRaises(RuntimeError):
+            split_svc.split_by_percentage(ds, "alpha-left", "alpha-right", 50)
+
+    def test_empty_dataset_aborts(self):
+        ds = _make_dataset(self.src, "alpha", "", ["person"], [])
+        with self.assertRaises(RuntimeError):
+            split_svc.split_by_percentage(ds, "alpha-left", "alpha-right", 50)
 
 
 class DatasetAnalyticsTests(TestCase):

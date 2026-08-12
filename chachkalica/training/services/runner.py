@@ -163,11 +163,18 @@ INSPECT_TIMEOUT = 60
 
 
 def inspect_checkpoint(checkpoint_path, ts: TrainingSettings | None = None) -> dict:
-    """``{"arch", "trained_size"}`` for a checkpoint, without exporting anything.
+    """``{"arch", "trained_size", "fp16_trusted"}`` for a checkpoint, without
+    exporting anything.
 
     ``trained_size`` is ``[H, W]`` or ``None`` (Faster R-CNN/RetinaNet train at
     variable input size, so there is no single size to report). Used to prefill
     the export forms' static input size.
+
+    ``fp16_trusted`` is False for an arch whose fp16 engine does not reproduce its
+    fp32 output (currently ecdet). ``build_engine`` already floors ``auto`` to fp32
+    for those, but the TRT export form names a precision explicitly and so bypasses
+    that floor — this flag is what lets the form default to fp32 instead. Callers
+    should treat a missing key as True: an older trainer service does not send it.
     """
     payload = {"checkpoint_path": str(checkpoint_path)}
     resp = requests.post(

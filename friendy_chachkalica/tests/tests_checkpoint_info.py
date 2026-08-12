@@ -72,20 +72,44 @@ class InspectCheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._checkpoint(Path(tmp), "rfdetr", {"resolution": 512})
             info = inspect_checkpoint(path)
-        self.assertEqual(info, {"arch": "rfdetr", "trained_size": [512, 512]})
+        self.assertEqual(
+            info,
+            {"arch": "rfdetr", "trained_size": [512, 512], "fp16_trusted": True},
+        )
 
     def test_variable_size_arch_reports_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._checkpoint(Path(tmp), "fasterrcnn", {})
             info = inspect_checkpoint(path)
-        self.assertEqual(info, {"arch": "fasterrcnn", "trained_size": None})
+        self.assertEqual(
+            info,
+            {"arch": "fasterrcnn", "trained_size": None, "fp16_trusted": True},
+        )
 
     def test_missing_params_dict_is_treated_as_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "model.pt"
             torch.save({"model_name": "rtdetr", "model_state_dict": {}}, path)
             info = inspect_checkpoint(path)
-        self.assertEqual(info, {"arch": "rtdetr", "trained_size": [640, 640]})
+        self.assertEqual(
+            info,
+            {"arch": "rtdetr", "trained_size": [640, 640], "fp16_trusted": True},
+        )
+
+    def test_reports_fp16_untrusted_for_an_arch_on_the_fp32_floor(self):
+        """The TRT export form reads this to default its precision select.
+
+        ``build_engine`` already floors ``precision="auto"`` to fp32 for these, but
+        the admin form names a precision explicitly and would otherwise hand the
+        operator the fp16 engine that fails the parity gate.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._checkpoint(Path(tmp), "ecdet", {"input_max_size": 640})
+            info = inspect_checkpoint(path)
+        self.assertEqual(
+            info,
+            {"arch": "ecdet", "trained_size": [640, 640], "fp16_trusted": False},
+        )
 
 
 if __name__ == "__main__":

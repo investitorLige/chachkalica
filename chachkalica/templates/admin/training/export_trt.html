@@ -61,9 +61,17 @@ trainer's exact GPU + TensorRT version (not portable to other hardware).</p>
   <div class="form-row">
     <label for="precision">Precision:</label>
     <select name="precision" id="precision">
-      <option value="fp16" selected>FP16 (faster; falls back to FP32 if unsupported)</option>
-      <option value="fp32">FP32 (most faithful)</option>
+      <option value="fp16" {% if fp16_trusted %}selected{% endif %}>FP16 (faster; falls back to FP32 if unsupported)</option>
+      <option value="fp32" {% if not fp16_trusted %}selected{% endif %}>FP32 (most faithful)</option>
     </select>
+    {% if not fp16_trusted %}
+      <p class="help" style="color:#d98d45;"><strong>Defaulted to FP32:</strong> this
+      architecture's FP16 engine is known not to reproduce its own FP32 output — it
+      fails the trained-checkpoint parity gate (confident detections drop or shift),
+      so an <code>auto</code>-precision build floors it to FP32 too. FP16 is still
+      selectable and will build; treat the result as a speed experiment, not a
+      deployable engine.</p>
+    {% endif %}
   </div>
 
   <div class="form-row">

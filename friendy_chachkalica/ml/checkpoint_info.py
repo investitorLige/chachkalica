@@ -83,12 +83,28 @@ def resolve_trained_size(arch: str, params: dict) -> Optional[Tuple[int, int]]:
 
 
 def inspect_checkpoint(checkpoint_path: str | Path) -> dict:
-    """``{"arch", "trained_size"}`` for a checkpoint, without exporting anything.
+    """``{"arch", "trained_size", "fp16_trusted"}`` for a checkpoint, without
+    exporting anything.
 
     ``trained_size`` is ``[H, W]`` or ``None`` (see :func:`resolve_trained_size`).
+
+    ``fp16_trusted`` mirrors ``trt_export.arch.is_fp16_trusted`` — False for an
+    arch whose fp16 engine is known not to reproduce its fp32 output (currently
+    ecdet). It rides along here because the caller that needs it is the export UI:
+    ``precision="auto"`` already floors an untrusted arch to fp32 inside
+    ``build_engine``, but a caller that names fp16 *explicitly* bypasses that
+    floor, and the Django TRT export form does exactly that. Surfacing the flag
+    lets the form default to fp32 and say why, without teaching the Django app any
+    arch names of its own.
     """
+    from .trt_export.arch import is_fp16_trusted
+
     state = torch.load(checkpoint_path, map_location="cpu")
     arch = state["model_name"]
     params = dict((state.get("model_config") or {}).get("params") or {})
     size = resolve_trained_size(arch, params)
-    return {"arch": arch, "trained_size": list(size) if size else None}
+    return {
+        "arch": arch,
+        "trained_size": list(size) if size else None,
+        "fp16_trusted": bool(is_fp16_trusted(arch)),
+    }

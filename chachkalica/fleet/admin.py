@@ -28,6 +28,7 @@ from fleet.services import datasets as datasets_svc
 from fleet.services import lsapi
 from fleet.services import merge as merge_svc
 from fleet.services import overlap as overlap_svc
+from fleet.services import split as split_svc
 from fleet.services.paths import source_root
 
 _STATUS_COLORS = {
@@ -244,6 +245,7 @@ class DatasetAdmin(admin.ModelAdmin):
         "promote_annotator_labels",
         "generate_grounding_sam_labels",
         "merge_selected",
+        "split_selected",
         "analyze_selected",
         "check_overlapping_images",
         "preview_labels",
@@ -481,6 +483,69 @@ class DatasetAdmin(admin.ModelAdmin):
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
         }
         return TemplateResponse(request, "admin/fleet/merge_datasets.html", context)
+
+    @admin.action(description="Split into two datasets by percentage…")
+    def split_selected(self, request, queryset):
+        datasets = list(queryset)
+        if len(datasets) != 1:
+            self.message_user(request, "Select exactly one dataset to split.", level=messages.WARNING)
+            return None
+        dataset = datasets[0]
+
+        if request.POST.get("apply"):
+            left_name = (request.POST.get("left_name") or "").strip()
+            right_name = (request.POST.get("right_name") or "").strip()
+            try:
+                left_percent = int(request.POST.get("left_percent", ""))
+            except ValueError:
+                left_percent = -1
+            shuffle = bool(request.POST.get("shuffle"))
+            if not left_name or not right_name:
+                self.message_user(request, "Enter a name for both split datasets.", level=messages.WARNING)
+                return None
+            if not 1 <= left_percent <= 99:
+                self.message_user(request, "Split percentage must be between 1 and 99.", level=messages.WARNING)
+                return None
+            for name in (left_name, right_name):
+                if Dataset.objects.filter(name=name).exists():
+                    self.message_user(request, f"A dataset named {name!r} already exists.", level=messages.ERROR)
+                    return None
+            if left_name == right_name:
+                self.message_user(request, "The two split dataset names must differ.", level=messages.ERROR)
+                return None
+            _queue().enqueue(
+                jobs.split_dataset, dataset.id, left_name, right_name, left_percent, shuffle=shuffle
+            )
+            self.message_user(
+                request,
+                f"Split queued — {left_name!r} and {right_name!r} will appear here when the worker "
+                f"finishes, and {dataset.name!r} will be removed.",
+            )
+            return None
+
+        if dataset.storage_type != Dataset.LOCAL:
+            self.message_user(request, "Split supports local-storage datasets only.", level=messages.ERROR)
+            return None
+        try:
+            image_count = split_svc.dataset_image_count(dataset)
+        except (FileNotFoundError, RuntimeError) as exc:
+            self.message_user(request, f"Cannot split: {exc}", level=messages.ERROR)
+            return None
+        if not image_count:
+            self.message_user(request, f"{dataset.name!r} has no images to split.", level=messages.ERROR)
+            return None
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Split dataset",
+            "dataset": dataset,
+            "image_count": image_count,
+            "has_labels": datasets_svc.detect_labels(dataset, persist=False),
+            "action": "split_selected",
+            "selected": [str(dataset.pk)],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+        }
+        return TemplateResponse(request, "admin/fleet/split_dataset.html", context)
 
     @admin.action(description="Analyze labeled dataset(s) — class distribution…")
     def analyze_selected(self, request, queryset):

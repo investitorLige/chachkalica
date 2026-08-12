@@ -1051,6 +1051,15 @@ class TrainedModelAdmin(admin.ModelAdmin):
         except Exception:  # noqa: BLE001 - best-effort hint only
             return {}
 
+    @classmethod
+    def _fp16_trusted(cls, checkpoints) -> bool:
+        """Whether this arch's fp16 engine is known to reproduce its fp32 output.
+
+        Defaults to True when the hint is unavailable, so a trainer-service hiccup
+        never silently downgrades an arch that is fine in fp16.
+        """
+        return bool(cls._trained_size_hint(checkpoints).get("fp16_trusted", True))
+
     @admin.action(description="Export best + last to ONNX…")
     def export_onnx(self, request, queryset):
         """Queue a model's best and last ``.pt`` for ONNX export under a chosen directory.
@@ -1149,9 +1158,16 @@ class TrainedModelAdmin(admin.ModelAdmin):
                 self.message_user(request, "Enter an output directory.",
                                   level=messages.WARNING)
                 return None
-            precision = (request.POST.get("precision") or "fp16").strip()
-            if precision not in ("fp16", "fp32"):
-                precision = "fp16"
+            # The form's own default comes from fp16_trusted below; an explicit
+            # posted value still wins, so an operator can deliberately build fp16
+            # for an untrusted arch. Only the fallback for a missing/garbage value
+            # follows the flag — never silently upgrade to fp16 for an arch whose
+            # fp16 engine is known not to match its fp32 output.
+            posted = (request.POST.get("precision") or "").strip()
+            if posted in ("fp16", "fp32"):
+                precision = posted
+            else:
+                precision = "fp16" if self._fp16_trusted(checkpoints) else "fp32"
             # An unchecked box posts nothing, so absence *is* the False -- no whitelist
             # needed here, unlike precision above.
             gpu_infer = bool(request.POST.get("gpu_infer"))
@@ -1219,7 +1235,11 @@ class TrainedModelAdmin(admin.ModelAdmin):
             return None
 
         default_dir = exports.exports_root()
-        trained_size = self._trained_size_hint(checkpoints).get("trained_size")
+        hint = self._trained_size_hint(checkpoints)
+        trained_size = hint.get("trained_size")
+        # Absent (older trainer service, or the hint failed) -> treat as trusted, so
+        # the form keeps its historical fp16 default for every other arch.
+        fp16_trusted = hint.get("fp16_trusted", True)
         context = {
             **self.admin_site.each_context(request),
             "title": f"Export {model.name} to TensorRT",
@@ -1227,6 +1247,7 @@ class TrainedModelAdmin(admin.ModelAdmin):
             "checkpoints": [{"label": label, "path": path} for label, path in checkpoints],
             "default_output_dir": str(default_dir),
             "default_input_size": f"{trained_size[0]}x{trained_size[1]}" if trained_size else "",
+            "fp16_trusted": fp16_trusted,
             "build_nodes": BuildNode.objects.filter(status=BuildNode.ACTIVE),
             "action": "export_trt",
             "selected": [str(model.pk)],
