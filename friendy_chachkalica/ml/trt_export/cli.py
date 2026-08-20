@@ -24,7 +24,16 @@ try:
     from ..onnx_export.cli import export_checkpoint
     from ..onnx_export.common import INPUT_NAME
     from ...registry import build_model
-    from .arch import get_fp16_node_block, get_fp16_op_block, get_trt_prep, is_fp16_trusted
+    from .arch import (
+        get_cast_backend,
+        get_fp16_node_block,
+        get_fp16_op_block,
+        get_trt_prep,
+        is_batch_aware,
+        is_fp16_trusted,
+        resolve_auto_precision,
+    )
+    from .modelopt_cast import modelopt_version
     from .builder import build_engine_from_onnx
     from .profile import profile_from_meta
 except ImportError:  # run flat (cwd on sys.path), mirroring onnx_export/cli.py
@@ -35,11 +44,15 @@ except ImportError:  # run flat (cwd on sys.path), mirroring onnx_export/cli.py
     from ml.onnx_export.cli import export_checkpoint  # type: ignore
     from ml.onnx_export.common import INPUT_NAME  # type: ignore
     from ml.trt_export.arch import (  # type: ignore
+        get_cast_backend,
         get_fp16_node_block,
         get_fp16_op_block,
         get_trt_prep,
+        is_batch_aware,
         is_fp16_trusted,
+        resolve_auto_precision,
     )
+    from ml.trt_export.modelopt_cast import modelopt_version  # type: ignore
     from ml.trt_export.builder import build_engine_from_onnx  # type: ignore
     from ml.trt_export.profile import profile_from_meta  # type: ignore
 
@@ -76,6 +89,8 @@ def build_engine(
     min_batch: int = 1,
     opt_batch: int = 1,
     max_batch: int = 1,
+    cast_backend: str = "auto",
+    autocast_options: Optional[dict] = None,
 ) -> Path:
     """Compile ``source_path`` (a ``.pt`` or ``.onnx``) into a TensorRT engine.
 
@@ -83,17 +98,22 @@ def build_engine(
     (retinanet/yolox); pass it to build from a ``.onnx`` without the ``.pt`` (used
     by tests / callers that already hold the adapter). Ignored for passthrough archs.
 
-    ``precision`` is ``"auto"`` (default), ``"fp16"``, or ``"fp32"``. ``auto`` builds
-    fp16 except for archs still on the fp16 safety floor (``UNTRUSTED_FP16``), which
-    build fp32; ``fp16``/``fp32`` are honored verbatim (explicit wins over the floor).
+    ``precision`` is ``"auto"`` (default), ``"fp16"``, ``"bf16"`` or ``"fp32"``.
+    ``auto`` builds fp16 except for archs still on the fp16 safety floor
+    (``UNTRUSTED_FP16``), which build fp32; the explicit precisions are honored
+    verbatim (explicit wins over the floor). ``bf16`` is only available on
+    strongly-typed TensorRT via ModelOpt AutoCast (see ``modelopt_cast.py``) or,
+    on TRT <= 10, via ``BuilderFlag.BF16``; it never falls back to another
+    precision — see ``build_trt.py`` for the standalone graph-level utility.
     On strongly-typed TRT the arch's per-arch fp32 keep-list (``ARCH_FP16_OP_BLOCK``)
     is applied to any fp16 build; ``extra_fp32_ops`` extends it (used by the sweep).
 
-    ``min_batch``/``opt_batch``/``max_batch`` default to 1 (today's behavior for
-    every arch, unchanged). Passing a wider range only actually helps a wrapper
-    that carries its real batch dim through end to end — right now that's
-    yolox's EfficientNMS wrapper (``arch/yolox.py``); other archs would just
-    build a wider, unused profile.
+    ``min_batch``/``opt_batch``/``max_batch`` default to 1. Passing a wider
+    range only ever helps an arch whose exported graph carries a real batch
+    dim through to its outputs (see ``arch/__init__.py``'s ``BATCH_AWARE_ARCHS``
+    — currently yolox, ecdet, rtdetr, rfdetr); requesting ``max_batch > 1`` for
+    any other arch raises rather than silently building a profile the graph
+    can't back correctly.
 
     Returns the written ``.engine`` path.
     """
@@ -117,12 +137,51 @@ def build_engine(
     meta = json.loads(meta_path.read_text())
     arch = meta.get("arch")
 
-    # Resolve auto -> per-arch precision (untrusted archs floor to fp32); explicit
-    # fp16/fp32 pass through. The per-arch fp32 keep-list applies to any fp16 build.
+    if max_batch > 1 and not is_batch_aware(arch):
+        raise ValueError(
+            f"arch {arch!r} was requested with max_batch={max_batch}, but its "
+            f"exported graph does not carry a real batch dimension through to "
+            f"its outputs — TensorRT would silently repeat one image's "
+            f"detections across the whole batch. Build with max_batch=1, or "
+            f"see arch/__init__.py's BATCH_AWARE_ARCHS for which archs support "
+            f"a wider profile."
+        )
+
+    # Resolve auto -> per-arch precision and cast backend (see arch/__init__.py:
+    # untrusted archs floor to fp32, unless AutoCast is known to rescue them and
+    # ModelOpt is installed); explicit fp16/bf16/fp32 pass through. The per-arch
+    # fp32 keep-list applies to any graph_cast fp16 build.
     if precision == "auto":
-        precision = "fp16" if is_fp16_trusted(arch) else "fp32"
-        if precision == "fp32":
-            print(f"[trt] {arch}: on the fp16 safety floor -> building fp32 (pass precision='fp16' to override)")
+        resolved, auto_backend = resolve_auto_precision(
+            arch, modelopt_available=modelopt_version() is not None
+        )
+        if cast_backend == "auto":
+            cast_backend = auto_backend
+        if resolved == "fp32" and not is_fp16_trusted(arch):
+            extra = ""
+            if arch in ("dfine",) and modelopt_version() is None:
+                extra = (" — install nvidia-modelopt[onnx] to get the AutoCast fp16 "
+                         "engine this arch is known to survive")
+            print(f"[trt] {arch}: on the fp16 safety floor -> building fp32 "
+                  f"(pass precision='fp16' to override){extra}")
+        elif resolved == "fp16" and auto_backend == "autocast" and not is_fp16_trusted(arch):
+            print(f"[trt] {arch}: fp16 via ModelOpt AutoCast (its blanket-cast fp16 is "
+                  f"on the safety floor; the AutoCast graph is not)")
+        precision = resolved
+    elif precision == "fp16" and cast_backend == "auto":
+        # An explicit fp16 request still gets the arch's required backend. If that
+        # is AutoCast and ModelOpt is missing, refuse: silently falling back to the
+        # blanket cast would ship exactly the engine the floor exists to prevent.
+        cast_backend = get_cast_backend(arch)
+        if cast_backend == "autocast" and modelopt_version() is None:
+            raise RuntimeError(
+                f"arch {arch!r} only has a trustworthy fp16 engine via NVIDIA ModelOpt "
+                f"AutoCast (its blanket-cast fp16 is on the safety floor — see "
+                f"trt_export/arch/__init__.py), but nvidia-modelopt is not installed:\n"
+                f"    pip install 'nvidia-modelopt[onnx]'\n"
+                f"Pass cast_backend='graph_cast' to build the known-degraded engine "
+                f"anyway, or precision='fp32'."
+            )
     resolved_fp32_ops = get_fp16_op_block(arch) + [
         op for op in (extra_fp32_ops or []) if op not in get_fp16_op_block(arch)
     ]
@@ -174,6 +233,8 @@ def build_engine(
         min_batch=min_batch,
         opt_batch=opt_batch,
         max_batch=max_batch,
+        cast_backend=cast_backend,
+        autocast_options=autocast_options,
     )
 
     # Self-contained artifact: a verbatim meta copy next to the engine (unless the
@@ -224,7 +285,12 @@ def main() -> None:
     )
     parser.add_argument("source", help="Path to a .pt checkpoint or an exported .onnx")
     parser.add_argument("--output", "-o", help="Engine output path (default: source with .engine)")
-    parser.add_argument("--precision", choices=["auto", "fp16", "fp32"], default="auto")
+    parser.add_argument("--precision", choices=["auto", "fp16", "bf16", "fp32"], default="auto")
+    parser.add_argument(
+        "--cast-backend", choices=["auto", "graph_cast", "autocast"], default="auto",
+        help="TRT>=11 only: how the low-precision graph is produced. auto = this "
+             "repo's onnxruntime float16 cast for fp16, ModelOpt AutoCast for bf16.",
+    )
     parser.add_argument("--min-hw", type=_parse_hw, help="Min input HxW (e.g. 64x64); overrides meta")
     parser.add_argument("--opt-hw", type=_parse_hw, help="Optimum input HxW; overrides meta")
     parser.add_argument("--max-hw", type=_parse_hw, help="Max input HxW; overrides meta")
@@ -245,6 +311,7 @@ def main() -> None:
         opt_batch=args.opt_batch,
         max_batch=args.max_batch,
         workspace_gb=args.workspace_gb,
+        cast_backend=args.cast_backend,
     )
 
 

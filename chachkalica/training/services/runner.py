@@ -163,8 +163,8 @@ INSPECT_TIMEOUT = 60
 
 
 def inspect_checkpoint(checkpoint_path, ts: TrainingSettings | None = None) -> dict:
-    """``{"arch", "trained_size", "fp16_trusted"}`` for a checkpoint, without
-    exporting anything.
+    """``{"arch", "trained_size", "fp16_trusted", "batch_aware"}`` for a
+    checkpoint, without exporting anything.
 
     ``trained_size`` is ``[H, W]`` or ``None`` (Faster R-CNN/RetinaNet train at
     variable input size, so there is no single size to report). Used to prefill
@@ -175,6 +175,13 @@ def inspect_checkpoint(checkpoint_path, ts: TrainingSettings | None = None) -> d
     for those, but the TRT export form names a precision explicitly and so bypasses
     that floor — this flag is what lets the form default to fp32 instead. Callers
     should treat a missing key as True: an older trainer service does not send it.
+
+    ``batch_aware`` is False for an arch whose engine only ever decodes correctly
+    at batch 1 (its exported graph carries no real batch axis). The TRT export
+    form uses it to decide whether to offer a batch profile above 1 at all.
+    Callers should treat a missing key as False: an older trainer service does
+    not send it, and assuming batch-safety it never claimed would be the wrong
+    direction to guess.
     """
     payload = {"checkpoint_path": str(checkpoint_path)}
     resp = requests.post(
@@ -228,7 +235,7 @@ def export_trt_onnx(checkpoint_path, onnx_path, ts: TrainingSettings | None = No
     Returns ``{"onnx_path", "meta_path", "arch", "prepared"}``. ``prepared`` is
     True when the arch needed its baked NMS replaced with an ``EfficientNMS_TRT``
     node (yolox, retinanet, fasterrcnn) and False when its standard export already
-    compiles (rtdetr, rfdetr, ecdet) — the remote build passes that flag through so
+    compiles (rtdetr, rfdetr, ecdet, dfine) — the remote build passes that flag through so
     the node knows which kind of graph it received.
 
     This is what makes an EfficientNMS arch buildable on a remote node at all: the
@@ -260,6 +267,7 @@ TRT_BUILD_TIMEOUT = 1800
 def export_trt(
     checkpoint_path, engine_path, precision: str = "fp16",
     input_hw: tuple[int, int] | None = None,
+    min_batch: int = 1, opt_batch: int = 1, max_batch: int = 1,
     ts: TrainingSettings | None = None,
 ) -> dict:
     """Build a TensorRT engine from one ``.pt`` via the trainer service.
@@ -272,11 +280,19 @@ def export_trt(
 
     ``input_hw`` (H, W), when given, pins a STATIC engine profile (min==opt==max) — the
     way to get FP16 on Faster R-CNN, whose graph only compiles FP16 at a fixed size.
+
+    ``min_batch``/``opt_batch``/``max_batch`` default to 1 (today's behavior). Passing
+    ``max_batch > 1`` for an arch that isn't batch-aware (see ``inspect_checkpoint``'s
+    ``batch_aware`` flag) makes the service's ``build_engine`` call raise — it is not
+    silently clamped here, so the caller sees why the build was rejected.
     """
     payload = {
         "checkpoint_path": str(checkpoint_path),
         "engine_path": str(engine_path),
         "precision": str(precision),
+        "min_batch": int(min_batch),
+        "opt_batch": int(opt_batch),
+        "max_batch": int(max_batch),
     }
     if input_hw is not None:
         payload["input_hw"] = [int(input_hw[0]), int(input_hw[1])]

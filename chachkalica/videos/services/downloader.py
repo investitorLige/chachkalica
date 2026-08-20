@@ -6,8 +6,11 @@ Unlike the original ``download_videos`` (which returns ``None`` and swallows
 ``DownloadError``), :func:`download` returns the saved path and raises on failure
 so the background job can record it on the row.
 
-Requires ``yt-dlp`` (+ ``ffmpeg`` on PATH for the mp4 merge/convert). An optional
-JS runtime (node) unlocks >360p YouTube streams via ``yt-dlp-ejs``.
+Requires ``yt-dlp`` (+ ``ffmpeg`` on PATH for the mp4 merge/convert). A JS
+runtime (deno) lets ``yt-dlp-ejs`` solve YouTube's player sig/n challenge, and
+``bgutil-ytdlp-pot-provider`` (talking to the ``yt-pot-server`` companion
+container) mints the separate PO Token YouTube now requires on the actual
+videoplayback fetch — the JS challenge alone no longer unlocks a download.
 """
 
 from __future__ import annotations
@@ -74,6 +77,19 @@ def download(url: str, output_dir: str | Path, quality: int | None = None) -> Pa
         name, path = runtime
         ydl_opts["js_runtimes"] = {name: {"path": path}}
         ydl_opts["remote_components"] = ["ejs:github"]
+
+    # Points bgutil-ytdlp-pot-provider (a yt-dlp plugin, active once installed —
+    # no opt-in flag needed) at its companion BotGuard-solving server. Without a
+    # PO Token, YouTube 403s the videoplayback fetch even after the JS challenge
+    # above is solved correctly.
+    pot_server_url = os.environ.get("YT_POT_SERVER_URL", "http://127.0.0.1:4416")
+    ydl_opts["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [pot_server_url]}}
+    # This network's TLS-inspecting proxy MITMs the fetch the POT server makes to
+    # www.google.com (see yt_pot_server/Dockerfile); yt-dlp forwards this flag to
+    # the server as `disable_tls_verification`, which is what actually silences
+    # that failure — NODE_TLS_REJECT_UNAUTHORIZED on the server alone does not,
+    # since bgutil's own HTTPS agent hardcodes rejectUnauthorized from this flag.
+    ydl_opts["nocheckcertificate"] = True
 
     try:
         with yt_dlp.YoutubeDL(dict(ydl_opts)) as ydl:

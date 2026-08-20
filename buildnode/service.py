@@ -36,7 +36,10 @@ log = logging.getLogger("buildnode")
 app = FastAPI(title="chachkalica build node", version=NODE_VERSION)
 
 _VALID_FMT = ("onnx", "engine")
-_VALID_PRECISION = ("fp16", "fp32", "auto")
+# bf16 needs nvidia-modelopt on the node (strongly-typed TensorRT has no BF16
+# builder flag); a node without it fails the build with that reason rather than
+# quietly compiling some other precision.
+_VALID_PRECISION = ("fp16", "bf16", "fp32", "auto")
 
 
 @app.on_event("startup")

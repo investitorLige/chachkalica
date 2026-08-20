@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from ..errors import UnknownArchError
 from .base import ArchHandler
+from .dfine import DFineHandler
 from .ecdet import ECDetHandler
 from .fasterrcnn import FasterRCNNHandler
 from .retinanet import RetinaNetHandler
@@ -20,7 +21,7 @@ ARCH_REGISTRY: dict[str, ArchHandler] = {
     handler.name: handler
     for handler in (
         FasterRCNNHandler(), RetinaNetHandler(), YOLOXHandler(), RTDetrHandler(), RFDetrHandler(),
-        ECDetHandler(),
+        ECDetHandler(), DFineHandler(),
     )
 }
 

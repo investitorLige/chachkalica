@@ -7,6 +7,7 @@ from unittest import mock
 import torch
 import yaml
 
+from friendy_chachkalica.ml.adapters.dfine import build_dfine
 from friendy_chachkalica.ml.adapters.rfdetr import build_rfdetr
 from friendy_chachkalica.ml.adapters.rtdetr import build_rtdetr
 from friendy_chachkalica.ml.adapters.yolox import _load_checkpoint
@@ -131,6 +132,20 @@ class WarmStartCheckpointTests(unittest.TestCase):
 
         self.assertEqual(params["weights"], "PekingU/rtdetr_v2_r18vd")
 
+    def test_dfine_keeps_source_repository_to_rebuild_topology(self):
+        # Same reasoning as rtdetr: dfine's repo id selects the size/dataset
+        # topology, so a warm start must keep it rather than forcing weights=False.
+        config = ModelConfig(name="dfine", num_classes=3, params={})
+        state = {
+            "model_config": {
+                "params": {"weights": "ustc-community/dfine-small-obj2coco"}
+            }
+        }
+
+        params = _warm_start_build_params(config, state)
+
+        self.assertEqual(params["weights"], "ustc-community/dfine-small-obj2coco")
+
     def test_compatible_backbone_loads_while_changed_head_stays_initialized(self):
         model = torch.nn.Sequential(
             torch.nn.Linear(4, 4),
@@ -197,6 +212,26 @@ class NativePretrainedFailureTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "refusing to silently train"):
                 build_rtdetr(num_classes=2, weights="missing-repository")
+
+    def test_dfine_requested_weights_fail_instead_of_falling_back(self):
+        class BrokenConfig:
+            @classmethod
+            def from_pretrained(cls, weights, **kwargs):
+                raise OSError("offline")
+
+            def __init__(self, **kwargs):
+                pass
+
+        class FakeModel:
+            def __init__(self, config):
+                self.config = config
+
+        with mock.patch(
+            "friendy_chachkalica.ml.adapters.dfine._load_transformers_dfine",
+            return_value=(BrokenConfig, FakeModel, object),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "refusing to silently train"):
+                build_dfine(num_classes=2, weights="missing-repository")
 
     def test_rfdetr_requested_weights_fail_instead_of_falling_back(self):
         class BrokenRFDETR:
@@ -295,6 +330,51 @@ class ECDetWarmStartStructuralParamsTests(unittest.TestCase):
         # ecdet's topology comes from the variant, so the pretrained download is
         # skipped and the Friendy state is restored on top instead.
         self.assertIs(build_params["weights"], False)
+
+
+class DFineWarmStartStructuralParamsTests(unittest.TestCase):
+    """dfine's repo id selects topology, same as rtdetr's — not a variant kwarg."""
+
+    def test_weights_is_the_only_structural_param(self):
+        from friendy_chachkalica.ml.train import _WARM_START_STRUCTURAL_PARAMS
+
+        self.assertEqual(set(_WARM_START_STRUCTURAL_PARAMS["dfine"]), {"weights"})
+
+    def test_mismatched_repository_is_refused(self):
+        from friendy_chachkalica.config import ModelConfig
+        from friendy_chachkalica.ml.train import _warm_start_build_params
+
+        checkpoint = {
+            "model_config": {
+                "name": "dfine",
+                "num_classes": 3,
+                "params": {"weights": "ustc-community/dfine-small-coco"},
+            }
+        }
+        config = ModelConfig(
+            name="dfine", num_classes=3,
+            params={"weights": "ustc-community/dfine-large-coco"},
+        )
+        with self.assertRaisesRegex(ValueError, "weights"):
+            _warm_start_build_params(config, checkpoint)
+
+    def test_matching_topology_is_reused_without_redownloading(self):
+        from friendy_chachkalica.config import ModelConfig
+        from friendy_chachkalica.ml.train import _warm_start_build_params
+
+        checkpoint = {
+            "model_config": {
+                "name": "dfine",
+                "num_classes": 3,
+                "params": {"weights": "ustc-community/dfine-small-coco"},
+            }
+        }
+        config = ModelConfig(name="dfine", num_classes=3, params={})
+        build_params = _warm_start_build_params(config, checkpoint)
+        # dfine's topology comes from the weights repo id, like rtdetr's — kept,
+        # not forced to False, so the same checkpoint is reused without a
+        # redundant re-download before the Friendy state is restored on top.
+        self.assertEqual(build_params["weights"], "ustc-community/dfine-small-coco")
 
 
 if __name__ == "__main__":

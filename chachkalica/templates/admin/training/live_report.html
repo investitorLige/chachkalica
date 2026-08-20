@@ -121,8 +121,8 @@
   "use strict";
   var RUN_ID = {{ run_id }};
   var METRICS_URL = "{{ metrics_url }}";
-  var IMAGE_URL = "{% url 'admin:training_trainingrun_hard_images_image' %}";
-  var DATA_URL = "{% url 'admin:training_trainingrun_hard_images_data' %}";
+  var IMAGE_URL = "{{ hard_image_url }}";
+  var DATA_URL = "{{ hard_image_data_url }}";
   var POLL_MS = 5000;
   var TERMINAL = { ok: 1, error: 1 };
 

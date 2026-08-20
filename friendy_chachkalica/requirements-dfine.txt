@@ -1,0 +1,8 @@
+-r requirements.txt
+# D-FINE (Peterande/D-FINE, Apache-2.0) has no installable upstream package, but
+# it landed as a first-class architecture in transformers (DFineConfig/
+# DFineForObjectDetection) — see adapters/dfine.py's module docstring for why
+# that route was chosen over vendoring, unlike ecdet. Same two extras rtdetr
+# needs, for the same reason: scipy for the Hungarian matcher.
+scipy
+transformers

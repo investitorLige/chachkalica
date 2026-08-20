@@ -27,7 +27,7 @@ try:
     # Re-exported (not defined here) so bundle_export can reach it without
     # importing this module's torch — see chachak/config.py.
     from .config import _inference_score_threshold  # noqa: F401
-    from ._friendy import _to_builtin, evaluate_detection
+    from ._friendy import EVAL_HARD_IMAGES_FRACTION, _to_builtin, _write_hard_images, evaluate_detection
     from .boxes import (
         crop_image,
         expand_box,
@@ -42,7 +42,7 @@ try:
     from .infer import infer_in_chunks
 except ImportError:  # run as a flat script
     from config import _inference_score_threshold  # noqa: F401
-    from _friendy import _to_builtin, evaluate_detection
+    from _friendy import EVAL_HARD_IMAGES_FRACTION, _to_builtin, _write_hard_images, evaluate_detection
     from boxes import (
         crop_image,
         expand_box,
@@ -315,6 +315,18 @@ class Pipeline:
             f"[chachak] {self.name} metrics: map50={metrics.get('map50')} "
             f"map50_95={metrics.get('map50_95')} precision={metrics.get('precision')} "
             f"recall={metrics.get('recall')}"
+        )
+        _write_hard_images(
+            prediction_path,
+            all_predictions,
+            all_targets,
+            records,
+            config=None,
+            prediction_classes=prediction_classes,
+            target_classes=target_classes,
+            eval_classes=eval_classes,
+            score_threshold=self.config.score_threshold,
+            top_k_fraction=EVAL_HARD_IMAGES_FRACTION,
         )
         return {
             "prediction_path": prediction_path,

@@ -249,12 +249,13 @@ def batch_caps(manifest: Dict[str, Any], fmt: Optional[str] = None) -> Dict[str,
 
     ONNX artifacts are run one image per session call by ``OnnxAdapter``, so they
     have no cap. TensorRT is different: ``TrtAdapter`` submits same-shaped images
-    as one real ``[B,3,H,W]`` batch, which is only decoded correctly for the
-    EfficientNMS archs — the passthrough graphs emit a single detection axis with
-    no batch dimension, and their engines are built with a batch-1 profile. The
-    exporter records the resulting ceiling per role under ``artifacts.max_batch``;
-    ``None`` means uncapped. ``fmt`` is accepted (and ignored) for call-site
-    compatibility — see :func:`artifact_paths`.
+    as one real ``[B,3,H,W]`` batch, decoded correctly only for an arch this
+    engine was actually built with a wider profile for (see
+    ``trt_export.arch.BATCH_AWARE_ARCHS`` for which archs that can even be asked
+    for — retinanet/fasterrcnn never; the DETR-family passthrough archs can, but
+    still build batch-1 by default). The exporter records the resulting ceiling
+    per role under ``artifacts.max_batch``; ``None`` means uncapped. ``fmt`` is
+    accepted (and ignored) for call-site compatibility — see :func:`artifact_paths`.
     """
     caps = (manifest.get("artifacts") or {}).get("max_batch") or {}
     return {

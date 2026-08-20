@@ -1,6 +1,19 @@
 """Shared helpers for the per-arch exporters: the meta.json builder and the
 standard ``torch.onnx.export`` call for a wrapper that emits ``(boxes, scores,
-labels)`` with a dynamic detection count and dynamic input H/W.
+labels)`` with dynamic input H/W.
+
+Two output shapes are supported, picked by ``batch_aware``:
+
+* Default (``batch_aware=False``): ``(boxes[N,4], scores[N], labels[N])`` — the
+  batch axis is indexed away inside the wrapper, N is a *detection* count and is
+  dynamic (real NMS/threshold output, as in yolox/retinanet/fasterrcnn's plain
+  ONNX export). Only ever correct for a batch of 1.
+* ``batch_aware=True``: ``(boxes[B,K,4], scores[B,K], labels[B,K])`` — the
+  wrapper carries the real batch dim ``B`` through instead of indexing it away,
+  and the per-image detection count ``K`` is a fixed constant baked in at export
+  time (a static top-k, no data-dependent op). Used by the DETR-family
+  exporters (ecdet/rtdetr/rfdetr), whose top-k is already static per image —
+  see ``arch/ecdet.py`` for why that makes batching free.
 """
 
 from __future__ import annotations
@@ -64,20 +77,29 @@ def export_detection_wrapper(
     dummy_hw: tuple[int, int] = (640, 640),
     opset: int = 17,
     dynamic_input_hw: bool = True,
+    batch_aware: bool = False,
 ) -> None:
-    """``torch.onnx.export`` a wrapper ``forward(pixel_values[1,3,H,W]) ->
-    (boxes[N,4], scores[N], labels[N])``."""
+    """``torch.onnx.export`` a wrapper emitting ``(boxes, scores, labels)``.
+
+    ``batch_aware=False`` (default): ``forward(pixel_values[1,3,H,W]) ->
+    (boxes[N,4], scores[N], labels[N])``, N a dynamic detection count.
+
+    ``batch_aware=True``: ``forward(pixel_values[B,3,H,W]) -> (boxes[B,K,4],
+    scores[B,K], labels[B,K])``, B the real (dynamic) batch dim and K a fixed
+    per-image detection count baked in at trace time — see the module docstring.
+    """
     import torch
 
     dummy = torch.rand(1, 3, dummy_hw[0], dummy_hw[1])
     input_axes = {0: "batch"}
     if dynamic_input_hw:
         input_axes.update({2: "height", 3: "width"})
+    det_axis = {0: "batch"} if batch_aware else {0: "num_dets"}
     dynamic_axes = {
         INPUT_NAME: input_axes,
-        "boxes": {0: "num_dets"},
-        "scores": {0: "num_dets"},
-        "labels": {0: "num_dets"},
+        "boxes": dict(det_axis),
+        "scores": dict(det_axis),
+        "labels": dict(det_axis),
     }
     wrapper.eval()
     with torch.no_grad():

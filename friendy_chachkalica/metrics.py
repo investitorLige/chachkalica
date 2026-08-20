@@ -258,6 +258,32 @@ HARD_IMAGE_METRIC_DESCRIPTION = (
 )
 
 
+EVAL_HARD_IMAGES_FRACTION = 0.10
+"""Share of images kept as "hardest" by every standalone eval surface (base
+checkpoint eval, combined-checkpoint eval, chachak pipeline eval — everything
+under the admin's "eval tab", as opposed to training's fixed top-50 per-epoch
+val viewer, which keeps its own fixed count)."""
+
+
+def hard_images_top_k(
+    num_images: int,
+    *,
+    top_k: Optional[int] = None,
+    fraction: float = 0.10,
+    minimum: int = 1,
+) -> int:
+    """Resolve how many images a hard-images artifact should keep.
+
+    An explicit ``top_k`` always wins (a fixed-count viewer, e.g. training's
+    per-epoch "hardest val images"); otherwise ``fraction`` of ``num_images`` is
+    used (e.g. a standalone eval's "worst 10%"), floored at ``minimum`` so a tiny
+    eval set still surfaces at least one image.
+    """
+    if top_k is not None:
+        return max(minimum, int(top_k))
+    return max(minimum, round(fraction * num_images))
+
+
 def select_hard_images(
     predictions: Sequence[torch.Tensor],
     targets: Sequence[Dict[str, Any]],

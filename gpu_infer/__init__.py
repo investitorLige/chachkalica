@@ -39,11 +39,15 @@ re-validating mAP per architecture. The box geometry twins in :mod:`gpu_infer.ge
 **float64** for the same reason — ``chachak.boxes.expand_box`` and friends convert to python
 floats, which *are* float64, so a float32 tensor version would not agree.
 
-It also does not reduce the number of engine calls. A passthrough-arch engine (rtdetr/rfdetr)
-is built with a batch-1 profile — see ``chachak.bundle_export.cli._batchable_in_trt`` — so N
-person crops are still N executions. This package removes the synchronization and per-call
-host overhead *around* those N calls. Batching them needs a batch-aware DETR export and is a
-separate change.
+It also does not by itself reduce the number of engine calls. A passthrough-arch engine
+(ecdet/rtdetr/rfdetr/dfine) still defaults to a batch-1 profile — see
+``chachak.bundle_export.cli._batchable_in_trt`` / ``trt_export.arch.BATCH_AWARE_ARCHS`` — so N
+person crops are still N executions unless the engine was actually built with a wider profile.
+The DETR-family export wrappers are batch-aware now (``onnx_export/arch/{ecdet,rtdetr,rfdetr,dfine}.py``),
+so that rebuild is no longer a separate change waiting to happen; it just has to be requested at
+export time (the TRT export form's batch-size field, or ``chachak.bundle_export``'s batch
+config). This package removes the synchronization and per-call host overhead *around* however
+many engine calls that ends up being.
 
 Layout
 ------

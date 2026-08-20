@@ -119,6 +119,11 @@ class YoloDetectionDataset:
         self.labels_root = Path(labels_dir).resolve() if labels_dir is not None else None
         self.names = dict(classes)
         self.image_paths = _resolve_image_dir(self.images_root)
+        # Corrupt/truncated files show up in real-world datasets often enough
+        # that one bad JPEG shouldn't take down a whole multi-epoch run; see
+        # __getitem__. Logged once per path so a repeat-offender doesn't spam
+        # every epoch.
+        self._warned_bad_paths = set()
 
         if self.labels_root is not None and not self.labels_root.is_dir():
             raise FileNotFoundError(f"Could not resolve labels directory: {self.labels_root}")
@@ -173,14 +178,28 @@ class YoloDetectionDataset:
     def __len__(self):
         return len(self.image_paths)
 
-    def __getitem__(self, index):
+    def __getitem__(self, index, _attempt=0):
         import numpy as np
         import torch
         from PIL import Image, ImageOps
 
         image_path = self.image_paths[index]
-        # Match browser/display orientation before deriving dimensions and boxes.
-        image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+        try:
+            # Match browser/display orientation before deriving dimensions and boxes.
+            image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+        except OSError as exc:
+            # Truncated/corrupt files happen in real datasets (bad export,
+            # interrupted copy, ...). Crashing the whole DataLoader worker over
+            # one file kills a run that may be hours into training, so skip it
+            # and substitute a neighboring sample instead. Bounded by dataset
+            # size so a dataset that's corrupt end-to-end still raises instead
+            # of recursing forever.
+            if image_path not in self._warned_bad_paths:
+                self._warned_bad_paths.add(image_path)
+                print(f"[data] WARNING: skipping unreadable image {image_path}: {exc}")
+            if _attempt >= len(self):
+                raise
+            return self.__getitem__((index + 1) % len(self), _attempt=_attempt + 1)
         width, height = image.size
         label_path = (_image_to_label_path(image_path, self.images_root, self.labels_root)
                       if self.labels_root is not None else None)

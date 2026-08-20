@@ -143,6 +143,8 @@ def _default_new_weights(arch: str) -> str:
     """The weights option a freshly added row of this arch starts on."""
     if arch == ExperimentModel.RTDETR:
         return "PekingU/rtdetr_r50vd"  # RT-DETR's original default size/checkpoint
+    if arch == ExperimentModel.DFINE:
+        return "ustc-community/dfine-medium-coco"  # mid-size default, matches build_dfine's
     if arch in model_specs.WEIGHTS_DEFAULT_ARCHS:
         return model_specs.WEIGHTS_DEFAULT  # COCO pretrained
     return model_specs.WEIGHTS_NONE

@@ -138,6 +138,48 @@ ARCH_FIELD_SPECS: dict[str, list[dict]] = {
             "help": "How many backbone stages to fine-tune (0–5). Blank = fully trainable.",
         },
     ],
+    "dfine": [
+        # D-FINE's backbone/decoder size *is* its pretrained checkpoint too (each
+        # ustc-community/dfine-{nano,small,medium,large,xlarge}-* repo id carries
+        # its own backbone_config), so — like rtdetr — the size selector lives in
+        # the "Pretrained weights" dropdown (WEIGHTS_CATALOG["dfine"]) rather than
+        # a separate variant kwarg. Its geometry (stretch to a square canvas, no
+        # padding) is also rtdetr's exactly, confirmed against transformers'
+        # modeling_d_fine.py.
+        {
+            "key": "score_threshold", "label": "Score threshold", "kind": "float",
+            "default": 0.5, "help": "Default confidence cutoff used at prediction time.",
+        },
+        {
+            "key": "nms_threshold", "label": "val_metrics_nms_iou_threshold", "kind": "float",
+            "help": "IoU for deduplicating this model's boxes in val/test "
+                    "precision/recall/F1 only — inference stays NMS-free and mAP is "
+                    "unaffected. Blank = the experiment's operating NMS threshold.",
+        },
+        {
+            "key": "input_max_size", "label": "Input max size", "kind": "int",
+            "default": 640, "help": "Working resolution: every input is resized "
+                    "(up OR down) so its longest side hits this, then padded to a "
+                    "square. Higher = more accurate and more memory. For person-crop "
+                    "pipelines keep it at the model's native size (640 for dfine) — "
+                    "lowering it to 'match' small crops upscales them less and "
+                    "reduces accuracy.",
+        },
+        {
+            "key": "input_size_multiple", "label": "Input size multiple", "kind": "int",
+            "default": 32, "help": "Pad each side up to this multiple.",
+        },
+        {
+            "key": "ignore_mismatched_sizes", "label": "Ignore mismatched sizes",
+            "kind": "bool", "default": True,
+            "help": "Re-init the head when the pretrained class count differs.",
+        },
+        {
+            "key": "trainable_backbone_layers", "label": "Trainable backbone layers",
+            "kind": "int",
+            "help": "How many backbone stages to fine-tune (0–5). Blank = fully trainable.",
+        },
+    ],
     "fasterrcnn": [
         # Order follows the forward pass: input resize -> backbone -> RPN
         # (proposal filtering in the same order torchvision applies it:
@@ -370,11 +412,31 @@ def friendy_checkpoint_from_value(value: str) -> str | None:
         return value[len(WEIGHTS_FRIENDY_PREFIX):]
     return None
 
+
+# Every arch already exposes a "freeze the backbone" builder option as one of its
+# ARCH_FIELD_SPECS above — a 0-5 trainable_backbone_layers count (torchvision-style;
+# 0 freezes everything) for every arch except RF-DETR, whose adapter instead takes a
+# plain freeze_backbone bool. The "Fine-tune model…" action offers this as a single
+# checkbox rather than making the operator pick the right per-arch knob; this
+# resolves that checkbox into the params patch the selected arch actually needs.
+def freeze_params(arch: str, freeze: bool) -> dict:
+    """The builder kwarg(s) implementing a "freeze backbone" checkbox for ``arch``.
+
+    Empty when unchecked — leaving the key unset gives every adapter's own
+    fully-trainable default, same as an ordinary (non-fine-tune) run.
+    """
+    if not freeze:
+        return {}
+    if arch == "rfdetr":
+        return {"freeze_backbone": True}
+    return {"trainable_backbone_layers": 0}
+
+
 # Archs whose published default is variant-resolved by the adapter when it gets
 # ``weights=True`` (torchvision COCO enum / YOLOX per-variant URL / RF-DETR
-# per-variant default / ECDet per-variant release asset). RT-DETR is excluded:
-# its size *is* its checkpoint, so it lists explicit repo ids instead of a single
-# "default".
+# per-variant default / ECDet per-variant release asset). RT-DETR and D-FINE are
+# excluded: their size *is* their checkpoint, so they list explicit repo ids
+# instead of a single "default".
 WEIGHTS_DEFAULT_ARCHS = {"retinanet", "fasterrcnn", "yolox", "rfdetr", "ecdet"}
 
 # torchvision accepts weight-enum names, not arbitrary checkpoint paths/URLs.
@@ -382,8 +444,10 @@ WEIGHTS_DEFAULT_ARCHS = {"retinanet", "fasterrcnn", "yolox", "rfdetr", "ecdet"}
 # choice, not by capability — ``build_ecdet`` does accept an arbitrary URL/path,
 # but the three curated tiers (COCO / distilled backbone / scratch) cover every
 # intended use and a free-text field here would mostly invite mismatched
-# checkpoints. Add "ecdet" here if that changes.
-WEIGHTS_CUSTOM_ARCHS = {"yolox", "rtdetr", "rfdetr"}
+# checkpoints. Add "ecdet" here if that changes. D-FINE is included alongside
+# rtdetr/rfdetr: it takes an arbitrary HF repo id or local path too, and its own
+# catalog is already richer (9 entries) than a curated-tiers case like ecdet's.
+WEIGHTS_CUSTOM_ARCHS = {"yolox", "rtdetr", "rfdetr", "dfine"}
 
 # Published, appropriately-licensed checkpoints offered per arch *beyond* the
 # variant default. Each entry: {value, label, variant?}. ``value`` is written
@@ -430,6 +494,25 @@ WEIGHTS_CATALOG: dict[str, list[dict]] = {
         {"value": "PekingU/rtdetr_v2_r50vd", "label": "r50vd — v2", "train_res": "640"},
         {"value": "PekingU/rtdetr_v2_r101vd", "label": "r101vd — v2", "train_res": "640"},
     ],
+    "dfine": [
+        # Size == checkpoint for D-FINE too (see ARCH_FIELD_SPECS["dfine"]).
+        # obj2coco (Objects365-pretrained, then COCO-finetuned) beats the
+        # plain-coco tier by 2-3 AP at every size upstream ships it for (no
+        # nano-obj2coco exists upstream). All ustc-community/Apache-2.0, all
+        # trained at a square 640.
+        {"value": "ustc-community/dfine-nano-coco", "label": "nano — 42.8 COCO AP, 4M params (fastest)", "train_res": "640"},
+        {"value": "ustc-community/dfine-small-coco", "label": "small — 48.5 COCO AP, 10M params", "train_res": "640"},
+        {"value": "ustc-community/dfine-medium-coco", "label": "medium — 52.3 COCO AP, 19M params (original default)", "train_res": "640"},
+        {"value": "ustc-community/dfine-large-coco", "label": "large — 54.0 COCO AP, 31M params", "train_res": "640"},
+        {"value": "ustc-community/dfine-xlarge-coco", "label": "xlarge — 55.8 COCO AP, 62M params (most accurate)", "train_res": "640"},
+        {"value": "ustc-community/dfine-small-obj2coco", "label": "small — 50.7 AP, Objects365+COCO", "train_res": "640"},
+        {"value": "ustc-community/dfine-medium-obj2coco", "label": "medium — 55.1 AP, Objects365+COCO", "train_res": "640"},
+        # NB the real repo id carries an ``-e25`` suffix (upstream ships this one
+        # tier as an epoch-25 checkpoint); the plain ``dfine-large-obj2coco`` name
+        # does not resolve. Caught when populating the offline HF cache.
+        {"value": "ustc-community/dfine-large-obj2coco-e25", "label": "large — 57.3 AP, Objects365+COCO", "train_res": "640"},
+        {"value": "ustc-community/dfine-xlarge-obj2coco", "label": "xlarge — 59.3 AP, Objects365+COCO", "train_res": "640"},
+    ],
 }
 
 # Input resolution each arch's variant-resolved "COCO pretrained (default)" option
@@ -440,8 +523,9 @@ WEIGHTS_CATALOG: dict[str, list[dict]] = {
 #
 # A dict value is a {variant: res} map the form/JS resolves against the row's
 # selected variant (the default's resolution genuinely depends on the variant); a
-# bare string is a single value used for every variant. RT-DETR is absent: it has
-# no "default" option (its size IS its checkpoint — see WEIGHTS_CATALOG above).
+# bare string is a single value used for every variant. RT-DETR and D-FINE are
+# absent: neither has a "default" option (their size IS their checkpoint — see
+# WEIGHTS_CATALOG above; each catalog entry carries its own "train_res" instead).
 _TORCHVISION_MULTISCALE = "800 shorter side (≤1333)"
 WEIGHTS_DEFAULT_TRAIN_RES: dict[str, object] = {
     # YOLOX test/train size: 416 for nano/tiny, 640 for s/m/l/x.

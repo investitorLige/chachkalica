@@ -45,6 +45,9 @@
   .ev-cmp .cmx-controls label { font-weight: 600; }
   .ev-cmp .cmx-slider { flex: 0 0 180px; }
   .ev-cmp .cmx-value { font-variant-numeric: tabular-nums; font-weight: 700; color: #222; min-width: 3ch; }
+  .ev-cmp .hard-links { list-style: none; margin: 0; padding: 0; }
+  .ev-cmp .hard-links li { padding: 6px 0; border-bottom: 1px solid #e0e0e0; }
+  .ev-cmp .hard-links .button { margin-left: 10px; }
 </style>
 {% endblock %}
 
@@ -75,6 +78,23 @@
     {% endfor %}
   </tbody>
 </table>
+
+<h2>Worst images</h2>
+<p class="note">Each eval's worst-scoring images by difficulty (missed detections, false
+   positives, wrong class, and loose boxes) — the same ranking training's "hardest val
+   images" viewer uses, sized to the worst 10% of the eval's images rather than a fixed count.</p>
+<ul class="hard-links">
+  {% for col in columns %}
+    <li>
+      <strong>{{ col.model }}</strong> <span class="arch">{{ col.arch }} · on {{ col.dataset }}</span>
+      {% if col.hard_images_url %}
+        <a class="button" href="{{ col.hard_images_url }}">View worst images</a>
+      {% else %}
+        <span class="note">— no worst-images artifact for this eval</span>
+      {% endif %}
+    </li>
+  {% endfor %}
+</ul>
 
 {% if confusion_matrices %}
   <h2>Confusion matrix</h2>

@@ -42,10 +42,12 @@ class _RecordingAdapter:
 
 class InferInChunksBatchCapTest(unittest.TestCase):
     def test_clamps_to_the_adapters_batch_1_profile(self):
-        """A batch-1 TensorRT engine (any passthrough arch — rfdetr/rtdetr) must
-        never see more than one image per call, no matter what chunk_size the
-        caller configured — this is what stops `people_detect_first` crashing on
-        any frame with more than one person cropped for such a bundle."""
+        """A batch-1 TensorRT engine — the default profile for every arch, and
+        still the only option for retinanet/fasterrcnn (see
+        ``trt_export.arch.BATCH_AWARE_ARCHS``) — must never see more than one
+        image per call, no matter what chunk_size the caller configured — this
+        is what stops `people_detect_first` crashing on any frame with more than
+        one person cropped for such a bundle."""
         adapter = _RecordingAdapter(max_batch=1)
         images = list(range(5))
 

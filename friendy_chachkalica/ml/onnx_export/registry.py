@@ -13,6 +13,7 @@ matching half — the two must agree on Contracts A/B for that arch.
 from __future__ import annotations
 
 try:
+    from .arch.dfine import export_dfine
     from .arch.ecdet import export_ecdet
     from .arch.fasterrcnn import export_fasterrcnn
     from .arch.retinanet import export_retinanet
@@ -20,6 +21,7 @@ try:
     from .arch.rtdetr import export_rtdetr
     from .arch.yolox import export_yolox
 except ImportError:  # run as a flat script
+    from arch.dfine import export_dfine
     from arch.ecdet import export_ecdet
     from arch.fasterrcnn import export_fasterrcnn
     from arch.retinanet import export_retinanet
@@ -34,6 +36,7 @@ EXPORT_REGISTRY = {
     "rtdetr": export_rtdetr,
     "rfdetr": export_rfdetr,
     "ecdet": export_ecdet,
+    "dfine": export_dfine,
 }
 
 

@@ -61,10 +61,25 @@ trainer's exact GPU + TensorRT version (not portable to other hardware).</p>
   <div class="form-row">
     <label for="precision">Precision:</label>
     <select name="precision" id="precision">
-      <option value="fp16" {% if fp16_trusted %}selected{% endif %}>FP16 (faster; falls back to FP32 if unsupported)</option>
-      <option value="fp32" {% if not fp16_trusted %}selected{% endif %}>FP32 (most faithful)</option>
+      <option value="fp16" {% if auto_precision == "fp16" %}selected{% endif %}>FP16 (faster; falls back to FP32 if unsupported)</option>
+      <option value="fp32" {% if auto_precision == "fp32" %}selected{% endif %}>FP32 (most faithful)</option>
+      <option value="bf16">BF16 (same speed class as FP16, wider range, fewer mantissa bits)</option>
     </select>
-    {% if not fp16_trusted %}
+    {% if autocast_rescued %}
+      <p class="help" style="color:#d98d45;"><strong>FP16 here means ModelOpt AutoCast:</strong>
+      this architecture's plain FP16 cast is on the safety floor (it fails the
+      trained-checkpoint parity gate), but NVIDIA ModelOpt AutoCast's mixed
+      FP32/FP16 graph reproduces the PyTorch model where that blanket cast destroys
+      it — it keeps the numerically fragile decoder nodes in FP32 — so an FP16 build
+      here goes through AutoCast automatically. Measured on real COCO weights over
+      24 images: mAP50 <strong>0.98–1.00</strong> against PyTorch, versus 0.25–0.72
+      for the blanket cast, and about 2× faster than FP32. It is <em>not</em> a gate
+      pass: neither this engine nor the FP32 one clears the strict per-detection
+      gate against PyTorch (both miss one near-threshold detection), so the case for
+      it is that aggregate agreement, not a green light. FP32 is still selectable —
+      though for this architecture TensorRT's own FP32 engine is the <em>less</em>
+      faithful of the two.</p>
+    {% elif not fp16_trusted %}
       <p class="help" style="color:#d98d45;"><strong>Defaulted to FP32:</strong> this
       architecture's FP16 engine is known not to reproduce its own FP32 output — it
       fails the trained-checkpoint parity gate (confident detections drop or shift),
@@ -72,6 +87,10 @@ trainer's exact GPU + TensorRT version (not portable to other hardware).</p>
       selectable and will build; treat the result as a speed experiment, not a
       deployable engine.</p>
     {% endif %}
+    <p class="help">BF16 needs <code>nvidia-modelopt</code> on the machine that
+    compiles the engine (TensorRT 11 is strongly typed and has no BF16 builder
+    flag); without it the build fails rather than quietly producing another
+    precision.</p>
   </div>
 
   <div class="form-row">
@@ -90,6 +109,34 @@ trainer's exact GPU + TensorRT version (not portable to other hardware).</p>
       (min = opt = max). <strong>Faster R-CNN needs this to build FP16</strong> — its graph
       only compiles FP16 at a fixed size; with a dynamic profile the FP16 build fails and
       silently falls back to FP32.</p>
+    {% endif %}
+  </div>
+
+  <div class="form-row">
+    <label for="batch_size">Batch size:</label>
+    {% if batch_aware %}
+      <input type="text" name="batch_size" id="batch_size" size="6" value="1">
+      <label style="margin-left:1.5em; font-weight:normal;">
+        <input type="checkbox" name="variable_batch" id="variable_batch" value="1">
+        Variable (min/max range)
+      </label>
+      <span id="batch_range_row" style="display:none; margin-left:1em;">
+        min <input type="text" name="min_batch" id="min_batch" size="4" value="1">
+        max <input type="text" name="max_batch" id="max_batch" size="4" value="4">
+      </span>
+      <p class="help">Detections per image are fixed at export time, so a wider batch
+      just runs more images through the engine at once — nothing else about the output
+      changes. <strong>Fixed</strong> builds one profile at exactly that size.
+      <strong>Variable</strong> builds an optimization profile TensorRT can run anywhere
+      in <code>[min, max]</code>, tuned for <code>max</code> — pick this if the number of
+      images you'll actually submit at once varies. Only applies to a local build; a
+      remote build node ignores this for now.</p>
+    {% else %}
+      <input type="text" value="1" size="6" disabled>
+      <p class="help" style="color:#d98d45;"><strong>Fixed at 1:</strong> this
+      architecture's exported graph has no batch axis, so TensorRT would silently repeat
+      one image's detections across the whole batch if a wider profile were allowed —
+      the same cap <code>chachak.bundle_export</code> already applies.</p>
     {% endif %}
   </div>
 
@@ -114,4 +161,19 @@ trainer's exact GPU + TensorRT version (not portable to other hardware).</p>
     <a href="../" class="button cancel-link">Cancel</a>
   </div>
 </form>
+
+{% if batch_aware %}
+<script>
+  var variableBatch = document.getElementById("variable_batch");
+  var batchRangeRow = document.getElementById("batch_range_row");
+  var fixedBatchSize = document.getElementById("batch_size");
+  function syncBatchMode() {
+    var variable = variableBatch.checked;
+    batchRangeRow.style.display = variable ? "" : "none";
+    fixedBatchSize.disabled = variable;
+  }
+  variableBatch.addEventListener("change", syncBatchMode);
+  syncBatchMode();
+</script>
+{% endif %}
 {% endblock %}

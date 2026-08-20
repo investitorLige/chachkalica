@@ -12,6 +12,7 @@
     var FIELD_PIPELINES = {
         detector_checkpoint: ["people_detect_first", "batch_people", "chain"],
         detector_expand_ratio: ["people_detect_first", "batch_people", "chain"],
+        detector_min_box_size: ["people_detect_first", "batch_people", "chain"],
         tile_size_px: ["batch_detect"],
         tile_width_pct: ["batch_detect", "batch_people", "chain"],
         tile_height_pct: ["batch_detect", "batch_people", "chain"],

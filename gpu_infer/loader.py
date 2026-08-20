@@ -110,9 +110,10 @@ class LoadedEngine:
     def batchable(self) -> bool:
         """Whether more than one region can be submitted per execution.
 
-        Read off the engine's own profile rather than the arch name: a passthrough graph is built
-        batch-1 because its export wrapper indexes the batch axis away, and that is a property of
-        the artifact, not of the string in its meta.
+        Read off the engine's own profile rather than the arch name: whether an engine was built
+        with a batch profile wider than 1 is a property of that build (see
+        ``trt_export.arch.BATCH_AWARE_ARCHS`` for which archs it can even be asked for), not of
+        the string in its meta.
         """
         return (self.engine.max_batch or 1) > 1
 

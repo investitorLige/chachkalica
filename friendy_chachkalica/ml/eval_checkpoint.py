@@ -34,7 +34,11 @@ try:
     )
     from ..data import build_eval_dataloader
     from ..device import resolve_device
-    from ..metrics import evaluate_detection, remap_raw_predictions_to_eval_classes
+    from ..metrics import (
+        EVAL_HARD_IMAGES_FRACTION,
+        evaluate_detection,
+        remap_raw_predictions_to_eval_classes,
+    )
     from ..registry import build_model
     from .train import (
         _apply_eval_nms,
@@ -43,6 +47,7 @@ try:
         _predict_with_config,
         _require_prediction_batch,
         _target_to_cpu,
+        _write_hard_images,
         predict_dataset,
         resolve_operating_nms_threshold,
     )
@@ -60,7 +65,11 @@ except ImportError:
     )
     from data import build_eval_dataloader
     from device import resolve_device
-    from metrics import evaluate_detection, remap_raw_predictions_to_eval_classes
+    from metrics import (
+        EVAL_HARD_IMAGES_FRACTION,
+        evaluate_detection,
+        remap_raw_predictions_to_eval_classes,
+    )
     from registry import build_model
     from ml.train import (
         _apply_eval_nms,
@@ -69,6 +78,7 @@ except ImportError:
         _predict_with_config,
         _require_prediction_batch,
         _target_to_cpu,
+        _write_hard_images,
         predict_dataset,
         resolve_operating_nms_threshold,
     )
@@ -156,6 +166,7 @@ def eval_checkpoint(
         eval_classes=eval_classes,
         operating_nms_threshold=resolve_operating_nms_threshold(config, config.models[0]),
         compute_metrics=labels is not None,
+        hard_images_top_k_fraction=EVAL_HARD_IMAGES_FRACTION,
     )
 
     result = {
@@ -324,6 +335,20 @@ def eval_combined_checkpoints(
         eval_classes=eval_classes,
         operating_nms_threshold=operating_nms_threshold,
     ) if labels is not None else {"prediction_only": True})
+
+    if labels is not None:
+        _write_hard_images(
+            prediction_path,
+            all_predictions,
+            all_targets,
+            records,
+            config=config,
+            prediction_classes=eval_classes,
+            target_classes=eval_classes,
+            eval_classes=eval_classes,
+            operating_nms_threshold=operating_nms_threshold,
+            top_k_fraction=EVAL_HARD_IMAGES_FRACTION,
+        )
 
     result = {
         "checkpoint": [str(p) for p in checkpoint_paths],

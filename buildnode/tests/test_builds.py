@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 from buildnode import builds
+from buildnode import compile as compile_mod
 
 
 class MaterializeRequestTests(unittest.TestCase):
@@ -117,6 +118,94 @@ class NeedsDetectorTests(unittest.TestCase):
                                     "chain": ["batch_detect", "batch_people"]}))
         self.assertFalse(
             builds._needs_detector({"pipeline": "chain", "chain": ["batch_detect"]}))
+
+
+class Fp16RoutingTests(unittest.TestCase):
+    """Which fp16 mechanism a remote build uses — the one thing a node can get
+    silently wrong.
+
+    An arch whose blanket-cast fp16 is on the safety floor but whose engine is
+    rescued by ModelOpt AutoCast (``ARCH_CAST_BACKEND``) must reach
+    ``build_engine_from_onnx`` with ``cast_backend="autocast"``, or the builder
+    applies its fp16 default — the blanket cast — and this node ships the exact
+    engine the floor exists to keep out, labelled "fp16" like any other. The
+    admin's TRT export form always sends an explicit precision, so the explicit
+    path matters at least as much as ``auto``.
+
+    The real policy table is used deliberately (it is torch-free); only the
+    builder, the modelopt probe and the GPU identity are stubbed.
+    """
+
+    def setUp(self):
+        from friendy_chachkalica.ml.trt_export import arch as arch_policy
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.scratch = Path(self._tmp.name)
+        self.onnx = self.scratch / "model.onnx"
+        self.onnx.write_bytes(b"x")
+        (self.scratch / "model.meta.json").write_text('{"arch": "dfine"}')
+        self.captured = {}
+        self.arch_policy = arch_policy
+
+    def _install_api(self, *, modelopt: str | None):
+        def build_engine_from_onnx(onnx_path, engine_path, **kwargs):
+            self.captured.update(kwargs)
+            Path(engine_path).write_bytes(b"engine")
+            return {"precision": kwargs["precision"]}
+
+        api = {
+            "build_engine_from_onnx": build_engine_from_onnx,
+            "profile_from_meta": lambda meta, **kw: ((640, 640), (640, 640), (640, 640)),
+            "get_fp16_op_block": self.arch_policy.get_fp16_op_block,
+            "get_fp16_node_block": self.arch_policy.get_fp16_node_block,
+            "is_fp16_trusted": self.arch_policy.is_fp16_trusted,
+            "get_cast_backend": self.arch_policy.get_cast_backend,
+            "resolve_auto_precision": self.arch_policy.resolve_auto_precision,
+            "modelopt_version": lambda: modelopt,
+            "has_trt_prep": self.arch_policy.has_trt_prep,
+        }
+        original = compile_mod._trt_export
+        compile_mod._trt_export = lambda: api
+        self.addCleanup(lambda: setattr(compile_mod, "_trt_export", original))
+
+        from buildnode import gpu as gpu_mod
+
+        original_describe = gpu_mod.describe
+        gpu_mod.describe = lambda: {
+            "gpu_name": "stub", "compute_capability": None, "driver_version": None,
+        }
+        self.addCleanup(lambda: setattr(gpu_mod, "describe", original_describe))
+
+    def _compile(self, precision):
+        return compile_mod.compile_engine(
+            self.onnx, self.scratch / "model.engine", precision=precision,
+        )
+
+    def test_explicit_fp16_on_an_autocast_arch_uses_autocast(self):
+        self._install_api(modelopt="0.46.0")
+        self._compile("fp16")
+        self.assertEqual(self.captured["cast_backend"], "autocast")
+        self.assertEqual(self.captured["precision"], "fp16")
+
+    def test_explicit_fp16_without_modelopt_is_refused_not_downgraded(self):
+        self._install_api(modelopt=None)
+        with self.assertRaises(compile_mod.CompileError) as caught:
+            self._compile("fp16")
+        self.assertIn("nvidia-modelopt", str(caught.exception))
+        self.assertNotIn("cast_backend", self.captured)
+
+    def test_auto_without_modelopt_falls_back_to_fp32(self):
+        self._install_api(modelopt=None)
+        self._compile("auto")
+        self.assertEqual(self.captured["precision"], "fp32")
+
+    def test_an_ordinary_fp16_arch_still_uses_the_graph_cast(self):
+        (self.scratch / "model.meta.json").write_text('{"arch": "rtdetr"}')
+        self._install_api(modelopt=None)
+        self._compile("fp16")
+        self.assertEqual(self.captured["cast_backend"], "graph_cast")
+        self.assertEqual(self.captured["precision"], "fp16")
 
 
 class TorchFreeTests(unittest.TestCase):

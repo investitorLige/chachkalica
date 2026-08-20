@@ -9,6 +9,7 @@ from friendy_chachkalica.ml.adapters.retinanet import (
     RetinaNetAdapter,
     _build_retinanet_model,
 )
+from friendy_chachkalica.ml.adapters.dfine import DFineAdapter
 from friendy_chachkalica.ml.adapters.ecdet import ECDetAdapter
 from friendy_chachkalica.ml.adapters.rfdetr import RFDETRAdapter
 from friendy_chachkalica.ml.adapters.rtdetr import RTDETRAdapter
@@ -341,6 +342,44 @@ class AdapterResizeRoundTripTests(unittest.TestCase):
         cx, cy, w, h = pred[0, :4].tolist()
         self.assertTrue(all(0.0 <= v <= 1.0 for v in (cx, cy, w, h)), pred[0, :4])
         # Clipped to [90, 90, 100, 100] of a 100x100 image.
+        self.assertTrue(torch.allclose(pred[0, :4], torch.tensor([0.95, 0.95, 0.1, 0.1])))
+
+    def test_dfine_stretches_to_a_square_canvas_with_no_padding(self):
+        # DFineAdapter is a near-verbatim clone of RTDETRAdapter (same shared
+        # transformers-DETR geometry, confirmed against modeling_d_fine.py).
+        adapter = DFineAdapter(
+            model=_DummyDetector(), image_processor=None, num_classes=1, input_max_size=640
+        )
+        image = torch.zeros(3, self.IMAGE_H, self.IMAGE_W)
+        resized, _targets = adapter._resize_training_inputs([image], [self._target()])
+        self.assertEqual(tuple(resized[0].shape[-2:]), (640, 640))
+
+    def test_dfine_labels_normalize_over_the_model_input(self):
+        adapter = DFineAdapter(
+            model=_DummyDetector(), image_processor=None, num_classes=1, input_max_size=640
+        )
+        image = torch.zeros(3, self.IMAGE_H, self.IMAGE_W)
+        resized, targets = adapter._resize_training_inputs([image], [self._target()])
+        labels = adapter._prepare_labels(targets, resized[0].shape[-2:])
+        self.assertTrue(torch.allclose(
+            labels[0]["boxes"], torch.tensor([[0.3, 175.0 / 333.0, 0.4, 250.0 / 333.0]])
+        ))
+
+    def test_dfine_pad_margin_prediction_stays_inside_the_image(self):
+        # Resize disabled: _prepare_batch pads 100x100 up to the 32-multiple
+        # 128x128, and D-FINE's decoder can score a box in that margin (its
+        # padding-blind pixel_mask handling matches RT-DETR's). The result must
+        # still be normalized within [0, 1] against the real image.
+        adapter = DFineAdapter(
+            model=_ConfiguredDetector(),
+            image_processor=_FixedRTPostprocess(torch.tensor([[90.0, 90.0, 120.0, 120.0]])),
+            num_classes=1,
+            input_max_size=None,
+        )
+        pred = adapter.predict([torch.zeros(3, 100, 100)], score_threshold=0.0)[0]
+
+        cx, cy, w, h = pred[0, :4].tolist()
+        self.assertTrue(all(0.0 <= v <= 1.0 for v in (cx, cy, w, h)), pred[0, :4])
         self.assertTrue(torch.allclose(pred[0, :4], torch.tensor([0.95, 0.95, 0.1, 0.1])))
 
     def test_ecdet_stretches_to_a_square_canvas_with_no_padding(self):

@@ -32,8 +32,40 @@ onnx_graphsurgeon
 # engine needs the ONNX graph cast to fp16 first. trt_export/fp16_cast.py uses
 # onnxruntime's float16 converter (already an onnx_export dep) and falls back to
 # onnxconverter_common if present; without either it honestly builds FP32.
-onnxruntime
+#
+# GPU wheel, deliberately: it supersedes the CPU `onnxruntime` from
+# requirements.txt (same `onnxruntime` module, CPUExecutionProvider still
+# present) and is what nvidia-modelopt[onnx] below pulls in anyway. Naming it
+# here rather than letting modelopt drag it in keeps the swap visible, and the
+# Dockerfile uninstalls the CPU wheel in the same layer so exactly one
+# implementation of the module is on disk. It also gives onnx_infer and
+# inferlica/benchmark a CUDAExecutionProvider without the isolated
+# --target install this box used to need.
+onnxruntime-gpu
 # GPU utilization/memory sampling for inferlica/benchmark (NVIDIA's officially
 # maintained wheel; provides the `pynvml` import). GPU-only, hence here and not
 # in the base requirements.txt.
 nvidia-ml-py
+# BF16 engines (and the ModelOpt AutoCast variant of FP16) need NVIDIA Model
+# Optimizer: on strongly-typed TensorRT >= 11 there is no BuilderFlag.BF16 to set,
+# so the precision has to be baked into the ONNX graph, and AutoCast is the route
+# NVIDIA's own 10.x->11.x migration guide points at. See trt_export/modelopt_cast.py.
+#
+# NO LONGER OPTIONAL (2026-08-18). It used to be commented out because only bf16
+# needed it and the install has a real blast radius: it pulls onnxruntime-gpu over
+# onnxruntime (see above) and pins onnx DOWN a minor version (1.22.0 -> 1.21.0),
+# plus onnxscript / onnxslim / polygraphy / cupy. What changed is that AutoCast is
+# now the ONLY trustworthy fp16 route for D-FINE — its blanket-cast fp16 destroys
+# the model (mAP50 0.72/0.25 against torch) while the AutoCast graph reproduces it
+# (0.996/0.983) by keeping the inverse_sigmoid and index-math nodes in fp32, so
+# `precision="auto"` for dfine resolves to fp16 only where this package is
+# installed and floors to fp32 where it is not (trt_export/arch.py's
+# resolve_auto_precision). Leaving it out of the image meant every container
+# rebuild silently cost dfine its 2x engine.
+#
+# Pinned exact for the same reason tensorrt is: AutoCast's data_max node
+# classification is what makes the engine faithful, and that is a property of a
+# specific ModelOpt version — 0.46.0 is the one every number in
+# trt_export/arch.py's dfine block was measured on. Bump deliberately, and re-run
+# ml/trt_export/precision_report.py against torch when you do.
+nvidia-modelopt[onnx]==0.46.0

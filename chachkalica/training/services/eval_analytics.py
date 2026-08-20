@@ -27,10 +27,29 @@ def _num(value):
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
+def _eval_kind_and_id(eval_run) -> tuple[str, int]:
+    """Return ("base"/"pipeline", real-row-pk) for any of the three eval shapes.
+
+    A ``CombinedEval`` union row already carries these (``kind``/``orig_id``);
+    a real ``EvalRun``/``PipelineEvalRun`` doesn't, so it's told apart by
+    whether it has a ``pipeline`` field at all — only ``PipelineEvalRun`` does.
+    Kept duck-typed (no ``eval_pipelines`` import) so this stays the
+    training-side, decoupled module its docstring promises.
+    """
+    kind = getattr(eval_run, "kind", None)
+    if kind is not None:
+        return kind, eval_run.orig_id
+    return ("pipeline" if hasattr(eval_run, "pipeline") else "base"), eval_run.pk
+
+
 def _column(eval_run) -> dict:
     metrics = eval_run.metrics if isinstance(eval_run.metrics, dict) else {}
+    kind, orig_id = _eval_kind_and_id(eval_run)
     return {
         "id": eval_run.pk,
+        "kind": kind,
+        "orig_id": orig_id,
+        "output_dir": getattr(eval_run, "output_dir", "") or "",
         "model": eval_run.trained_model.name,
         "arch": eval_run.trained_model.arch,
         "dataset": eval_run.dataset.name,
@@ -94,6 +113,73 @@ def _class_rows(columns) -> list[dict]:
             "ap50_95": [{"value": v, "is_best": best is not None and v == best} for v in ap],
         })
     return rows
+
+
+_HEADLINE_TILES = [
+    ("map50", "mAP@50", "pct"),
+    ("map50_95", "mAP@50-95", "pct"),
+    ("precision", "Precision", "pct"),
+    ("recall", "Recall", "pct"),
+    ("f1", "F1", "pct"),
+    ("num_images", "Images", "int"),
+    ("num_predictions", "Predictions", "int"),
+    ("num_targets", "Targets", "int"),
+    ("eval_seconds", "Eval time", "time"),
+]
+
+
+def _headline_tiles(metrics: dict) -> list[dict]:
+    return [
+        {"label": label, "value": _num(metrics.get(key)), "kind": kind}
+        for key, label, kind in _HEADLINE_TILES
+    ]
+
+
+def _per_class_rows(metrics: dict) -> list[dict]:
+    """Full per-class metric rows for a single eval's summary display.
+
+    Unlike :func:`_class_rows` (AP only, one column per compared eval), this is
+    for one eval at a time, so it surfaces everything ``per_class`` carries.
+    """
+    per_class = metrics.get("per_class")
+    if not isinstance(per_class, dict):
+        return []
+    rows = [
+        {
+            "class_name": (stats or {}).get("class_name") or str(class_id),
+            "ap50": _num((stats or {}).get("ap50")),
+            "ap50_95": _num((stats or {}).get("ap50_95")),
+            "precision": _num((stats or {}).get("precision")),
+            "recall": _num((stats or {}).get("recall")),
+            "f1": _num((stats or {}).get("f1")),
+            "gt": (stats or {}).get("ground_truth_count"),
+            "pred": (stats or {}).get("prediction_count"),
+        }
+        for class_id, stats in per_class.items()
+    ]
+    rows.sort(key=lambda r: r["class_name"])
+    return rows
+
+
+def summary(eval_run) -> dict:
+    """Single-eval metrics summary for the change_form "metrics" field display.
+
+    Reshapes the raw ``metrics`` JSON into headline tiles, a per-class table, and
+    a confusion matrix (when stored) for
+    ``admin/eval_pipelines/metrics_summary.html`` — the prettified replacement for
+    Django's default one-line ``json.dumps`` readonly rendering.
+    """
+    metrics = eval_run.metrics if isinstance(eval_run.metrics, dict) else {}
+    if not metrics:
+        return {"has_metrics": False}
+    column = _column(eval_run)
+    return {
+        "has_metrics": True,
+        "evaluated_at": column["evaluated_at"],
+        "tiles": _headline_tiles(metrics),
+        "class_rows": _per_class_rows(metrics),
+        "confusion_matrix": _confusion_matrix(column),
+    }
 
 
 def _confusion_matrix(column) -> dict | None:

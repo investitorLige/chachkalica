@@ -9,11 +9,27 @@ from django.contrib.admin.sites import AdminSite
 from django.test import RequestFactory, TestCase
 
 from fleet.models import Dataset, FleetSettings
-from training.models import EvalRun, Experiment, ExperimentDataset, RunResult, TrainingRun
+from training.models import (
+    EvalRun,
+    Experiment,
+    ExperimentDataset,
+    RunResult,
+    TrainedModel,
+    TrainingRun,
+    TrainingSettings,
+)
 from training.services import autoeval, config_gen, ingest, promote, runner
 
 from eval_pipelines.admin import CombinedEvalAdmin
-from eval_pipelines.models import CombinedEval, PipelineEvalRun
+from eval_pipelines.models import (
+    BaseEval,
+    BatchDetectEval,
+    BatchPeopleEval,
+    ChainEval,
+    CombinedEval,
+    PeopleDetectFirstEval,
+    PipelineEvalRun,
+)
 
 
 def _make_dataset_on_disk(source_root: Path, name: str, classes: list[str]) -> None:
@@ -291,3 +307,69 @@ class AutoEvalPipelineTests(TestCase):
         self.assertEqual(
             queue.return_value.enqueue.call_args.args[0], "training.jobs.run_pipeline_eval"
         )
+
+
+class ProxyCleanupTests(TestCase):
+    """Every list an operator actually deletes from is a *proxy* model — Base
+    Eval proxies training.EvalRun, and each per-pipeline list (Batch detect,
+    People detect first, Batch people, Chain) proxies PipelineEvalRun. Django's
+    delete Collector groups instances by the exact class fetched, so a delete
+    made through a proxy's own manager fires post_delete with that proxy as
+    sender, never the concrete model underneath — a receiver registered only
+    on the concrete model silently never cleans up. See eval_pipelines.signals.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.runs_root = self.root / "runs"
+        self.runs_root.mkdir()
+        ts = TrainingSettings.load()
+        ts.runs_root = str(self.runs_root)
+        ts.save()
+
+        self.dataset = Dataset.objects.create(name="ds1")
+        self.model = TrainedModel.objects.create(name="m1", arch="yolox", checkpoint_path="")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _artifacts(self, name):
+        out = self.runs_root / name
+        out.mkdir()
+        (out / "result.yaml").write_text("metrics: {}\n", encoding="utf-8")
+        return out
+
+    def test_deleting_via_base_eval_proxy_cleans_up(self):
+        out = self._artifacts("base-eval-1")
+        ev = BaseEval.objects.create(
+            trained_model=self.model, dataset=self.dataset, output_dir=str(out),
+        )
+        BaseEval.objects.get(pk=ev.pk).delete()
+        self.assertFalse(out.exists())
+
+    def test_deleting_via_each_pipeline_proxy_cleans_up(self):
+        proxies = [
+            (BatchDetectEval, PipelineEvalRun.BATCH_DETECT),
+            (PeopleDetectFirstEval, PipelineEvalRun.PEOPLE_DETECT_FIRST),
+            (BatchPeopleEval, PipelineEvalRun.BATCH_PEOPLE),
+            (ChainEval, PipelineEvalRun.CHAIN),
+        ]
+        for proxy_cls, pipeline in proxies:
+            with self.subTest(proxy=proxy_cls.__name__):
+                out = self._artifacts(f"pipeline-eval-{pipeline}")
+                pe = PipelineEvalRun.objects.create(
+                    trained_model=self.model, dataset=self.dataset, pipeline=pipeline,
+                    output_dir=str(out),
+                )
+                proxy_cls.objects.get(pk=pe.pk).delete()
+                self.assertFalse(out.exists())
+
+    def test_bulk_delete_via_proxy_cleans_up(self):
+        out = self._artifacts("pipeline-eval-bulk")
+        PipelineEvalRun.objects.create(
+            trained_model=self.model, dataset=self.dataset,
+            pipeline=PipelineEvalRun.BATCH_DETECT, output_dir=str(out),
+        )
+        BatchDetectEval.objects.all().delete()
+        self.assertFalse(out.exists())

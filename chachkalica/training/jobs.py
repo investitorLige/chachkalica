@@ -114,6 +114,9 @@ def finalize_success(run: TrainingRun) -> dict:
     summary = ingest.ingest_run(run)
     _mark(run, TrainingRun.OK, finished=True)
 
+    if run.experiment_id and run.experiment.is_finetune:
+        _auto_promote_finetune(run)
+
     # Best-effort: training succeeded, so an auto-eval hiccup must not fail the
     # run. Per-eval build errors are already captured on their EvalRun rows.
     try:
@@ -123,6 +126,30 @@ def finalize_success(run: TrainingRun) -> dict:
         run.save(update_fields=["last_error"])
         return {"status": "ok", "auto_eval_error": str(exc), **summary}
     return {"status": "ok", "auto_evals": queued, **summary}
+
+
+def _auto_promote_finetune(run: TrainingRun) -> None:
+    """Register the fine-tuned checkpoint as a new TrainedModel, no click needed.
+
+    An ordinary experiment leaves promotion to the operator (they may be
+    comparing several archs/datasets and only want the winner registered); a
+    fine-tune run has exactly one architecture and one train dataset by
+    construction (see ``training.services.finetune``), so there is exactly one
+    RunResult to promote — the whole point of "Fine-tune model…" is getting a
+    new model out the other end without an extra step. Skips a RunResult that
+    recorded a training error (``ingest`` still creates the row so the failure
+    is visible); never lets a promotion problem flip an otherwise-OK run to
+    error — it's surfaced on ``last_error`` instead, same as an auto-eval hiccup.
+    """
+    from training.services import promote
+
+    experiment = run.experiment
+    for rr in run.run_results.filter(error=""):
+        try:
+            promote.promote_run_result(rr, name=experiment.name, parent_model=experiment.finetune_source)
+        except Exception as exc:  # noqa: BLE001 - reported, not fatal to the run
+            run.last_error = f"training ok, but auto-promote failed: {exc}"
+            run.save(update_fields=["last_error"])
 
 
 def _mark_eval(eval_run: EvalRun, status: str, *, error: str = "", finished: bool = False):
@@ -373,7 +400,8 @@ def run_export_trt(export_id: int) -> dict:
     input_hw = tuple(run.input_hw) if run.input_hw else None
     try:
         result = runner.export_trt(
-            run.checkpoint_path, run.output_path, precision=run.precision, input_hw=input_hw)
+            run.checkpoint_path, run.output_path, precision=run.precision, input_hw=input_hw,
+            min_batch=run.min_batch, opt_batch=run.opt_batch, max_batch=run.max_batch)
     except Exception as exc:  # noqa: BLE001 - surface service/network errors on the row
         run.status, run.last_error, run.finished_at = ExportRun.ERROR, str(exc), timezone.now()
         run.save(update_fields=["status", "last_error", "finished_at"])

@@ -18,12 +18,14 @@ import yaml
 
 try:
     from ._friendy import (
+        EVAL_HARD_IMAGES_FRACTION,
         DatasetConfig,
         EvaluationConfig,
         ExperimentConfig,
         ModelConfig,
         TrainingConfig,
         _to_builtin,
+        _write_hard_images,
         _write_yaml,
         build_eval_dataloader,
         evaluate_detection,
@@ -40,12 +42,14 @@ try:
     from .registry import build_pipeline
 except ImportError:  # run as a flat script
     from _friendy import (
+        EVAL_HARD_IMAGES_FRACTION,
         DatasetConfig,
         EvaluationConfig,
         ExperimentConfig,
         ModelConfig,
         TrainingConfig,
         _to_builtin,
+        _write_hard_images,
         _write_yaml,
         build_eval_dataloader,
         evaluate_detection,
@@ -310,6 +314,20 @@ def run_combined_pipeline(config) -> Dict[str, Any]:
         f"map50_95={metrics.get('map50_95')} precision={metrics.get('precision')} "
         f"recall={metrics.get('recall')}"
     )
+
+    if config.labels is not None:
+        _write_hard_images(
+            prediction_path,
+            all_predictions,
+            all_targets,
+            records,
+            config=None,
+            prediction_classes=config.classes,
+            target_classes=config.classes,
+            eval_classes=config.classes,
+            score_threshold=config.score_threshold,
+            top_k_fraction=EVAL_HARD_IMAGES_FRACTION,
+        )
 
     output = {
         "pipeline": config.pipeline,

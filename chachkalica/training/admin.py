@@ -35,6 +35,7 @@ from training.models import (
     ExperimentDataset,
     ExperimentModel,
     ExportRun,
+    FineTuningRun,
     RunResult,
     TrainedModel,
     TrainingRun,
@@ -43,8 +44,8 @@ from training.models import (
 from training import model_specs, pipelines
 from training.forms import ExperimentModelForm
 from training.services import (
-    buildnode, combine, config_gen, exports, ingest, pipeline_meta, promote, runner,
-    teardown,
+    buildnode, combine, config_gen, exports, finetune, ingest, pipeline_meta, promote,
+    runner, teardown,
 )
 
 
@@ -189,6 +190,14 @@ class ExperimentAdmin(admin.ModelAdmin):
     class Media:
         js = ("training/experiment_pipeline_form.js",)
 
+    def get_queryset(self, request):
+        # Fine-tune experiments are auto-generated bookkeeping for the "Fine-tune
+        # model…" action on Trained models (see training.services.finetune) — an
+        # operator never builds or edits one by hand, so this tab stays about the
+        # configs they actually author. Its TrainingRun still shows up, just under
+        # "Fine-tuning runs" instead of "Training runs" (see FineTuningRunAdmin).
+        return super().get_queryset(request).filter(is_finetune=False)
+
     def formfield_for_dbfield(self, db_field, request, **kwargs):
         # Offer only pipelines supported end-to-end today (train + val + test):
         # blank = full-frame, plus every pipeline in TRAINABLE_PIPELINES. `chain`
@@ -288,6 +297,12 @@ class TrainingRunAdmin(admin.ModelAdmin):
         # Runs are created by the Experiment action, not by hand.
         return False
 
+    def get_queryset(self, request):
+        # Fine-tune runs live under their own "Fine-tuning runs" tab (see
+        # FineTuningRunAdmin below) so they don't clutter this one — same split
+        # as ExperimentAdmin.get_queryset.
+        return super().get_queryset(request).filter(experiment__is_finetune=False)
+
     @admin.display(description="status", ordering="status")
     def status_badge(self, obj):
         return _status_badge(obj.status)
@@ -317,16 +332,30 @@ class TrainingRunAdmin(admin.ModelAdmin):
             ),
         )
 
+    def _url_name(self, suffix: str) -> str:
+        """A URL name scoped to this ModelAdmin's own model.
+
+        FineTuningRunAdmin subclasses this admin over the FineTuningRun proxy
+        (see training.models.FineTuningRun) rather than overriding get_urls, so
+        deriving the name from ``self.model`` — the same trick Django's own
+        admin uses for its changelist/add/change routes — is what keeps its
+        routes (``training_finetuningrun_live_report`` etc.) distinct from
+        TrainingRunAdmin's, instead of two ``path()`` entries silently sharing
+        one name and ``reverse()`` picking whichever was registered last.
+        """
+        opts = self.model._meta
+        return f"{opts.app_label}_{opts.model_name}_{suffix}"
+
     def get_urls(self):
         custom = [
             path("report/", self.admin_site.admin_view(self.live_report_view),
-                 name="training_trainingrun_live_report"),
+                 name=self._url_name("live_report")),
             path("report/metrics/", self.admin_site.admin_view(self.live_report_metrics),
-                 name="training_trainingrun_live_report_metrics"),
+                 name=self._url_name("live_report_metrics")),
             path("hard-images/image/", self.admin_site.admin_view(self.hard_images_image),
-                 name="training_trainingrun_hard_images_image"),
+                 name=self._url_name("hard_images_image")),
             path("hard-images/data/", self.admin_site.admin_view(self.hard_images_data),
-                 name="training_trainingrun_hard_images_data"),
+                 name=self._url_name("hard_images_data")),
         ]
         return custom + super().get_urls()
 
@@ -337,7 +366,7 @@ class TrainingRunAdmin(admin.ModelAdmin):
             self.message_user(request, "Select exactly one training run.", level=messages.WARNING)
             return None
         run = queryset.first()
-        return redirect(reverse("admin:training_trainingrun_live_report") + "?run=" + str(run.pk))
+        return redirect(reverse(f"admin:{self._url_name('live_report')}") + "?run=" + str(run.pk))
 
     def _hard_image_artifacts(self, run):
         """Return available ``val_hard_images.json`` files for a TrainingRun."""
@@ -420,7 +449,9 @@ class TrainingRunAdmin(admin.ModelAdmin):
             "score_threshold": payload.get("score_threshold"),
             "operating_nms_threshold": payload.get("operating_nms_threshold"),
             "max_display_predictions": payload.get("max_display_predictions"),
-            "metrics_url": reverse("admin:training_trainingrun_live_report_metrics"),
+            "metrics_url": reverse(f"admin:{self._url_name('live_report_metrics')}"),
+            "hard_image_url": reverse(f"admin:{self._url_name('hard_images_image')}"),
+            "hard_image_data_url": reverse(f"admin:{self._url_name('hard_images_data')}"),
             "back_label": "Back to training runs",
         }
         return TemplateResponse(request, "admin/training/live_report.html", context)
@@ -608,6 +639,28 @@ class TrainingRunAdmin(admin.ModelAdmin):
         return TemplateResponse(request, "admin/training/kill_run.html", context)
 
 
+@admin.register(FineTuningRun)
+class FineTuningRunAdmin(TrainingRunAdmin):
+    """"Fine-tuning runs" tab — the same epoch/status/live-report machinery as
+    TrainingRunAdmin, scoped to runs created by TrainedModelAdmin.fine_tune.
+
+    A plain subclass over the FineTuningRun proxy (see training.models): every
+    action, inline, and the live report view/urls (see TrainingRunAdmin._url_name)
+    come along unchanged, just filtered to this one queryset — the whole point
+    is that a fine-tune run gets identical visibility (epochs, metrics, live
+    report) without also cluttering the ordinary Training runs tab.
+    """
+
+    list_display = ["__str__", "finetune_source", "status_badge", "config_yaml_path", "created_at"]
+
+    def get_queryset(self, request):
+        return TrainingRun.objects.filter(experiment__is_finetune=True)
+
+    @admin.display(description="fine-tuned from")
+    def finetune_source(self, obj):
+        return obj.experiment.finetune_source if obj.experiment_id else None
+
+
 @admin.register(RunResult)
 class RunResultAdmin(admin.ModelAdmin):
     list_display = ["run_name", "run", "model_arch", "train_dataset_name",
@@ -744,10 +797,10 @@ class TrainedModelAdmin(admin.ModelAdmin):
     list_filter = ["stage", "arch"]
     search_fields = ["name", "description"]
     actions = [
-        "evaluate", "preview_on_dataset", "export_onnx", "export_trt", "export_pt_bundle",
-        "view_hard_val_images",
+        "evaluate", "fine_tune", "preview_on_dataset", "export_onnx", "export_trt",
+        "export_pt_bundle", "view_hard_val_images",
     ]
-    readonly_fields = ["source_run_result", "created_at", "updated_at"]
+    readonly_fields = ["source_run_result", "parent_model", "created_at", "updated_at"]
 
     @admin.display(description="mAP50")
     def map50(self, obj):
@@ -921,6 +974,120 @@ class TrainedModelAdmin(admin.ModelAdmin):
         }
         return TemplateResponse(request, "admin/training/evaluate_model.html", context)
 
+    @admin.action(description="Fine-tune model…")
+    def fine_tune(self, request, queryset):
+        """Fine-tune one trained model on a new dataset.
+
+        A smaller sibling of ``ExperimentAdmin.generate_run``: pick a dataset
+        (plus an optional val dataset), a handful of training hyperparameters,
+        and an optional freeze-backbone toggle, then hand off to
+        ``training.services.finetune.create_run`` to build the same
+        Experiment/dataset/model/TrainingRun rows the full flow would — pre-
+        seeded with this model's architecture, checkpoint (as a Friendy warm
+        start) and frozen pipeline geometry, so none of that is asked for
+        twice. Unlike an ordinary experiment, the result is auto-promoted
+        straight to a new TrainedModel the moment the run succeeds (see
+        ``jobs.finalize_success``) — watch it under "Fine-tuning runs", not
+        "Training runs".
+        """
+        if queryset.count() != 1:
+            self.message_user(request, "Select exactly one model to fine-tune.",
+                              level=messages.WARNING)
+            return None
+        source = queryset.first()
+        if not source.checkpoint_path:
+            self.message_user(request, f"{source.name} has no checkpoint to fine-tune from.",
+                              level=messages.ERROR)
+            return None
+
+        if request.POST.get("apply"):
+            train_dataset = Dataset.objects.filter(
+                pk=request.POST.get("train_dataset") or None).first()
+            if train_dataset is None:
+                self.message_user(request, "Choose a fine-tune dataset.", level=messages.WARNING)
+                return None
+            label_source = request.POST.get("label_source") or ExperimentDataset.SOURCE
+            annotator = Annotator.objects.filter(pk=request.POST.get("annotator") or None).first()
+            explicit_labels_path = request.POST.get("explicit_labels_path", "")
+            if label_source == ExperimentDataset.ANNOTATOR and annotator is None:
+                self.message_user(request, "Pick an annotator for 'annotator output'.",
+                                  level=messages.WARNING)
+                return None
+            if label_source == ExperimentDataset.EXPLICIT and not explicit_labels_path.strip():
+                self.message_user(request, "Enter an explicit labels path.", level=messages.WARNING)
+                return None
+
+            val_dataset = Dataset.objects.filter(pk=request.POST.get("val_dataset") or None).first()
+            val_label_source = request.POST.get("val_label_source") or ExperimentDataset.SOURCE
+            val_annotator = Annotator.objects.filter(
+                pk=request.POST.get("val_annotator") or None).first()
+            val_explicit_labels_path = request.POST.get("val_explicit_labels_path", "")
+            if val_dataset is not None:
+                if val_label_source == ExperimentDataset.ANNOTATOR and val_annotator is None:
+                    self.message_user(
+                        request, "Pick an annotator for the val dataset's 'annotator output'.",
+                        level=messages.WARNING)
+                    return None
+                if val_label_source == ExperimentDataset.EXPLICIT and not val_explicit_labels_path.strip():
+                    self.message_user(
+                        request, "Enter an explicit labels path for the val dataset.",
+                        level=messages.WARNING)
+                    return None
+
+            early_stopping_patience = _int_or_none(request.POST.get("early_stopping_patience"))
+            if early_stopping_patience is not None and val_dataset is None:
+                self.message_user(
+                    request,
+                    "Early stopping needs a validation dataset — pick one or clear the "
+                    "patience field.",
+                    level=messages.WARNING,
+                )
+                return None
+
+            req = finetune.FineTuneRequest(
+                train_dataset=train_dataset,
+                label_source=label_source,
+                annotator=annotator,
+                explicit_labels_path=explicit_labels_path,
+                val_dataset=val_dataset,
+                val_label_source=val_label_source,
+                val_annotator=val_annotator,
+                val_explicit_labels_path=val_explicit_labels_path,
+                name=(request.POST.get("name") or "").strip(),
+                epochs=_int_or_none(request.POST.get("epochs")) or 20,
+                batch_size=_int_or_none(request.POST.get("batch_size")) or 4,
+                num_workers=_int_or_none(request.POST.get("num_workers")),
+                lr=_float_or_none(request.POST.get("lr")) or 2e-5,
+                freeze_backbone=bool(request.POST.get("freeze_backbone")),
+                early_stopping_patience=early_stopping_patience,
+            )
+            try:
+                run = finetune.create_run(source, req)
+            except (ValueError, FileNotFoundError, RuntimeError) as exc:
+                self.message_user(request, f"Cannot start fine-tuning: {exc}", level=messages.ERROR)
+                return None
+            self.message_user(
+                request,
+                f"Fine-tune run #{run.pk} queued from {source.name!r} on {train_dataset.name}. "
+                "Watch the Fine-tuning runs page for progress — it promotes a new model "
+                "automatically when the run finishes.",
+            )
+            return None
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Fine-tune {source.name}",
+            "source": source,
+            "datasets": Dataset.objects.all(),
+            "annotators": Annotator.objects.filter(status=Annotator.ACTIVE).order_by("username"),
+            "label_source_choices": ExperimentDataset.LABEL_SOURCE_CHOICES,
+            "default_name": f"{source.name}-ft",
+            "action": "fine_tune",
+            "selected": [str(source.pk)],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+        }
+        return TemplateResponse(request, "admin/training/fine_tune.html", context)
+
     @staticmethod
     def _experiment_pipeline_defaults(model) -> dict:
         """The model's frozen pipeline metadata, shaped for a form template.
@@ -1060,6 +1227,33 @@ class TrainedModelAdmin(admin.ModelAdmin):
         """
         return bool(cls._trained_size_hint(checkpoints).get("fp16_trusted", True))
 
+    @classmethod
+    def _auto_precision(cls, checkpoints) -> str:
+        """What ``precision="auto"`` would build for this arch on the trainer.
+
+        Not derivable from ``fp16_trusted`` alone: an arch whose blanket-cast fp16
+        is untrusted can still have a clean fp16 engine via ModelOpt AutoCast (see
+        trt_export/arch/__init__.py's ARCH_CAST_BACKEND), and whether that route is
+        available depends on nvidia-modelopt being installed on the trainer. Falls
+        back to the old fp16_trusted rule when the hint predates this field.
+        """
+        hint = cls._trained_size_hint(checkpoints)
+        value = hint.get("auto_precision")
+        if value in ("fp16", "fp32", "bf16"):
+            return value
+        return "fp16" if hint.get("fp16_trusted", True) else "fp32"
+
+    @classmethod
+    def _batch_aware(cls, checkpoints) -> bool:
+        """Whether this arch's engine decodes a batch profile above 1 correctly.
+
+        Defaults to False when the hint is unavailable (older trainer service, or
+        the hint failed) — the safe direction to guess, since assuming batch-safety
+        it never claimed would let a bad request through instead of just hiding a
+        form field.
+        """
+        return bool(cls._trained_size_hint(checkpoints).get("batch_aware", False))
+
     @admin.action(description="Export best + last to ONNX…")
     def export_onnx(self, request, queryset):
         """Queue a model's best and last ``.pt`` for ONNX export under a chosen directory.
@@ -1164,10 +1358,10 @@ class TrainedModelAdmin(admin.ModelAdmin):
             # follows the flag — never silently upgrade to fp16 for an arch whose
             # fp16 engine is known not to match its fp32 output.
             posted = (request.POST.get("precision") or "").strip()
-            if posted in ("fp16", "fp32"):
+            if posted in ("fp16", "fp32", "bf16", "auto"):
                 precision = posted
             else:
-                precision = "fp16" if self._fp16_trusted(checkpoints) else "fp32"
+                precision = self._auto_precision(checkpoints)
             # An unchecked box posts nothing, so absence *is* the False -- no whitelist
             # needed here, unlike precision above.
             gpu_infer = bool(request.POST.get("gpu_infer"))
@@ -1193,6 +1387,41 @@ class TrainedModelAdmin(admin.ModelAdmin):
                         f"Invalid input size {input_size!r}; use a number (e.g. 640) or HxW "
                         f"(e.g. 640x640).", level=messages.WARNING)
                     return None
+            # Batch profile. Only offered at all when the arch's engine actually
+            # decodes B > 1 correctly (see _batch_aware) — the template hides the
+            # checkbox/range fields otherwise, so an unaware arch always falls
+            # through to the fixed branch at batch_size's default of "1".
+            batch_aware = self._batch_aware(checkpoints)
+            variable_batch = bool(request.POST.get("variable_batch"))
+            if not batch_aware:
+                min_batch = opt_batch = max_batch = 1
+            elif variable_batch:
+                min_raw = (request.POST.get("min_batch") or "").strip()
+                max_raw = (request.POST.get("max_batch") or "").strip()
+                try:
+                    min_batch, max_batch = int(min_raw), int(max_raw)
+                    if min_batch < 1 or max_batch < min_batch:
+                        raise ValueError
+                except ValueError:
+                    self.message_user(
+                        request,
+                        f"Invalid batch range (min={min_raw!r}, max={max_raw!r}); "
+                        f"need 1 <= min <= max.", level=messages.WARNING)
+                    return None
+                opt_batch = max_batch
+            else:
+                batch_raw = (request.POST.get("batch_size") or "1").strip()
+                try:
+                    min_batch = opt_batch = max_batch = int(batch_raw)
+                    if min_batch < 1:
+                        raise ValueError
+                except ValueError:
+                    self.message_user(
+                        request,
+                        f"Invalid batch size {batch_raw!r}; enter a positive integer.",
+                        level=messages.WARNING)
+                    return None
+
             # "Build on": blank = the local trainer (the only option before build
             # nodes existed). A node instead compiles on ITS GPU and returns a whole
             # bundle, which is a different job — see jobs.run_export_remote.
@@ -1207,6 +1436,13 @@ class TrainedModelAdmin(admin.ModelAdmin):
                         level=messages.WARNING)
                     return None
 
+            if node is not None and max_batch > 1:
+                self.message_user(
+                    request,
+                    f"Batch profile (batch {min_batch}-{max_batch}) is ignored for a "
+                    f"remote build node — {node.name} will build batch-1, like every "
+                    f"other bundle it assembles.", level=messages.WARNING)
+
             out_dir = config_gen._resolve(output_dir)
             stem = self._onnx_stem(model.name)
             queue = _queue()
@@ -1217,6 +1453,7 @@ class TrainedModelAdmin(admin.ModelAdmin):
                     checkpoint_path=checkpoint, output_path=str(engine_path),
                     precision=precision, input_hw=list(input_hw) if input_hw else None,
                     gpu_infer=gpu_infer,
+                    min_batch=min_batch, opt_batch=opt_batch, max_batch=max_batch,
                     node=node,
                 )
                 if node is None:
@@ -1228,10 +1465,11 @@ class TrainedModelAdmin(admin.ModelAdmin):
                         jobs.run_export_remote, export_run.pk,
                         job_timeout=jobs.EXPORT_REMOTE_JOB_TIMEOUT)
             where = f"on {node.name}" if node else "on the local trainer"
+            batch_note = f", batch {min_batch}-{max_batch}" if max_batch > 1 else ""
             self.message_user(
                 request,
                 f"Queued {len(checkpoints)} TensorRT export job(s) for {model.name} "
-                f"({precision}) {where} — see Export runs for progress.")
+                f"({precision}{batch_note}) {where} — see Export runs for progress.")
             return None
 
         default_dir = exports.exports_root()
@@ -1240,6 +1478,14 @@ class TrainedModelAdmin(admin.ModelAdmin):
         # Absent (older trainer service, or the hint failed) -> treat as trusted, so
         # the form keeps its historical fp16 default for every other arch.
         fp16_trusted = hint.get("fp16_trusted", True)
+        auto_precision = self._auto_precision(checkpoints)
+        # True when the arch's plain fp16 is on the safety floor but AutoCast
+        # rescues it — the form should then point at fp16, not fp32, and say why.
+        autocast_rescued = not fp16_trusted and auto_precision == "fp16"
+        # Absent -> treat as NOT batch-aware, the opposite direction from fp16_trusted
+        # above: hiding the batch field on a missing hint is safe, defaulting it open
+        # is not (see _batch_aware).
+        batch_aware = hint.get("batch_aware", False)
         context = {
             **self.admin_site.each_context(request),
             "title": f"Export {model.name} to TensorRT",
@@ -1248,6 +1494,9 @@ class TrainedModelAdmin(admin.ModelAdmin):
             "default_output_dir": str(default_dir),
             "default_input_size": f"{trained_size[0]}x{trained_size[1]}" if trained_size else "",
             "fp16_trusted": fp16_trusted,
+            "auto_precision": auto_precision,
+            "autocast_rescued": autocast_rescued,
+            "batch_aware": batch_aware,
             "build_nodes": BuildNode.objects.filter(status=BuildNode.ACTIVE),
             "action": "export_trt",
             "selected": [str(model.pk)],

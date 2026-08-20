@@ -279,10 +279,11 @@ class AsyncEngine:
     def submit_single(self, stacked, index: int) -> EngineOutputs:
         """Enqueue row ``index`` of a stacked batch as a batch of one, without copying it.
 
-        This is the batch-1 passthrough path — rtdetr/rfdetr engines are built with a batch-1
-        profile because their export wrappers index the batch axis away, so N crops must be N
-        executions. Pointing TensorRT at row ``index`` of an existing contiguous buffer avoids
-        re-materializing each crop.
+        This is the batch-1 fallback path — used whenever an engine's own profile caps it at 1
+        (today, that's every arch by default, and always retinanet/fasterrcnn — see
+        ``trt_export.arch.BATCH_AWARE_ARCHS``), so N crops must be N executions. Pointing
+        TensorRT at row ``index`` of an existing contiguous buffer avoids re-materializing each
+        crop.
 
         TensorRT requires an aligned address, and the per-image byte stride is not guaranteed to
         be a multiple of :data:`_ADDRESS_ALIGNMENT` for an arbitrary input size. When it is not,
@@ -363,10 +364,13 @@ class AsyncEngine:
             raw[name] for name in ("boxes", "scores", "labels")
         )
         if boxes.ndim <= 2:
-            # No batch axis: both DETR export wrappers index it away before baking the head
-            # math, so the graph emits [N_queries, 4] and its engine carries a batch-1 profile.
-            # Reading boxes[i] here instead would return detection *zero* and silently discard
-            # every other one -- the bug _split_passthrough documents at session.py:377.
+            # No batch axis: an engine built from the old-style export (batch indexed away
+            # before baking the head math) emits [N_queries, 4] with a batch-1 profile. The
+            # DETR-family exporters carry a real batch dim now (BATCH_AWARE_ARCHS), but an
+            # existing engine doesn't get rebuilt just because the exporter changed, so this
+            # shape is still real. Reading boxes[i] here instead would return detection *zero*
+            # and silently discard every other one -- the bug _split_passthrough documents at
+            # session.py:377.
             if batch != 1:
                 raise RuntimeError(
                     f"passthrough engine returned un-batched outputs (boxes shape "

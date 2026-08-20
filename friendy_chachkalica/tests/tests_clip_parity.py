@@ -50,7 +50,9 @@ class ClipBoxesParityTests(unittest.TestCase):
     def test_the_check_sees_the_archs_it_should(self):
         # A rename that silently emptied the scan would make the test above vacuous.
         found = {arch for arch, _, _ in _arch_modules()}
-        self.assertLessEqual({"rtdetr", "rfdetr", "yolox", "retinanet", "ecdet"}, found)
+        self.assertLessEqual(
+            {"rtdetr", "rfdetr", "yolox", "retinanet", "ecdet", "dfine"}, found
+        )
 
 
 if __name__ == "__main__":

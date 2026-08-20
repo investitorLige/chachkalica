@@ -31,6 +31,7 @@ from friendy_chachkalica.ml.onnx_export.arch.yolox import export_yolox  # noqa: 
 from friendy_chachkalica.ml.onnx_export.arch.rtdetr import export_rtdetr  # noqa: E402
 from friendy_chachkalica.ml.onnx_export.arch.rfdetr import export_rfdetr  # noqa: E402
 from friendy_chachkalica.ml.onnx_export.arch.ecdet import export_ecdet  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.dfine import export_dfine  # noqa: E402
 from onnx_infer import load_onnx_adapter  # noqa: E402
 
 
@@ -395,3 +396,95 @@ def test_ecdet_parity(ecdet_export, hw):
     # boxes whose sigmoid-decoded centres can push past the canvas edge, and
     # to_friendy must clamp them to [0,1] exactly as the adapter's clip_xyxy does.
     _assert_parity(torch_pred, onnx_pred, min_dets=20, atol=5e-3)
+
+
+# --------------------------------------------------------------------------- D-FINE
+
+
+@pytest.fixture(scope="module")
+def dfine_export(tmp_path_factory):
+    pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    # From scratch, offline, at a small canvas for speed (320 is a multiple of the
+    # encoder's stride 32).
+    adapter = build_model("dfine", num_classes=3, weights=None, input_max_size=320)
+    # Same de-tying surgery, and for the same reason, as the rtdetr fixture above:
+    # a random-init D-FINE's untrained `enc_score_head` gives every encoder proposal
+    # the identical constant score, so the encoder's `topk(..., num_queries)` runs on
+    # a fully-tied field that torch and onnxruntime break differently. That is tie
+    # ambiguity, not an export defect. D-FINE inherits this from RT-DETR verbatim
+    # (`DFineModel.forward`'s two-stage query selection).
+    inner = adapter.model.model
+    torch.nn.init.normal_(inner.enc_score_head.weight, mean=0.0, std=0.2)
+    torch.nn.init.constant_(inner.enc_score_head.bias, 0.0)
+    torch.nn.init.normal_(inner.decoder.class_embed[-1].weight, mean=0.0, std=0.15)
+    torch.nn.init.constant_(inner.decoder.class_embed[-1].bias, -2.0)
+    adapter.eval()
+    out_dir = tmp_path_factory.mktemp("dfine")
+    onnx_path = out_dir / "model.onnx"
+    meta = export_dfine(
+        adapter, num_classes=3, params={},
+        class_map={0: "a", 1: "b", 2: "c"}, onnx_path=onnx_path,
+    )
+    onnx_path.with_suffix(".meta.json").write_text(json.dumps(meta))
+    return adapter, onnx_path
+
+
+@pytest.mark.parametrize(
+    "hw",
+    [
+        (320, 320),  # already on the canvas: no resize at all
+        (240, 320),  # landscape: per-axis stretch (one axis already on the canvas)
+        (256, 256),  # square: uniform upscale
+        (400, 300),  # both axes stretched, one down and one up
+    ],
+)
+def test_dfine_parity(dfine_export, hw):
+    adapter, onnx_path = dfine_export
+    onnx_adapter, info = load_onnx_adapter(onnx_path, "cpu")
+    assert info["num_classes"] == 3
+
+    torch.manual_seed(1)
+    image = torch.rand(3, *hw)
+    # Compare the full post-top-k set (threshold 0) rather than the handful above a
+    # positive floor: a random-init D-FINE's prior-biased head keeps every score
+    # low, and the full set is the richer check of box decode + top-k + the
+    # normalized-coords and clip contracts anyway.
+    threshold = 0.0
+    torch_pred = adapter.predict([image], score_threshold=threshold)[0].detach().cpu().numpy()
+    onnx_pred = onnx_adapter.predict([image], score_threshold=threshold)[0].detach().cpu().numpy()
+
+    _assert_parity(torch_pred, onnx_pred, min_dets=20, atol=5e-3)
+
+
+def test_dfine_export_honours_a_dynamic_input_size(dfine_export):
+    """The exported graph really is dynamic in H/W, not a 320-shaped constant.
+
+    D-FINE's encoder anchor grid comes from an ``lru_cache``d ``generate_anchors``
+    keyed on the feature-map spatial shape, which looks exactly like the build-time
+    anchor caching that forces ecdet's export static. It isn't — the cache key is
+    the *traced* shape and the grid arithmetic traces symbolically — but the two are
+    indistinguishable from the exporter's side, so pin it with a test: feed the
+    graph a size it was not traced at and it must still track torch. Were the
+    anchors baked, the boxes would be silently wrong here rather than raise.
+    """
+    onnxruntime = pytest.importorskip("onnxruntime")
+    adapter, onnx_path = dfine_export
+    session = onnxruntime.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+
+    off_canvas = 256  # the fixture traced at 320
+    torch.manual_seed(2)
+    pixel_values = torch.rand(1, 3, off_canvas, off_canvas)
+    onnx_boxes = session.run(None, {"pixel_values": pixel_values.numpy()})[0][0]
+
+    with torch.no_grad():
+        out = adapter.model(pixel_values=pixel_values)
+    scores = torch.sigmoid(out.logits[0]).flatten()
+    num_queries, num_classes = out.logits.shape[1], out.logits.shape[2]
+    _, top_idx = torch.topk(scores, num_queries)
+    cxcywh = out.pred_boxes[0][top_idx // num_classes]
+    cx, cy, w, h = cxcywh.unbind(-1)
+    torch_boxes = torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1).numpy()
+
+    assert onnx_boxes.shape == torch_boxes.shape
+    assert np.abs(onnx_boxes - torch_boxes).max() <= 1e-4

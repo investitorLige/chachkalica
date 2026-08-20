@@ -1,0 +1,144 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Fine-tune <strong>{{ source.name }}</strong> ({{ source.arch }}) on a new dataset.</p>
+<p class="help">Starts from <code>{{ source.checkpoint_path }}</code> as a Friendy warm start,
+and trains through the same chachak pipeline this model was originally trained with — that
+geometry is carried over automatically, not asked for again. When the run finishes, a new
+model is registered on the Trained models page automatically (see it under
+<em>Fine-tuning runs</em>, not <em>Training runs</em>) — no separate "Promote" step.</p>
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="apply" value="1">
+
+  <div class="form-row">
+    <label for="name">Fine-tuned model name:</label>
+    <input type="text" name="name" id="name" size="50" value="{{ default_name }}">
+    <p class="help">Also the auto-generated experiment's name. Blank uses
+    <code>{{ default_name }}</code>.</p>
+  </div>
+
+  <h3>Fine-tune dataset</h3>
+
+  <div class="form-row">
+    <label for="train_dataset">Dataset:</label>
+    <select name="train_dataset" id="train_dataset" required>
+      <option value="">— select a dataset —</option>
+      {% for d in datasets %}<option value="{{ d.pk }}">{{ d.name }}</option>{% endfor %}
+    </select>
+    <p class="help">Trains on this dataset, warm-started from the model's current weights.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="label_source">Label source:</label>
+    <select name="label_source" id="label_source">
+      {% for value, label in label_source_choices %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+    </select>
+    <p class="help">Where the ground-truth labels come from: the dataset's own source
+    labels, a specific annotator's output, or an explicit labels path.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="annotator">Annotator:</label>
+    <select name="annotator" id="annotator">
+      <option value="">—</option>
+      {% for a in annotators %}<option value="{{ a.pk }}">{{ a.username }}</option>{% endfor %}
+    </select>
+    <p class="help">Only used when <em>Label source</em> is "annotator output".</p>
+  </div>
+
+  <div class="form-row">
+    <label for="explicit_labels_path">Explicit labels path:</label>
+    <input type="text" name="explicit_labels_path" id="explicit_labels_path" size="60">
+    <p class="help">Only used when <em>Label source</em> is "explicit path".</p>
+  </div>
+
+  <h3>Validation dataset <span class="help">(optional)</span></h3>
+  <p class="help">Needed for early stopping and for tracking a best-epoch checkpoint by
+  metric rather than just training every epoch requested. Leave blank to skip both.</p>
+
+  <div class="form-row">
+    <label for="val_dataset">Val dataset:</label>
+    <select name="val_dataset" id="val_dataset">
+      <option value="">— none —</option>
+      {% for d in datasets %}<option value="{{ d.pk }}">{{ d.name }}</option>{% endfor %}
+    </select>
+  </div>
+
+  <div class="form-row">
+    <label for="val_label_source">Val label source:</label>
+    <select name="val_label_source" id="val_label_source">
+      {% for value, label in label_source_choices %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+    </select>
+  </div>
+
+  <div class="form-row">
+    <label for="val_annotator">Val annotator:</label>
+    <select name="val_annotator" id="val_annotator">
+      <option value="">—</option>
+      {% for a in annotators %}<option value="{{ a.pk }}">{{ a.username }}</option>{% endfor %}
+    </select>
+    <p class="help">Only used when <em>Val label source</em> is "annotator output".</p>
+  </div>
+
+  <div class="form-row">
+    <label for="val_explicit_labels_path">Val explicit labels path:</label>
+    <input type="text" name="val_explicit_labels_path" id="val_explicit_labels_path" size="60">
+    <p class="help">Only used when <em>Val label source</em> is "explicit path".</p>
+  </div>
+
+  <h3>Hyperparameters</h3>
+
+  <div class="form-row">
+    <label for="epochs">Epochs:</label>
+    <input type="number" name="epochs" id="epochs" min="1" step="1" value="20">
+  </div>
+
+  <div class="form-row">
+    <label for="batch_size">Batch size:</label>
+    <input type="number" name="batch_size" id="batch_size" min="1" step="1" value="4">
+  </div>
+
+  <div class="form-row">
+    <label for="num_workers">DataLoader workers:</label>
+    <input type="number" name="num_workers" id="num_workers" min="0" step="1" value="4">
+    <p class="help">Parallel data-loading processes. Each holds batches in the container's
+    shared memory (<code>/dev/shm</code>) — a high worker count times a large batch size
+    can exhaust it and hang the run stuck at "running" instead of erroring cleanly. Lower
+    this if that happens.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="lr">Learning rate:</label>
+    <input type="number" name="lr" id="lr" min="0" step="any" value="0.00002">
+    <p class="help">Fine-tuning usually wants a lower learning rate than training from
+    scratch — this defaults an order of magnitude below a fresh experiment's default.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="freeze_backbone">Freeze backbone:</label>
+    <input type="checkbox" name="freeze_backbone" id="freeze_backbone">
+    <p class="help">Train only the detection head and leave the backbone as-is. Worth
+    trying when the fine-tune dataset is small — it trains faster and is less prone to
+    overfitting, at the cost of not adapting the backbone's features to the new data.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="early_stopping_patience">Early stopping patience:</label>
+    <input type="number" name="early_stopping_patience" id="early_stopping_patience" min="1" step="1">
+    <p class="help">Stop after this many scored epochs with no best-metric improvement (the
+    best checkpoint is kept). Blank trains every epoch requested above. Needs a validation
+    dataset.</p>
+  </div>
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Start fine-tuning">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+{% endblock %}

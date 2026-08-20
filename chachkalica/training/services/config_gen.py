@@ -106,22 +106,29 @@ def augmentation_entry(exp_dataset: ExperimentDataset) -> dict:
     return augmentation
 
 
-# rtdetr's encoder runs topk(num_queries) over its feature-pyramid tokens, so
-# num_queries must not exceed that token count or the forward pass crashes
-# ("selected index k out of range"). The adapter stretches every crop onto a
-# square canvas fixed by input_max_size (see
-# RTDETRAdapter._resize_image_with_scale), so the crash floor is a function of
-# input_max_size, NOT the raw crop size: model_entry below
-# enforces input_max_size >= input_size_multiple * ceil(sqrt(num_queries)), which
-# makes the coarsest (stride input_size_multiple) level alone clear num_queries
-# with margin. 25 is kept low anyway — HF's own default (300) assumes near-full-
-# frame subjects with many objects, whereas 25 comfortably covers the handful of
-# PPE items on one person crop. This replaces the old coupling to detector_min_box_size,
-# which floored the *crop* size back when crops were fed at native resolution.
-# Only injected for people_detect_first (see model_entry) — other pipelines
-# don't hit this mismatch (batch_people's tiles are already sized generously;
-# full-frame training was never undersized to begin with).
+# rtdetr's (and dfine's — same HF hybrid encoder/two-stage topk, confirmed
+# against modeling_d_fine.py) encoder runs topk(num_queries) over its
+# feature-pyramid tokens, so num_queries must not exceed that token count or the
+# forward pass crashes ("selected index k out of range"). The adapter stretches
+# every crop onto a square canvas fixed by input_max_size (see
+# RTDETRAdapter._resize_image_with_scale / DFineAdapter's twin), so the crash
+# floor is a function of input_max_size, NOT the raw crop size: model_entry
+# below enforces input_max_size >= input_size_multiple * ceil(sqrt(num_queries)),
+# which makes the coarsest (stride input_size_multiple) level alone clear
+# num_queries with margin. 25 is kept low anyway — HF's own default (300)
+# assumes near-full-frame subjects with many objects, whereas 25 comfortably
+# covers the handful of PPE items on one person crop. This replaces the old
+# coupling to detector_min_box_size, which floored the *crop* size back when
+# crops were fed at native resolution. Only injected for people_detect_first
+# (see model_entry) — other pipelines don't hit this mismatch (batch_people's
+# tiles are already sized generously; full-frame training was never undersized
+# to begin with). Name kept rtdetr-specific for history; the value and mechanism
+# are shared with dfine, not rtdetr-only.
 PEOPLE_DETECT_FIRST_RTDETR_NUM_QUERIES_DEFAULT = 25
+
+# Archs whose HF-style hybrid encoder does the topk(num_queries) two-stage
+# selection above, and so need the people_detect_first guard below.
+_TOPK_ENCODER_ARCHS = (ExperimentModel.RTDETR, ExperimentModel.DFINE)
 
 
 def model_entry(exp_model: ExperimentModel, pipeline_name: str | None = None) -> dict:
@@ -129,16 +136,16 @@ def model_entry(exp_model: ExperimentModel, pipeline_name: str | None = None) ->
 
     The ``pretrained`` checkbox maps to ``weights: true`` — every adapter reads
     ``weights=True`` as "load the published COCO-pretrained weights" (retinanet,
-    rtdetr, yolox, rfdetr, fasterrcnn, ecdet). An explicit ``weights`` in ``params``
-    (e.g. a path, URL, or ecdet's ``backbone`` sentinel) is left untouched and wins
-    over the checkbox.
+    rtdetr, yolox, rfdetr, fasterrcnn, ecdet; dfine reads it as its own default
+    checkpoint too). An explicit ``weights`` in ``params`` (e.g. a path, URL, or
+    ecdet's ``backbone`` sentinel) is left untouched and wins over the checkbox.
 
     ``pipeline_name`` is the owning experiment's pipeline, passed by
     :func:`build_experiment_dict` (``None`` for standalone/test callers, which
-    skips the injection below). For an rtdetr model on people_detect_first, an
-    explicit ``params["num_queries"]`` always wins; otherwise
-    :data:`PEOPLE_DETECT_FIRST_RTDETR_NUM_QUERIES_DEFAULT` is injected so the
-    run doesn't crash on RT-DETR's un-cropped-frame default of 300.
+    skips the injection below). For an rtdetr or dfine model on
+    people_detect_first, an explicit ``params["num_queries"]`` always wins;
+    otherwise :data:`PEOPLE_DETECT_FIRST_RTDETR_NUM_QUERIES_DEFAULT` is injected
+    so the run doesn't crash on their shared un-cropped-frame default of 300.
     """
     params = dict(exp_model.params or {})
     entry = {
@@ -149,7 +156,7 @@ def model_entry(exp_model: ExperimentModel, pipeline_name: str | None = None) ->
     if exp_model.pretrained and "weights" not in params:
         entry["weights"] = True
     if (
-        exp_model.arch == ExperimentModel.RTDETR
+        exp_model.arch in _TOPK_ENCODER_ARCHS
         and pipeline_name == pipelines.PEOPLE_DETECT_FIRST
     ):
         if "num_queries" not in params:

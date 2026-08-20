@@ -60,7 +60,18 @@ def main() -> None:
         help="Precision to attempt across every format: TensorRT engine build, PT via "
         "torch.autocast (skipped per-adapter if supports_amp=False), and ONNX via a graph-level "
         "fp16 cast run through onnxruntime's CUDA execution provider (falls back to fp32 for any "
-        "of the three if that format's fp16 path isn't available; see the CSV's precision row)",
+        "of the three if that format's fp16 path isn't available; see the CSV's precision row). "
+        "An arch on the fp16 safety floor (UNTRUSTED_FP16) is swept at fp32 regardless, EXCEPT "
+        "its engine row when the arch has a trustworthy AutoCast fp16 route (ARCH_CAST_BACKEND -- "
+        "dfine) -- see --allow-untrusted-fp16 and resolve_cell_precision",
+    )
+    parser.add_argument(
+        "--allow-untrusted-fp16", action="store_true",
+        help="Let --precision fp16 apply even to an arch in UNTRUSTED_FP16, whose blanket-cast fp16 "
+        "fails the trained-checkpoint parity gate and therefore never ships (ecdet, and dfine's "
+        ".pt/.onnx -- dfine's ENGINE ships fp16 via ModelOpt AutoCast and is swept fp16 anyway). "
+        "so the sweep reports precisions that are actually deployable; turn it on to answer 'what "
+        "would fp16 save if the parity break got fixed?' -- a speed-only number, not a shippable one.",
     )
     parser.add_argument("--workspace-gb", type=float, default=4.0, help="TensorRT builder workspace (default: 4.0)")
     parser.add_argument(
@@ -87,10 +98,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--follow-image-size", action="store_true",
-        help="Make rfdetr, yolox AND ecdet follow --image-size too. All three have an architectural "
-        "input size (rfdetr's per-variant resolution, yolox's and ecdet's fixed canvas) that otherwise "
-        "ignores --image-size; with this flag rfdetr is rebuilt at the nearest valid resolution "
-        "(multiples of 32, or 56 for base) and yolox/ecdet at the size directly (multiple of 32). "
+        help="Make rfdetr, yolox, ecdet AND dfine follow --image-size too. All four have an "
+        "architectural/exported input size (rfdetr's per-variant resolution, yolox's, ecdet's and "
+        "dfine's square canvas) that otherwise ignores --image-size; with this flag rfdetr is rebuilt "
+        "at the nearest valid resolution (multiples of 32, or 56 for base) and yolox/ecdet/dfine at "
+        "the size directly (multiple of 32). "
         "fasterrcnn/rtdetr/retinanet follow via their static engine profile regardless. Leave off to "
         "keep native sizes.",
     )
@@ -118,6 +130,7 @@ def main() -> None:
         variant_names=args.variants,
         min_duration_s=args.gpu_util_min_duration_s,
         follow_image_size=args.follow_image_size,
+        allow_untrusted_fp16=args.allow_untrusted_fp16,
     )
 
     print("\n=== benchmark summary ===")

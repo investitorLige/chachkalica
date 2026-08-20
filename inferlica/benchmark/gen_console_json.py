@@ -110,6 +110,7 @@ def _build_data(dataframes: dict) -> dict:
                 "status": _text(cell("status")),
                 "reason": _text(cell("status_reason")) or None,
                 "precision": _text(cell("precision")),
+                "params": _num(cell("num_params")),
                 "eval_s": _num(cell("eval_seconds")),
                 "fps": _num(cell("fps")),
                 "mem": _num(cell("gpu_mem_mb_peak")),
@@ -117,7 +118,22 @@ def _build_data(dataframes: dict) -> dict:
                 "util_peak": _num(cell("gpu_util_pct_peak")),
                 "method": _text(cell("gpu_util_method")) or None,
             }
-        out[arch] = {"variants": variants, "nms": NMS_STATUS[arch], "cells": cells}
+
+        # One param count per variant, not per cell -- pt/onnx/engine all build
+        # the same PT adapter first (see core.benchmark_cell), so their
+        # "params" values agree whenever more than one format succeeded; this
+        # picks whichever format's cell actually has a number, preferring pt,
+        # so the console's per-variant header doesn't need to know which
+        # formats ran.
+        params_by_variant = {}
+        for variant in variants:
+            for fmt in ("pt", "onnx", "engine"):
+                value = cells.get(f"{variant}__{fmt}", {}).get("params")
+                if value is not None:
+                    params_by_variant[variant] = value
+                    break
+
+        out[arch] = {"variants": variants, "nms": NMS_STATUS[arch], "params": params_by_variant, "cells": cells}
     return out
 
 
@@ -157,6 +173,13 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--precision", choices=["fp16", "fp32"], default="fp16")
+    parser.add_argument(
+        "--allow-untrusted-fp16", action="store_true",
+        help="Publish fp16 numbers even for an arch in UNTRUSTED_FP16, whose fp16 export fails the "
+        "trained-checkpoint parity gate and so never ships (ecdet, and dfine's .pt/.onnx -- dfine's "
+        "engine ships AutoCast fp16 and is swept fp16 without this flag). Off by default: the "
+        "console's rows are meant to describe deployable configurations.",
+    )
     parser.add_argument("--workspace-gb", type=float, default=4.0)
     parser.add_argument("--gpu-poll-interval-ms", type=float, default=4.0)
     parser.add_argument("--gpu-util-min-duration-s", type=float, default=2.0)
@@ -219,6 +242,7 @@ def main() -> None:
             force_rebuild=args.force_rebuild,
             min_duration_s=args.gpu_util_min_duration_s,
             follow_image_size=follow,
+            allow_untrusted_fp16=args.allow_untrusted_fp16,
         )
         data = _build_data(result["dataframes"])
         out_path = args.output_dir / f"{size}.json"

@@ -661,6 +661,24 @@ class ECTransformer(nn.Module):
 
         enc_outputs_logits :torch.Tensor = self.enc_score_head(memory)
 
+        # Invalid (near-edge) anchor positions must never win top-k selection,
+        # independent of numeric precision. Zeroing `memory` above only zeroes the
+        # score head's *input*; its bias term still yields a finite score there, so
+        # top-k could in principle still pick an invalid position (its decoded box
+        # would then depend on the anchor's `torch.inf` sentinel from
+        # `_generate_anchors`, which an fp16 ONNX cast clamps to a finite 65504 via
+        # `fp16_cast._clamp_large_constants` — a genuine fp32-vs-fp16 structural
+        # difference at that slot, see UNTRUSTED_FP16 in trt_export/arch/__init__.py).
+        # Masking the score directly removes invalid slots from selection
+        # structurally — a hard exclusion, not a numeric coincidence of one
+        # checkpoint's bias — so the anchor sentinel can never reach the output at
+        # all, regardless of which value it holds or which checkpoint is loaded.
+        # -1e4 (not -inf) is deliberate: real trained logits stay within a few tens
+        # (bias_init_with_prob keeps the head's prior small), so this needs no
+        # margin anywhere near fp16's range, and a finite constant needs no clamp
+        # of its own to stay well-formed under an fp16 cast.
+        enc_outputs_logits = enc_outputs_logits.masked_fill(~valid_mask, -1e4)
+
         # select topk queries
         enc_topk_memory, enc_topk_logits, enc_topk_anchors = \
             self._select_topk(memory, enc_outputs_logits, anchors, self.num_queries)

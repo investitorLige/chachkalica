@@ -1,0 +1,75 @@
+<!-- Fragment: rendered via render_to_string() and returned mark_safe from
+     eval_pipelines.admin's "metrics" readonly-field display method. Not a full
+     page — no template inheritance, styling lives in metrics_summary.css. -->
+<div class="ev-metrics">
+  {% if not has_metrics %}
+    <p class="ev-metrics-empty">No metrics ingested yet.</p>
+  {% else %}
+    <div class="ev-metrics-tiles">
+      {% for tile in tiles %}
+        <div class="ev-metrics-tile{% if tile.value is None %} na{% endif %}">
+          <div class="v">
+            {% if tile.value is None %}&mdash;
+            {% elif tile.kind == "pct" %}{{ tile.value|floatformat:4 }}
+            {% elif tile.kind == "time" %}{{ tile.value|floatformat:1 }}s
+            {% else %}{{ tile.value|floatformat:0 }}{% endif %}
+          </div>
+          <div class="l">{{ tile.label }}</div>
+        </div>
+      {% endfor %}
+    </div>
+    {% if evaluated_at %}<p class="ev-metrics-meta">Evaluated {{ evaluated_at }}</p>{% endif %}
+
+    {% if class_rows %}
+      <table class="ev-metrics-classes">
+        <thead>
+          <tr>
+            <th class="rowlabel">Class</th>
+            <th>AP@50</th><th>AP@50-95</th><th>Precision</th><th>Recall</th><th>F1</th>
+            <th>GT</th><th>Pred</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in class_rows %}
+            <tr>
+              <td class="rowlabel">{{ row.class_name }}</td>
+              <td>{% if row.ap50 is None %}&mdash;{% else %}{{ row.ap50|floatformat:4 }}{% endif %}</td>
+              <td>{% if row.ap50_95 is None %}&mdash;{% else %}{{ row.ap50_95|floatformat:4 }}{% endif %}</td>
+              <td>{% if row.precision is None %}&mdash;{% else %}{{ row.precision|floatformat:4 }}{% endif %}</td>
+              <td>{% if row.recall is None %}&mdash;{% else %}{{ row.recall|floatformat:4 }}{% endif %}</td>
+              <td>{% if row.f1 is None %}&mdash;{% else %}{{ row.f1|floatformat:4 }}{% endif %}</td>
+              <td>{% if row.gt is None %}&mdash;{% else %}{{ row.gt }}{% endif %}</td>
+              <td>{% if row.pred is None %}&mdash;{% else %}{{ row.pred }}{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+
+    {% if confusion_matrix %}
+      <p class="ev-metrics-cm-label">Confusion matrix
+        {% if confusion_matrix.iou_threshold %} &middot; matched at IoU &ge; {{ confusion_matrix.iou_threshold }}{% endif %}
+        {% if confusion_matrix.conf_threshold %}, confidence &ge; {{ confusion_matrix.conf_threshold }}{% endif %}
+      </p>
+      <table class="ev-metrics-cmx">
+        <thead>
+          <tr>
+            <th class="corner">truth &#65340; pred</th>
+            {% for label in confusion_matrix.axis %}<th>{{ label }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in confusion_matrix.rows %}
+            <tr>
+              <th class="rowlabel">{{ row.label }}</th>
+              {% for cell in row.cells %}
+                <td class="{% if cell.is_diagonal %}diag{% else %}cmcell{% endif %}{% if cell.value == 0 %} zero{% endif %}"
+                    style="--i: {{ cell.intensity }}">{{ cell.value }}</td>
+              {% endfor %}
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  {% endif %}
+</div>

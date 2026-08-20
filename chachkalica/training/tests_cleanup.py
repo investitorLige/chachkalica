@@ -5,15 +5,21 @@ its output_dir and generated YAML under the configured roots — but never touch
 anything outside them.
 """
 
+import shutil
 import tempfile
+import uuid
 from pathlib import Path
 
+from django.conf import settings
 from django.test import TestCase
 
 from fleet.models import Dataset
 from training.models import (
     EvalRun,
     Experiment,
+    ExportRun,
+    FineTuningRun,
+    RunResult,
     TrainedModel,
     TrainingRun,
     TrainingSettings,
@@ -99,3 +105,72 @@ class CleanupTests(TestCase):
         ev.delete()
         self.assertFalse(out.exists())
         self.assertFalse(req.exists())
+
+    def test_deleting_via_finetuning_run_proxy_still_cleans_up(self):
+        """FineTuningRun is a proxy of TrainingRun (same table, see its
+        docstring) — Django's delete Collector groups instances by the exact
+        class a queryset/instance was fetched as, so a delete made through the
+        proxy manager (the "Fine-tuning runs" tab) fires post_delete with
+        sender=FineTuningRun, never sender=TrainingRun. Without a matching
+        receiver this silently never cleans up — regression coverage for
+        that gap."""
+        run, out, cfg = self._make_run("ft-run")
+        FineTuningRun.objects.get(pk=run.pk).delete()
+        self.assertFalse(out.exists())
+        self.assertFalse(cfg.exists())
+
+    def test_deleting_run_result_removes_its_run_dir(self):
+        run, out, _ = self._make_run("run-with-results")
+        run_dir = out / "00-yolox"
+        self.assertTrue(run_dir.is_dir())
+        rr = RunResult.objects.create(run=run, run_name="00-yolox", run_dir=str(run_dir))
+        rr.delete()
+        self.assertFalse(run_dir.exists())
+        self.assertTrue(out.exists(), "the parent run's own dir must survive")
+
+    def test_deleting_trained_model_removes_its_checkpoint(self):
+        ckpt = self.runs_root / "some-run" / "best.pt"
+        ckpt.parent.mkdir(parents=True)
+        ckpt.write_bytes(b"weights")
+        model = TrainedModel.objects.create(name="m1", arch="yolox", checkpoint_path=str(ckpt))
+        model.delete()
+        self.assertFalse(ckpt.exists())
+
+    def test_deleting_trained_model_refuses_checkpoint_outside_runs_root(self):
+        model = TrainedModel.objects.create(name="m2", arch="yolox",
+                                            checkpoint_path="/tmp/best.pt")
+        model.delete()  # must not raise, must not touch a path outside runs_root
+
+    def test_deleting_export_run_removes_output_and_bundle_dir(self):
+        # output_path/bundle_dir come from an operator-chosen directory (the
+        # export forms' "output_dir" field), not one fixed TrainingSettings
+        # root, so cleanup guards against the project root instead — exercise
+        # that with a scratch dir actually under it, not an arbitrary tmp dir.
+        out_dir = Path(settings.BASE_DIR) / f"_cleanup_test_{uuid.uuid4().hex}"
+        self.addCleanup(shutil.rmtree, out_dir, ignore_errors=True)
+        out_dir.mkdir()
+        model = TrainedModel.objects.create(name="m3", arch="yolox", checkpoint_path="")
+        onnx_path = out_dir / "m3-best.onnx"
+        onnx_path.write_bytes(b"onnx")
+        bundle_dir = out_dir / "m3-best-bundle"
+        (bundle_dir / "models").mkdir(parents=True)
+        export = ExportRun.objects.create(
+            model=model, kind=ExportRun.ONNX, checkpoint_label="best",
+            checkpoint_path=str(onnx_path), output_path=str(onnx_path),
+            bundle_dir=str(bundle_dir),
+        )
+        export.delete()
+        self.assertFalse(onnx_path.exists())
+        self.assertFalse(bundle_dir.exists())
+
+    def test_deleting_export_run_refuses_path_outside_project_root(self):
+        model = TrainedModel.objects.create(name="m4", arch="yolox", checkpoint_path="")
+        outside = self.root / "outside-exports" / "m4-best.onnx"
+        outside.parent.mkdir(parents=True)
+        outside.write_bytes(b"onnx")
+        export = ExportRun.objects.create(
+            model=model, kind=ExportRun.ONNX, checkpoint_label="best",
+            checkpoint_path=str(outside), output_path=str(outside),
+        )
+        export.delete()
+        self.assertTrue(outside.exists(), "must not delete paths outside the project root")

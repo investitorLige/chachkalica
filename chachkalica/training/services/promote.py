@@ -19,6 +19,7 @@ from training.services import config_gen, pipeline_meta
 
 def promote_run_result(
     run_result: RunResult, *, name: str | None = None, stage: str = TrainedModel.DEV,
+    parent_model: TrainedModel | None = None,
 ) -> TrainedModel:
     checkpoint = run_result.best_checkpoint or run_result.last_checkpoint
     if not checkpoint:
@@ -45,4 +46,5 @@ def promote_run_result(
             getattr(run_result.run, "experiment", None)
         ),
         source_run_result=run_result,
+        parent_model=parent_model,
     )

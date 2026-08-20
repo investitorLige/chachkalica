@@ -12,16 +12,26 @@ action, and a "Promote predictions to source labels" action that turns a finishe
 run's predictions into the dataset's source-of-truth labels.
 """
 
+import json
+from pathlib import Path
+
 import django_rq
 from django.contrib import admin, messages
 from django.contrib.admin.helpers import ACTION_CHECKBOX_NAME
+from django.http import FileResponse, Http404, JsonResponse
+from django.template.loader import render_to_string
 from django.template.response import TemplateResponse
+from django.urls import path, reverse
+from django.utils.http import urlencode
+from django.utils.safestring import mark_safe
 
 from fleet.admin import _status_badge
 from fleet.services import datasets as datasets_svc
+from fleet.services.paths import source_root
 from training import jobs
+from training.admin import _hard_image_path_from_request, _hard_image_token, _preview_index
 from training.models import EvalRun
-from training.services import config_gen, runner
+from training.services import config_gen, eval_analytics, runner
 
 from eval_pipelines.models import (
     BaseEval,
@@ -38,10 +48,61 @@ def _queue():
     return django_rq.get_queue("default")
 
 
+def _hard_images_artifact(output_dir):
+    """The one ``*_hard_images.json`` file in an eval's ``output_dir``, or None.
+
+    Named ``eval_hard_images.json`` for a base eval and
+    ``predictions_hard_images.json`` for a chachak pipeline eval (single-model
+    or combined-checkpoint) — matched by glob so this doesn't have to know
+    which. Missing for evals that predate the feature or had no ground truth.
+    """
+    if not output_dir:
+        return None
+    matches = sorted(Path(output_dir).glob("*_hard_images.json"))
+    return matches[0] if matches else None
+
+
+def _attach_hard_images_links(columns):
+    """Add a ``hard_images_url`` (or None) to each compare-page column in place."""
+    for column in columns:
+        has_artifact = _hard_images_artifact(column.get("output_dir")) is not None
+        column["hard_images_url"] = (
+            reverse("admin:eval_pipelines_combinedeval_hard_images") + "?" + urlencode(
+                {"kind": column["kind"], "eval": column["orig_id"]}
+            )
+        ) if has_artifact else None
+    return columns
+
+
+def _resolve_eval_for_hard_images(request):
+    """Look up the real ``EvalRun``/``PipelineEvalRun`` a hard-images URL points at.
+
+    The worst-images viewer is shared by every eval list (see
+    :meth:`CombinedEvalAdmin.hard_images_view`), so it's addressed by
+    ``?kind=base|pipeline&eval=<pk>`` rather than a list-specific pk space.
+    """
+    kind = request.GET.get("kind")
+    pk = request.GET.get("eval")
+    model = PipelineEvalRun if kind == CombinedEval.PIPELINE else EvalRun
+    obj = model.objects.filter(pk=pk).first()
+    if obj is None:
+        raise Http404("unknown eval")
+    return obj
+
+
+def _load_hard_images_for(eval_obj):
+    """Parse the eval's hard-images artifact, or None if missing/unreadable."""
+    artifact = _hard_images_artifact(getattr(eval_obj, "output_dir", ""))
+    if artifact is None:
+        return None
+    try:
+        return json.loads(artifact.read_text())
+    except (ValueError, OSError):
+        return None
+
+
 def _analyze(model_admin, request, queryset, title):
     """Shared "Analyze / compare" action body for base and pipeline evals."""
-    from training.services import eval_analytics
-
     runs = [e for e in queryset if isinstance(e.metrics, dict) and e.metrics]
     skipped = [e for e in queryset if not (isinstance(e.metrics, dict) and e.metrics)]
     if skipped:
@@ -56,16 +117,35 @@ def _analyze(model_admin, request, queryset, title):
                                  level=messages.WARNING)
         return None
 
+    compared = eval_analytics.compare(runs)
+    _attach_hard_images_links(compared["columns"])
     context = {
         **model_admin.admin_site.each_context(request),
         "title": title,
-        **eval_analytics.compare(runs),
+        **compared,
     }
     return TemplateResponse(request, "admin/training/eval_analytics.html", context)
 
 
 class EvalDisplayMixin:
     """Shared metric columns for every eval list (base, pipeline, combined)."""
+
+    class Media:
+        css = {"all": ("eval_pipelines/metrics_summary.css",)}
+
+    @admin.display(description="metrics")
+    def metrics_pretty(self, obj):
+        """Headline tiles + per-class table + confusion matrix, not a JSON dump.
+
+        Swapped in for the raw ``metrics`` field in ``readonly_fields`` — left
+        alone, Django's default readonly rendering for a JSONField is a single
+        unbroken ``json.dumps(...)`` line. ``eval_analytics.summary`` does the
+        reshaping (shared with the "Analyze / compare" action); this just
+        renders it.
+        """
+        html = render_to_string("admin/eval_pipelines/metrics_summary.html",
+                                 eval_analytics.summary(obj))
+        return mark_safe(html)
 
     @admin.display(description="models")
     def models_display(self, obj):
@@ -178,7 +258,7 @@ class BaseEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
     readonly_fields = [
         "trained_model", "dataset", "label_source", "annotator", "explicit_labels_path",
         "score_threshold",
-        "status", "request_yaml_path", "output_dir", "metrics", "last_error",
+        "status", "request_yaml_path", "output_dir", "metrics_pretty", "last_error",
         "started_at", "finished_at", "created_at",
     ]
 
@@ -234,7 +314,7 @@ class PipelineEvalRunAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmi
         "pipeline", "detector_checkpoint", "detector_expand_ratio",
         "tile_width_pct", "tile_height_pct", "overlap", "chain",
         "score_threshold",
-        "status", "request_yaml_path", "output_dir", "metrics", "last_error",
+        "status", "request_yaml_path", "output_dir", "metrics_pretty", "last_error",
         "started_at", "finished_at", "created_at",
     ]
 
@@ -301,6 +381,93 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
         if obj.kind == CombinedEval.BASE:
             return EvalRun.objects.get(pk=obj.orig_id), "base"
         return PipelineEvalRun.objects.get(pk=obj.orig_id), "pipeline"
+
+    def get_urls(self):
+        custom = [
+            path("hard-images/", self.admin_site.admin_view(self.hard_images_view),
+                 name="eval_pipelines_combinedeval_hard_images"),
+            path("hard-images/image/", self.admin_site.admin_view(self.hard_images_image),
+                 name="eval_pipelines_combinedeval_hard_images_image"),
+            path("hard-images/data/", self.admin_site.admin_view(self.hard_images_data),
+                 name="eval_pipelines_combinedeval_hard_images_data"),
+        ]
+        return custom + super().get_urls()
+
+    # ------------------------------------------------------------- worst images
+    # Linked from the "Analyze / compare" page (see ``_attach_hard_images_links``),
+    # not from a changelist action — one viewer shared by every eval kind/list,
+    # addressed by ``?kind=&eval=`` rather than a list-specific pk space. Mirrors
+    # ``TrainedModelAdmin``'s "hardest val images" viewer (``training.admin``),
+    # but the worst 10% rather than a fixed top-50 — see
+    # ``friendy_chachkalica.metrics.EVAL_HARD_IMAGES_FRACTION``.
+    def hard_images_view(self, request):
+        """Render the viewer shell; the browser pulls images + precomputed boxes per index."""
+        eval_obj = _resolve_eval_for_hard_images(request)
+        payload = _load_hard_images_for(eval_obj)
+        if payload is None:
+            raise Http404("no worst-images artifact for this eval")
+        images = payload.get("images", [])
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Worst images — {eval_obj}",
+            "subject_name": str(eval_obj),
+            "image_count": len(images),
+            "metric": payload.get("metric", ""),
+            "metric_description": payload.get("metric_description", ""),
+            "iou_threshold": payload.get("iou_threshold"),
+            "score_threshold": payload.get("score_threshold"),
+            "operating_nms_threshold": payload.get("operating_nms_threshold"),
+            "max_display_predictions": payload.get("max_display_predictions"),
+            "query": urlencode({
+                "kind": request.GET.get("kind", CombinedEval.BASE), "eval": eval_obj.pk,
+            }),
+            "run_choices": [],
+            "run_choices_json": "[]",
+            "back_label": "Back to eval",
+        }
+        return TemplateResponse(request, "admin/training/hard_images_viewer.html", context)
+
+    def hard_images_image(self, request):
+        """Stream the raw bytes of the worst image at ``?index=`` (guarded to source_root)."""
+        eval_obj = _resolve_eval_for_hard_images(request)
+        payload = _load_hard_images_for(eval_obj)
+        images = payload.get("images", []) if payload else []
+        raw_path = _hard_image_path_from_request(request, images)
+        image_path = Path(raw_path).resolve()
+        root = source_root().resolve()
+        if root not in image_path.parents or not image_path.is_file():
+            raise Http404("image not found under source root")
+        return FileResponse(open(image_path, "rb"))
+
+    def hard_images_data(self, request):
+        """Return the precomputed predictions + ground truth + difficulty for ``?index=``."""
+        eval_obj = _resolve_eval_for_hard_images(request)
+        payload = _load_hard_images_for(eval_obj)
+        images = payload.get("images", []) if payload else []
+        if not images:
+            return JsonResponse({"error": "no worst images for this eval"}, status=400)
+        index = _preview_index(request, len(images))
+        entry = images[index]
+        return JsonResponse({
+            "predictions": entry.get("predictions", []),
+            "ground_truth": entry.get("ground_truth", []),
+            "image": entry.get("image_name", ""),
+            "image_token": _hard_image_token(entry.get("image_path", "")),
+            "difficulty": entry.get("difficulty"),
+            "precision": entry.get("precision"),
+            "recall": entry.get("recall"),
+            "f1": entry.get("f1"),
+            "missed": entry.get("missed"),
+            "false_positives": entry.get("false_positives"),
+            "wrong_class": entry.get("wrong_class"),
+            "loc_error": entry.get("loc_error"),
+            "localization_penalty": entry.get("localization_penalty"),
+            "total_errors": entry.get("total_errors"),
+            "num_predictions": entry.get("num_predictions"),
+            "num_ground_truth": entry.get("num_ground_truth"),
+            "index": index,
+            "count": len(images),
+        })
 
     @admin.action(description="Analyze / compare metrics of selected eval(s)…")
     def analyze_selected(self, request, queryset):

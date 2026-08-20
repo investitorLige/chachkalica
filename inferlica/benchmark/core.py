@@ -30,18 +30,21 @@ try:
     from .gpu_monitor import GpuMonitor, own_usage_delta_mb, read_current_mem_mb, snapshot_process_mem_mb
     from .kernel_util import native_kernel_busy_pct
     from .variants import (ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec,
-                           ecdet_variant_specs, rfdetr_variant_specs, yolox_variant_specs)
+                           dfine_variant_specs, ecdet_variant_specs, rfdetr_variant_specs,
+                           yolox_variant_specs)
 except ImportError:  # run as a flat script
     from gpu_monitor import GpuMonitor, own_usage_delta_mb, read_current_mem_mb, snapshot_process_mem_mb  # type: ignore
     from kernel_util import native_kernel_busy_pct  # type: ignore
     from variants import (ARCH_VARIANTS, NMS_STATUS, NO_TRT_ARCHS, VariantSpec,  # type: ignore
-                          ecdet_variant_specs, rfdetr_variant_specs, yolox_variant_specs)
+                          dfine_variant_specs, ecdet_variant_specs, rfdetr_variant_specs,
+                          yolox_variant_specs)
 
 METRIC_ROW_ORDER = [
     "status",
     "status_reason",
     "nms_status",
     "precision",
+    "num_params",
     "eval_seconds",
     "inference_seconds",
     "fps",
@@ -71,6 +74,72 @@ METRIC_ROW_ORDER = [
 # Pinning the profile to the cell's image_size fixes both -- retinanet now
 # builds fp16 and follows --image-size like the others.
 ARCHS_NEEDING_STATIC_FP16_PROFILE = {"fasterrcnn", "rtdetr", "retinanet"}
+
+
+def resolve_cell_precision(
+    arch: str, requested: str, allow_untrusted_fp16: bool, fmt: Optional[str] = None
+):
+    """Apply the shipping fp16 trust floor to a cell's requested precision.
+
+    Returns ``(precision, reason)`` -- ``reason`` is None unless the floor bit.
+
+    An arch in ``trt_export.arch.UNTRUSTED_FP16`` fails the trained-checkpoint fp16
+    parity gate with the mechanism that floor was measured on (``fp16_cast.py``'s
+    blanket cast of the whole graph), so ``precision="auto"`` ships fp32 out of both
+    export CLIs and the admin's export form. This sweep honours that floor by
+    default, because the table it feeds is read as "what these archs cost to run",
+    and a row nobody can deploy at that precision reads as an option that isn't on
+    the menu.
+
+    ``fmt`` is what makes this per-format rather than per-cell-arch, and it exists
+    for exactly one case: an arch whose blanket-cast fp16 is floored but whose
+    TensorRT engine has a *second*, trustworthy fp16 route -- NVIDIA ModelOpt
+    AutoCast, which keeps the fp16-fragile nodes in fp32 (``ARCH_CAST_BACKEND``;
+    dfine today). There an auto-precision export genuinely ships an fp16 ENGINE,
+    while ``.pt`` and ``.onnx`` still ship fp32 (the onnx fp16 sidecar is that same
+    blanket cast, and ``onnx_export/cli.py`` refuses it for a floored arch). Timing
+    every format at fp32 would understate the artifact people actually deploy;
+    timing every format at fp16 would publish two numbers nothing ships. So each
+    format reports the precision its own export path would hand out, and the cell's
+    ``status_reason`` says which case it is. Every other arch is unaffected: the
+    precision it resolves to does not depend on ``fmt``.
+
+    ``allow_untrusted_fp16`` restores the old pass-through for the research question
+    ("what would fp16 save if the blanket cast were fixed?"), which is worth
+    measuring but is not a shipping number. Note the gate's evidence is engine-side;
+    pt autocast is floored with it for row consistency, not because torch AMP was
+    measured to break.
+    """
+    if requested != "fp16" or allow_untrusted_fp16:
+        return requested, None
+
+    from friendy_chachkalica.ml.trt_export.arch import is_fp16_trusted, resolve_auto_precision
+
+    if is_fp16_trusted(arch):
+        return requested, None
+
+    from friendy_chachkalica.ml.trt_export.modelopt_cast import modelopt_version
+
+    auto_precision, auto_backend = resolve_auto_precision(
+        arch, modelopt_available=modelopt_version() is not None
+    )
+    if auto_precision == "fp16" and auto_backend == "autocast":
+        if fmt == "engine":
+            return "fp16", (
+                "arch is in UNTRUSTED_FP16, but that describes its BLANKET-cast fp16; its engine "
+                "ships fp16 through NVIDIA ModelOpt AutoCast (fp16-fragile nodes kept in fp32), "
+                "which is what an auto-precision export builds -- so this row is measured fp16"
+            )
+        return "fp32", (
+            "arch is in UNTRUSTED_FP16 (its blanket-cast fp16 fails the trained-checkpoint parity "
+            f"gate), and the AutoCast route that rescues it exists only for the engine -- {fmt or 'this format'} "
+            "ships fp32, so it is swept at fp32; --allow-untrusted-fp16 measures fp16 anyway"
+        )
+    return "fp32", (
+        "arch is in UNTRUSTED_FP16 (fails the trained-checkpoint fp16 parity gate), so an "
+        "auto-precision export ships fp32 -- swept at fp32 to match what ships; "
+        "--allow-untrusted-fp16 measures fp16 anyway"
+    )
 
 
 def _build_rtdetr_variant(repo_id: str, num_classes: int):
@@ -258,13 +327,13 @@ def export_onnx_fp16_artifact(onnx_path: Path, arch: str, force_rebuild: bool) -
     partly in fp32, making the cross-format comparison apples-to-oranges. I/O
     dtypes stay fp32, so the ORIGINAL meta.json applies verbatim.
 
-    Deliberately does NOT apply the CLI sidecar's ``is_fp16_trusted`` gate: that
-    is a shipping-safety floor, whereas this is a measurement tool. The benchmark
-    times whatever precision the sweep requests (its TRT path likewise passes an
-    explicit precision straight to ``build_engine``, bypassing the auto-only
-    trust floor in ``trt_export.cli``), so gating the ONNX path on trust would
-    make it inconsistent with the engine path in the same sweep. Degrades
-    gracefully (returns ``None`` instead of raising) so one arch without an
+    Does not itself apply the CLI sidecar's ``is_fp16_trusted`` gate -- and neither
+    does the engine path, which passes an explicit precision straight to
+    ``build_engine``, bypassing the auto-only floor in ``trt_export.cli``. Both are
+    reached only after ``resolve_cell_precision`` has already applied that floor for
+    the whole cell, which is what keeps the two formats consistent within one sweep;
+    by the time either runs, "fp16" means the sweep genuinely wants fp16 measured.
+    Degrades gracefully (returns ``None`` instead of raising) so one arch without an
     importable converter never kills the sweep.
     """
     fp16_path = onnx_path.with_name(onnx_path.stem + "_fp16.onnx")
@@ -483,6 +552,7 @@ def benchmark_cell(
     gpu_poll_interval_s: float,
     force_rebuild: bool,
     min_duration_s: float = 0.0,
+    allow_untrusted_fp16: bool = False,
 ) -> Dict[str, Any]:
     """Benchmark one (arch, variant, format) cell.
 
@@ -496,12 +566,23 @@ def benchmark_cell(
         "status_reason": None,
         "nms_status": NMS_STATUS[arch],
         "precision": None,
+        "num_params": None,
     }
 
     if fmt == "engine" and arch in NO_TRT_ARCHS:
         result["status"] = "skipped"
         result["status_reason"] = "no TRT export path for this arch (data-dependent NMS/RPN ops)"
         return result
+
+    # Ahead of every format branch, so each cell picks its precision once, from the
+    # same policy the export CLIs apply (see resolve_cell_precision -- pt/onnx/engine
+    # agree for every arch except one whose engine has its own trustworthy fp16
+    # route). Any later per-format fallback
+    # reason either can't fire once this floored to fp32 (the fp16 paths are
+    # skipped outright) or appends to this one rather than replacing it.
+    precision, floor_reason = resolve_cell_precision(arch, precision, allow_untrusted_fp16, fmt)
+    if floor_reason:
+        result["status_reason"] = floor_reason
 
     # Force the previous cell's runnable (onnxruntime session / TRT execution
     # context / torch model) out of memory before this cell allocates anything.
@@ -518,6 +599,19 @@ def benchmark_cell(
 
     try:
         pt_adapter = build_pt_adapter(arch, variant, num_classes)
+        try:
+            # Every adapter wraps its underlying nn.Module as .model (see
+            # adapters/*.py's to()/eval()), so this is a uniform way to get a
+            # real parameter count across all six archs. Counted once per cell
+            # from the freshly-built PT adapter -- built regardless of `fmt`,
+            # since onnx/engine export from it too -- rather than assumed
+            # constant across image sizes: a few variants (ecdet, rfdetr,
+            # yolox) rebuild at the cell's own canvas, and a ViT with learned
+            # (non-sinusoidal) position embeddings could in principle carry a
+            # slightly different count at a different grid size.
+            result["num_params"] = int(sum(p.numel() for p in pt_adapter.model.parameters()))
+        except Exception:  # noqa: BLE001 - param count is informational, never worth failing a cell over
+            result["num_params"] = None
 
         # onnx/engine pre-allocate essentially everything they'll ever need at
         # LOAD time -- TensorRT's execution-context workspace is fixed at
@@ -833,6 +927,7 @@ def run_sweep(
     variant_names: Optional[List[str]] = None,
     min_duration_s: float = 0.0,
     follow_image_size: bool = False,
+    allow_untrusted_fp16: bool = False,
 ) -> Dict[str, Any]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -850,6 +945,7 @@ def run_sweep(
         gpu_poll_interval_s=gpu_poll_interval_s,
         force_rebuild=force_rebuild,
         min_duration_s=min_duration_s,
+        allow_untrusted_fp16=allow_untrusted_fp16,
     )
 
     dataframes: Dict[str, Any] = {}
@@ -866,6 +962,8 @@ def run_sweep(
             variants = yolox_variant_specs(image_size)
         elif arch == "ecdet" and follow_image_size:
             variants = ecdet_variant_specs(image_size)
+        elif arch == "dfine" and follow_image_size:
+            variants = dfine_variant_specs(image_size)
         else:
             variants = ARCH_VARIANTS[arch]
         if variant_names:

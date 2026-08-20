@@ -107,14 +107,18 @@ def _adapter_max_batch(adapter: Any) -> Optional[int]:
     """Largest batch ``adapter`` can safely be handed in one ``predict`` call.
 
     Only ``TrtAdapter`` (``trt_infer.adapter.TrtAdapter``) caps this — it stacks
-    same-shaped images into one real engine call, which only the EfficientNMS
-    archs decode correctly past batch 1; a passthrough arch (rfdetr/rtdetr, see
-    ``chachak.bundle_export.cli._batchable_in_trt``) is built with a batch-1
-    profile, and ``TrtModel.max_batch`` (read off that profile at load time) is
-    how this finds out. Every other adapter (onnx, trained torch) has no such
-    ceiling — ``None`` means uncapped. Duck-typed rather than an isinstance check
-    so this has no import-time dependency on ``trt_infer`` (torch/tensorrt), same
-    reasoning as ``chachak.detector._adapter_max_input_hw``.
+    same-shaped images into one real engine call, and the engine's own built
+    profile is the ceiling: ``TrtModel.max_batch`` (read off that profile at load
+    time) is how this finds out. That profile is 1 whenever the engine was built
+    without asking for wider — the historical default for every arch, and still
+    the only option for retinanet/fasterrcnn (see
+    ``trt_export.arch.BATCH_AWARE_ARCHS``; their raw-export wrapper hardcodes a
+    single image internally, so a wider profile would silently repeat one image's
+    detections across the batch, not decode it). Every other adapter (onnx,
+    trained torch) has no such ceiling — ``None`` means uncapped. Duck-typed
+    rather than an isinstance check so this has no import-time dependency on
+    ``trt_infer`` (torch/tensorrt), same reasoning as
+    ``chachak.detector._adapter_max_input_hw``.
     """
     max_batch = getattr(getattr(adapter, "_model", None), "max_batch", None)
     return int(max_batch) if isinstance(max_batch, int) else None
@@ -130,10 +134,11 @@ def infer_in_chunks(
 
     ``chunk_size`` is a throughput knob, not a contract the adapter is assumed to
     tolerate — it is clamped to :func:`_adapter_max_batch` when the adapter has
-    one, so a caller configured for a wider batch than a batch-1 TensorRT engine
-    supports (e.g. ``people_detect_first`` cropping multiple person boxes out of
-    one frame, all bound for a passthrough-arch bundle) degrades to one engine
-    call per image instead of the adapter rejecting the oversized stack.
+    one, so a caller configured for a wider batch than the engine's own built
+    profile supports (e.g. ``people_detect_first`` cropping multiple person boxes
+    out of one frame, bound for a bundle built with the default batch-1 profile)
+    degrades to one engine call per image instead of the adapter rejecting the
+    oversized stack.
     """
     max_batch = _adapter_max_batch(adapter)
     effective_chunk_size = max(1, chunk_size if max_batch is None else min(chunk_size, max_batch))

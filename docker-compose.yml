@@ -45,6 +45,9 @@ x-app: &app
     TRAINING_SERVICE_URL: http://trainer:8200
     # Reach the Grounding SAM ML backend the same way.
     SAM_BACKEND_URL: http://sam-backend:9090
+    # bgutil-ytdlp-pot-provider (installed via requirements.txt) reads this to
+    # find its companion BotGuard-solving server — see videos/services/downloader.py.
+    YT_POT_SERVER_URL: http://yt-pot-server:4416
   volumes:
     - ./chachkalica/data:/app/data
     - /var/run/docker.sock:/var/run/docker.sock
@@ -54,6 +57,8 @@ x-app: &app
     postgres:
       condition: service_healthy
     redis:
+      condition: service_started
+    yt-pot-server:
       condition: service_started
 
 services:
@@ -79,6 +84,27 @@ services:
     image: redis:7
     ports:
       - "6379:6379"
+
+  # BotGuard-solving companion server for bgutil-ytdlp-pot-provider (see
+  # chachkalica/requirements.txt + videos/services/downloader.py). Mints the PO
+  # Token YouTube now requires on the actual videoplayback fetch — the JS
+  # runtime (deno, in the app image) only solves the separate sig/n challenge
+  # and isn't enough on its own. Internal-only: nothing outside the compose
+  # network needs to reach it.
+  yt-pot-server:
+    # The published image ships with no CA certificates (see yt_pot_server/Dockerfile) —
+    # a bare `image:` here would 500 on every PO Token request.
+    build: ./yt_pot_server
+    init: true
+    restart: unless-stopped
+    environment:
+      # This network's TLS-inspecting proxy (a self-signed "atlas-MASTER" root,
+      # not installed in any container's trust store here) MITMs the fetch this
+      # server makes to www.google.com to solve YouTube's BotGuard challenge.
+      # The connection is already intercepted either way; this just stops Node
+      # from refusing it. Scope is narrow: only this container's own outbound
+      # calls to fetch that public challenge script are affected.
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
 
   web:
     <<: *app
@@ -174,6 +200,16 @@ services:
       FC_PORT: ${FC_PORT:-8200}
       # Single-GPU safety: refuse a second concurrent launch with HTTP 409.
       FC_MAX_CONCURRENT: ${FC_MAX_CONCURRENT:-1}
+      # Hugging Face weights (rtdetr/dfine ``from_pretrained`` repo ids) live in
+      # the MOUNTED data dir, not the container's own ~/.cache — this container
+      # recreates itself periodically and would otherwise lose the whole cache
+      # and re-fetch. huggingface.co is unreachable from this network, so the
+      # cache is populated out-of-band (downloaded elsewhere, untarred here) and
+      # HF_HUB_OFFLINE stops every ``from_pretrained`` paying a connection
+      # timeout before falling back to it. Unset it if the hub becomes reachable
+      # and you want to pull a repo id that is not cached yet.
+      HF_HOME: /app/data/hf_cache
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
     # PyTorch DataLoader workers pass image batches through /dev/shm; Docker's
     # default 64 MB is far too small. Bump higher for many workers / large batches.
     shm_size: ${FC_SHM_SIZE:-2gb}

@@ -1,4 +1,5 @@
 try:
+    from .ml.adapters.dfine import build_dfine
     from .ml.adapters.ecdet import build_ecdet
     from .ml.adapters.fasterrcnn import build_fasterrcnn
     from .ml.adapters.retinanet import build_retinanet
@@ -6,6 +7,7 @@ try:
     from .ml.adapters.rtdetr import build_rtdetr
     from .ml.adapters.yolox import build_yolox
 except ImportError:
+    from ml.adapters.dfine import build_dfine
     from ml.adapters.ecdet import build_ecdet
     from ml.adapters.fasterrcnn import build_fasterrcnn
     from ml.adapters.retinanet import build_retinanet
@@ -15,6 +17,7 @@ except ImportError:
 
 
 MODEL_REGISTRY = {
+    "dfine": build_dfine,
     "ecdet": build_ecdet,
     "fasterrcnn": build_fasterrcnn,
     "retinanet": build_retinanet,
@@ -49,6 +52,8 @@ def build_model(name, **kwargs):
         build_model("ecdet", num_classes=3)
         build_model("ecdet", num_classes=3, variant="ecdet-s")
         build_model("ecdet", num_classes=3, weights="backbone")
+        build_model("dfine", num_classes=3)
+        build_model("dfine", num_classes=3, weights="ustc-community/dfine-small-coco")
     """
     try:
         builder = MODEL_REGISTRY[name]

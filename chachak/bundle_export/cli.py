@@ -175,26 +175,25 @@ def _role_formats(exported: Dict[str, Dict[str, Any]], *, want_engine: bool) -> 
 def _batchable_in_trt(arch: str) -> bool:
     """Whether this arch's engine decodes a ``B > 1`` submission correctly.
 
-    ``TrtAdapter`` stacks same-shaped images into one engine call. The EfficientNMS
-    archs emit fixed-size per-image outputs plus a ``num_detections`` count, which
-    ``trt_infer.session._unpack_efficientnms`` splits per image. The passthrough
-    archs compile the standard ONNX graph, whose outputs carry a single detection
-    axis and no batch dimension — there is nothing to split them by. So only the
-    former get a batch profile wider than 1.
+    ``TrtAdapter`` stacks same-shaped images into one engine call. An arch in
+    ``BATCH_AWARE_ARCHS`` carries a real batch dim through to its outputs
+    (EfficientNMS's fixed-size-per-image-plus-count for yolox, a per-batch-row
+    top-k for the DETR-family passthrough archs) — the rest don't, so there is
+    nothing for a wider batch profile to do.
 
     The cap this produces is enforced twice over: ``manifest.batch_caps`` clamps the
     bundle's configured batch sizes, and ``TrtModel`` rejects an oversized submission
     outright. The second check is the load-bearing one — TensorRT reports an
     over-profile ``set_input_shape`` through its logger rather than an exception and
-    then runs at its previous shape, so without it a passthrough engine silently
+    then runs at its previous shape, so without it a non-batch-aware engine silently
     returns the first image's detections for every image in the batch.
     """
-    # has_trt_prep, not get_trt_prep: the answer is a table lookup, but *fetching*
-    # the callable imports torch, and bundle assembly must stay torch-free so the
-    # slim build node (buildnode/) can run it.
-    from friendy_chachkalica.ml.trt_export.arch import has_trt_prep
+    # is_batch_aware, not a torch-importing helper: bundle assembly must stay
+    # torch-free so the slim build node (buildnode/) can run it, and this table
+    # is pure data.
+    from friendy_chachkalica.ml.trt_export.arch import is_batch_aware
 
-    return has_trt_prep(arch)
+    return is_batch_aware(arch)
 
 
 def _build_engine(
@@ -207,6 +206,7 @@ def _build_engine(
     batch: int,
 ) -> int:
     """Compile the bundled ONNX into ``engine_path``; returns its max batch."""
+    from friendy_chachkalica.ml.trt_export.arch import has_trt_prep
     from friendy_chachkalica.ml.trt_export.cli import _load_adapter, build_engine
 
     max_batch = batch if _batchable_in_trt(arch) else 1
@@ -218,9 +218,11 @@ def _build_engine(
         )
     # The EfficientNMS archs rebuild their TRT graph from the torch model, so they
     # need the adapter when the source ONNX isn't beside its checkpoint (ours isn't
-    # — it lives in the bundle).
+    # — it lives in the bundle). This is has_trt_prep (needs EfficientNMS surgery),
+    # not _batchable_in_trt (is the resulting engine batch-safe) — they're different
+    # questions that happen to agree only for yolox.
     adapter = None
-    if _batchable_in_trt(arch):
+    if has_trt_prep(arch):
         if source.suffix.lower() != ".pt":
             raise SystemExit(
                 f"[bundle] {arch} rebuilds its TensorRT graph with a fused-NMS plugin, "

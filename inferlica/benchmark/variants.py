@@ -44,6 +44,7 @@ NMS_STATUS: Dict[str, str] = {
     "rtdetr": "nms-free (DETR set-prediction)",
     "rfdetr": "nms-free (DETR set-prediction)",
     "ecdet": "nms-free (DETR set-prediction)",
+    "dfine": "nms-free (DETR set-prediction)",
 }
 
 # Backbone block size (patch_size * num_windows) that each rfdetr variant's
@@ -112,6 +113,26 @@ def ecdet_variant_specs(image_size: int) -> List["VariantSpec"]:
     """
     specs = []
     for spec in ARCH_VARIANTS["ecdet"]:
+        kwargs = dict(spec.build_kwargs)
+        kwargs["input_max_size"] = image_size
+        specs.append(VariantSpec(spec.name, kwargs))
+    return specs
+
+
+def dfine_variant_specs(image_size: int) -> List["VariantSpec"]:
+    """dfine VariantSpecs with the export canvas set to ``image_size``.
+
+    Same shape of override as ecdet/yolox: every published D-FINE variant trains
+    and exports at a square 640 (``build_dfine``'s ``input_max_size`` default),
+    and the sweep's synthetic input is letterboxed onto that canvas unless the
+    adapter is *built* at the requested size. Unlike ecdet the graph itself is
+    dynamic in H/W (the anchors trace symbolically -- see the dfine notes in
+    trt_export/arch/__init__.py), but the exported ``.meta.json`` still records
+    one square size, which is what the TRT profile and the letterbox both use.
+    ``image_size`` must be a multiple of 32 (``input_size_multiple``).
+    """
+    specs = []
+    for spec in ARCH_VARIANTS["dfine"]:
         kwargs = dict(spec.build_kwargs)
         kwargs["input_max_size"] = image_size
         specs.append(VariantSpec(spec.name, kwargs))
@@ -191,6 +212,21 @@ ARCH_VARIANTS: Dict[str, List[VariantSpec]] = {
         VariantSpec("yolox-m", {"variant": "yolox-m", "weights": False}),
         VariantSpec("yolox-l", {"variant": "yolox-l", "weights": False}),
         VariantSpec("yolox-x", {"variant": "yolox-x", "weights": False}),
+    ],
+    "dfine": [
+        # D-FINE has no `variant=` kwarg either -- like rtdetr, the size lives in
+        # the HF repo id (`weights=`). Unlike rtdetr, these ids resolve WITHOUT a
+        # download: all nine ustc-community repos are in this box's offline
+        # HF_HOME cache (huggingface.co is unreachable here -- see the trainer's
+        # HF_HUB_OFFLINE=1), so passing the real weights costs a local file read
+        # and, unlike rtdetr's config-only fetch, actually yields a params count.
+        # Weights change neither shape nor speed; the -coco line is the plain
+        # COCO one (the obj2coco repos are the same five backbones).
+        VariantSpec("nano", {"weights": "ustc-community/dfine-nano-coco"}),
+        VariantSpec("small", {"weights": "ustc-community/dfine-small-coco"}),
+        VariantSpec("medium", {"weights": "ustc-community/dfine-medium-coco"}),
+        VariantSpec("large", {"weights": "ustc-community/dfine-large-coco"}),
+        VariantSpec("xlarge", {"weights": "ustc-community/dfine-xlarge-coco"}),
     ],
     "ecdet": [
         # weights=False keeps the sweep offline: the distilled ECViT backbone and

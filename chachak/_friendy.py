@@ -35,6 +35,7 @@ from friendy_chachkalica.data import (  # noqa: E402
     detection_collate_fn,
 )
 from friendy_chachkalica.metrics import (  # noqa: E402
+    EVAL_HARD_IMAGES_FRACTION,
     evaluate_detection,
     remap_raw_predictions_to_eval_classes,
 )
@@ -46,6 +47,7 @@ from friendy_chachkalica.config import (  # noqa: E402
     ModelConfig,
     TrainingConfig,
 )
+from friendy_chachkalica.ml.train import _write_hard_images  # noqa: E402
 from friendy_chachkalica.ml.val import _to_builtin, _write_yaml  # noqa: E402
 
 __all__ = [
@@ -58,6 +60,7 @@ __all__ = [
     "build_model",
     "build_eval_dataloader",
     "detection_collate_fn",
+    "EVAL_HARD_IMAGES_FRACTION",
     "evaluate_detection",
     "remap_raw_predictions_to_eval_classes",
     "resolve_device",
@@ -66,6 +69,7 @@ __all__ = [
     "ExperimentConfig",
     "ModelConfig",
     "TrainingConfig",
+    "_write_hard_images",
     "_to_builtin",
     "_write_yaml",
 ]

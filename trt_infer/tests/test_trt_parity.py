@@ -6,8 +6,8 @@ exporters), compiles it to a TensorRT engine (``trt_export``), then asserts the
 
 All registered archs build and run:
 
-* **rtdetr, rfdetr, ecdet** — compile straight from the standard ONNX (fixed-size
-  DETR top-k, no NMS node to replace).
+* **rtdetr, rfdetr, ecdet, dfine** — compile straight from the standard ONNX
+  (fixed-size DETR top-k, no NMS node to replace).
 * **retinanet, yolox** — their standard ONNX bakes data-dependent NMS that TRT
   can't compile, so ``trt_export`` re-exports a raw-output graph and appends the
   ``EfficientNMS_TRT`` plugin; the runtime auto-detects the plugin outputs.
@@ -53,6 +53,7 @@ from friendy_chachkalica.ml.onnx_export.arch.yolox import export_yolox  # noqa: 
 from friendy_chachkalica.ml.onnx_export.arch.rtdetr import export_rtdetr  # noqa: E402
 from friendy_chachkalica.ml.onnx_export.arch.rfdetr import export_rfdetr  # noqa: E402
 from friendy_chachkalica.ml.onnx_export.arch.ecdet import export_ecdet  # noqa: E402
+from friendy_chachkalica.ml.onnx_export.arch.dfine import export_dfine  # noqa: E402
 from friendy_chachkalica.ml.trt_export.cli import build_engine  # noqa: E402
 from trt_infer import load_trt_adapter  # noqa: E402
 
@@ -258,16 +259,110 @@ def test_ecdet_parity(ecdet_engine):
 def test_ecdet_engine_is_passthrough_batch1(ecdet_engine):
     """The provenance records ecdet on the passthrough side of the TRT split.
 
-    ``efficientnms: false`` and a batch-1 profile are two halves of the same fact:
-    the export wrapper indexes the batch axis away, so there is no prep to run and
-    nothing wider than batch 1 to build. gpu_infer/loader.py reads batchability off
-    the engine's own profile rather than the arch name, so this is what makes crop
-    batching fall back to one-at-a-time for ecdet.
+    ``efficientnms: false`` — ecdet's standard ONNX has no data-dependent NMS, so
+    there is no EfficientNMS re-export to run; ``build_engine`` compiles it as-is.
+    This fixture's engine happens to be batch-1 because ``_build`` doesn't ask for
+    wider (the fixture is about parity, not batching) — not because ecdet is
+    incapable of it. ecdet is in ``trt_export.arch.BATCH_AWARE_ARCHS`` and its
+    exported graph carries a real batch dim; see ``arch/ecdet.py``'s module
+    docstring and ``batched_yolox_engine`` for the batching-plumbing tests
+    (which exercise the same rank-3-output code path, currently via yolox).
     """
     _, engine = ecdet_engine
     provenance = json.loads(Path(str(engine) + ".json").read_text())
     assert provenance["arch"] == "ecdet"
     assert provenance["efficientnms"] is False
+
+
+# --------------------------------------------------------------------------- D-FINE
+
+
+@pytest.fixture(scope="module")
+def dfine_engine(tmp_path_factory):
+    pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    adapter = build_model("dfine", num_classes=3, weights=None, input_max_size=320)
+    # De-tie the two-stage query selection; see the matching comment in
+    # onnx_infer/tests/test_onnx_parity.py::dfine_export.
+    inner = adapter.model.model
+    torch.nn.init.normal_(inner.enc_score_head.weight, mean=0.0, std=0.2)
+    torch.nn.init.constant_(inner.enc_score_head.bias, 0.0)
+    torch.nn.init.normal_(inner.decoder.class_embed[-1].weight, mean=0.0, std=0.15)
+    torch.nn.init.constant_(inner.decoder.class_embed[-1].bias, -2.0)
+    adapter.eval()
+    out_dir = tmp_path_factory.mktemp("dfine")
+    onnx_path = _export(adapter, export_dfine, out_dir)
+    # adapter=None: D-FINE is NMS-free, so it is a passthrough arch — no
+    # EfficientNMS prep, the standard ONNX compiles directly.
+    return adapter, _build(onnx_path, out_dir, adapter=None, static_hw=(320, 320))
+
+
+def test_dfine_parity(dfine_engine):
+    adapter, engine = dfine_engine
+    trt_adapter, info = load_trt_adapter(engine, "cuda")
+    assert info["num_classes"] == 3
+    torch.manual_seed(1)
+    image = torch.rand(3, 320, 320)
+    torch_pred = adapter.predict([image], score_threshold=0.0)[0].detach().cpu().numpy()
+    trt_pred = trt_adapter.predict([image], score_threshold=0.0)[0].detach().cpu().numpy()
+    _assert_topk_parity(torch_pred, trt_pred, k=10, atol=5e-3)
+
+
+def test_dfine_engine_is_passthrough(dfine_engine):
+    """The provenance records dfine on the passthrough side of the TRT split.
+
+    ``efficientnms: false`` — D-FINE's standard ONNX has no data-dependent NMS, so
+    there is no re-export to run and ``build_engine`` compiles it as-is. Same story
+    as ``test_ecdet_engine_is_passthrough_batch1``, including the batch-1 profile
+    being a property of this parity fixture rather than of the arch (dfine is in
+    ``trt_export.arch.BATCH_AWARE_ARCHS``).
+    """
+    _, engine = dfine_engine
+    provenance = json.loads(Path(str(engine) + ".json").read_text())
+    assert provenance["arch"] == "dfine"
+    assert provenance["efficientnms"] is False
+
+
+def test_dfine_fp16_engine_builds_and_is_really_fp16(tmp_path_factory, dfine_engine):
+    """D-FINE's graph compiles to a genuine fp16 engine that runs.
+
+    dfine is *not* on the fp16 safety floor (``trt_export/arch/__init__.py``'s
+    ``UNTRUSTED_FP16``), so ``precision="auto"`` will hand operators an fp16 engine
+    and this path has to keep working. The specific trap guarded here is the silent
+    one: ``build_engine_from_onnx`` retries in fp32 when an fp16 build yields no
+    engine, so an fp16 request can quietly produce an fp32 artifact — the provenance
+    assertion is what catches that.
+
+    Deliberately NOT a numeric fp32-vs-fp16 comparison. This fixture is random-init,
+    where top-k runs on a weakly-separated score field and any fp16 perturbation
+    reshuffles the selection — the exact measurement artifact ``UNTRUSTED_FP16``'s
+    comment was written about, and it does fire here (a first draft of this test
+    compared the confident top-5 and saw L1 ~1.2 on a degenerate 0.05x0.05 box).
+    Same reasoning as ``test_fasterrcnn_engine`` below: assert the engine builds,
+    loads, and emits structurally valid detections. The accuracy verdict belongs to
+    ``trained_fp16_gate.py`` on trained weights.
+    """
+    adapter, _ = dfine_engine
+    out_dir = tmp_path_factory.mktemp("dfine_fp16")
+    onnx_path = _export(adapter, export_dfine, out_dir)
+    fp16_engine = build_engine(
+        onnx_path, out_dir / "model_fp16.engine", precision="fp16", adapter=None,
+        min_hw=(320, 320), opt_hw=(320, 320), max_hw=(320, 320), workspace_gb=2.0,
+    )
+    provenance = json.loads(Path(str(fp16_engine) + ".json").read_text())
+    assert provenance["precision"] == "fp16", (
+        f"fp16 request produced a {provenance['precision']} engine — the builder's "
+        f"fp32 retry fired, which ships an fp32 artifact labelled as an fp16 build"
+    )
+
+    a16, _ = load_trt_adapter(fp16_engine, "cuda")
+    torch.manual_seed(1)
+    pred = a16.predict([torch.rand(3, 320, 320)], score_threshold=0.0)[0].detach().cpu().numpy()
+    assert pred.shape[0] == 300, f"expected the graph's 300 queries, got {pred.shape[0]}"
+    assert np.isfinite(pred).all(), "fp16 engine emitted non-finite detections"
+    scores = pred[:, 4]
+    assert ((scores >= 0.0) & (scores <= 1.0)).all(), "scores outside [0, 1]"
+    assert set(np.unique(pred[:, 5]).astype(int)) <= {0, 1, 2}, "unknown class ids"
 
 
 # --------------------------------------------------------------------------- Faster R-CNN

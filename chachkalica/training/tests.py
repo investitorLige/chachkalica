@@ -143,6 +143,26 @@ class ConfigGenTests(TestCase):
         )
         self.assertEqual(config_gen.model_entry(m, pipeline_name=self.exp.pipeline)["num_queries"], 10)
 
+    def test_people_detect_first_injects_dfine_num_queries_default(self):
+        # dfine shares rtdetr's topk(num_queries)-over-encoder-tokens crash mode
+        # (same HF hybrid encoder), so it gets the same guard/default.
+        self.exp.pipeline = pipelines.PEOPLE_DETECT_FIRST
+        self.exp.save()
+        m = ExperimentModel.objects.create(experiment=self.exp, arch=ExperimentModel.DFINE)
+        entry = config_gen.model_entry(m, pipeline_name=self.exp.pipeline)
+        self.assertEqual(
+            entry["num_queries"], config_gen.PEOPLE_DETECT_FIRST_RTDETR_NUM_QUERIES_DEFAULT
+        )
+
+    def test_dfine_input_max_size_below_the_topk_floor_is_rejected(self):
+        self.exp.pipeline = pipelines.PEOPLE_DETECT_FIRST
+        self.exp.save()
+        m = ExperimentModel.objects.create(
+            experiment=self.exp, arch=ExperimentModel.DFINE, params={"input_max_size": 64},
+        )
+        with self.assertRaises(ValueError):
+            config_gen.model_entry(m, pipeline_name=self.exp.pipeline)
+
     def test_num_queries_not_injected_off_people_detect_first(self):
         # Blank pipeline, and batch_people: rtdetr keeps its own (HF) default.
         m = ExperimentModel.objects.create(experiment=self.exp, arch=ExperimentModel.RTDETR)
@@ -570,6 +590,56 @@ class WeightsDropdownTests(TestCase):
         self.assertNotIn(model_specs.WEIGHTS_DEFAULT, choices)
         self.assertIn("PekingU/rtdetr_r50vd", choices)
         self.assertIn("PekingU/rtdetr_v2_r18vd", choices)
+
+    def test_dfine_has_no_default_option_but_lists_the_size_catalog(self):
+        # Like rtdetr: dfine's size IS its checkpoint, so there is no separate
+        # "COCO pretrained (default)" sentinel — only the explicit repo ids.
+        choices = dict(model_specs.weights_base_choices(ExperimentModel.DFINE))
+        self.assertNotIn(model_specs.WEIGHTS_DEFAULT, choices)
+        self.assertIn("ustc-community/dfine-medium-coco", choices)
+        self.assertIn("ustc-community/dfine-xlarge-obj2coco", choices)
+        self.assertIn(model_specs.WEIGHTS_CUSTOM, choices)
+
+    def test_dfine_catalog_option_passes_through(self):
+        obj = self._save(ExperimentModel.DFINE, "ustc-community/dfine-small-obj2coco")
+        self.assertEqual(obj.params["weights"], "ustc-community/dfine-small-obj2coco")
+        self.assertFalse(obj.pretrained)
+
+    def test_dfine_spec_fields_round_trip_into_params(self):
+        obj = self._save(
+            ExperimentModel.DFINE,
+            "ustc-community/dfine-small-coco",
+            extra={
+                model_specs.field_name(ExperimentModel.DFINE, "input_max_size"): "704",
+                model_specs.field_name(ExperimentModel.DFINE, "score_threshold"): "0.4",
+            },
+        )
+        self.assertEqual(obj.params["input_max_size"], 704)
+        self.assertEqual(obj.params["score_threshold"], 0.4)
+
+    def test_switching_away_from_dfine_strips_its_kwargs(self):
+        # ALL_SPEC_KEYS must cover dfine's keys, or a row switched to another arch
+        # would keep ignore_mismatched_sizes and the new adapter would reject it.
+        instance = self._save(
+            ExperimentModel.DFINE,
+            "ustc-community/dfine-large-coco",
+            extra={
+                model_specs.field_name(ExperimentModel.DFINE, "ignore_mismatched_sizes"): True,
+            },
+        )
+        self.assertIn("ignore_mismatched_sizes", instance.params)
+        wfield = model_specs.weights_field_name(ExperimentModel.FASTERRCNN)
+        form = ExperimentModelForm(
+            data={
+                "arch": ExperimentModel.FASTERRCNN,
+                "params": "{}",
+                wfield: model_specs.WEIGHTS_NONE,
+            },
+            instance=instance,
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        switched = form.save(commit=False)
+        self.assertNotIn("ignore_mismatched_sizes", switched.params)
 
     def test_rfdetr_o365_is_variant_tagged_to_base(self):
         vmap = model_specs.weights_variant_map(ExperimentModel.RFDETR)
@@ -1529,6 +1599,33 @@ class ExportActionsQueueJobsTests(TestCase):
         with mock.patch(
             "training.services.runner.inspect_checkpoint",
             return_value={"arch": "ecdet", "trained_size": [640, 640], "fp16_trusted": False},
+        ):
+            resp = self._post("export_trt")
+        self.assertContains(resp, '<option value="fp32" selected>', html=False)
+        self.assertContains(resp, "Defaulted to FP32")
+
+    def test_export_trt_form_offers_fp16_when_autocast_rescues_an_untrusted_arch(self):
+        # dfine's blanket-cast fp16 fails the parity gate, but ModelOpt AutoCast's
+        # mixed graph passes it — so where the trainer has nvidia-modelopt installed,
+        # inspect_checkpoint reports auto_precision="fp16" even with fp16_trusted
+        # False, and the form must follow that rather than the raw flag.
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint",
+            return_value={"arch": "dfine", "trained_size": [640, 640], "fp16_trusted": False,
+                          "auto_precision": "fp16", "auto_cast_backend": "autocast"},
+        ):
+            resp = self._post("export_trt")
+        self.assertContains(resp, '<option value="fp16" selected>', html=False)
+        self.assertContains(resp, "ModelOpt AutoCast")
+        self.assertNotContains(resp, "Defaulted to FP32")
+
+    def test_export_trt_form_falls_back_to_fp32_when_the_rescue_is_unavailable(self):
+        # Same arch on a machine without nvidia-modelopt: auto_precision comes back
+        # fp32 and the form must not offer the blanket-cast fp16 as the default.
+        with mock.patch(
+            "training.services.runner.inspect_checkpoint",
+            return_value={"arch": "dfine", "trained_size": [640, 640], "fp16_trusted": False,
+                          "auto_precision": "fp32", "auto_cast_backend": "auto"},
         ):
             resp = self._post("export_trt")
         self.assertContains(resp, '<option value="fp32" selected>', html=False)

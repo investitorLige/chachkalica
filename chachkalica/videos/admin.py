@@ -213,6 +213,17 @@ class VideoAdmin(admin.ModelAdmin):
     readonly_fields = ["status", "filename", "player", "last_error", "created_at", "updated_at"]
     actions = ["play_video", "extract_frames", "run_inference", "import_all_new", "redownload"]
 
+    def get_actions(self, request):
+        """Relabel the stock ``delete_selected`` — deleting a video also deletes
+        its file under ``videos_root`` (see ``videos.signals``), not just the row."""
+        actions = super().get_actions(request)
+        if "delete_selected" in actions:
+            func, name, _desc = actions["delete_selected"]
+            actions["delete_selected"] = (
+                func, name, "Delete selected video(s) (also deletes the file on disk)",
+            )
+        return actions
+
     # ------------------------------------------------------------------ forms
     def get_form(self, request, obj=None, **kwargs):
         defaults = {}
@@ -812,7 +823,13 @@ class InferenceJobAdmin(admin.ModelAdmin):
 
     def get_actions(self, request):
         """Relabel the stock ``delete_selected`` so it's clear the annotated
-        mp4 goes with the row, not just orphaned under ``inferred/``."""
+        mp4 goes with the row, not just orphaned under ``inferred/``.
+
+        The file removal itself lives in ``videos.signals`` (a ``post_delete``
+        receiver) rather than here, so it also fires when a row disappears by
+        cascade (e.g. deleting the row's ``TrainedModel``) — a path that never
+        goes through this ``ModelAdmin`` at all.
+        """
         actions = super().get_actions(request)
         if "delete_selected" in actions:
             func, name, _desc = actions["delete_selected"]
@@ -821,15 +838,6 @@ class InferenceJobAdmin(admin.ModelAdmin):
                 "Delete selected inferred videos (also deletes the annotated file)",
             )
         return actions
-
-    def delete_model(self, request, obj):
-        obj.output_path().unlink(missing_ok=True)
-        super().delete_model(request, obj)
-
-    def delete_queryset(self, request, queryset):
-        for job in queryset:
-            job.output_path().unlink(missing_ok=True)
-        super().delete_queryset(request, queryset)
 
     @admin.display(description="status", ordering="status")
     def status_badge(self, obj):

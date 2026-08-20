@@ -36,12 +36,15 @@ class CompileError(RuntimeError):
 def _trt_export():
     """The torch-free subset of the trainer's trt_export package."""
     from friendy_chachkalica.ml.trt_export.arch import (
+        get_cast_backend,
         get_fp16_node_block,
         get_fp16_op_block,
         has_trt_prep,
         is_fp16_trusted,
+        resolve_auto_precision,
     )
     from friendy_chachkalica.ml.trt_export.builder import build_engine_from_onnx
+    from friendy_chachkalica.ml.trt_export.modelopt_cast import modelopt_version
     from friendy_chachkalica.ml.trt_export.profile import profile_from_meta
 
     return {
@@ -50,6 +53,9 @@ def _trt_export():
         "get_fp16_op_block": get_fp16_op_block,
         "get_fp16_node_block": get_fp16_node_block,
         "is_fp16_trusted": is_fp16_trusted,
+        "get_cast_backend": get_cast_backend,
+        "resolve_auto_precision": resolve_auto_precision,
+        "modelopt_version": modelopt_version,
         "has_trt_prep": has_trt_prep,
     }
 
@@ -117,8 +123,33 @@ def compile_engine(
     arch = meta.get("arch")
     check_buildable(meta, prepared=prepared)
 
+    cast_backend = "auto"
     if precision == "auto":
-        precision = "fp16" if api["is_fp16_trusted"](arch) else "fp32"
+        # Same policy the trainer's cli uses, from the same table: an arch on the
+        # fp16 floor that ModelOpt AutoCast rescues builds fp16 through AutoCast
+        # when this node has modelopt installed, and fp32 when it does not.
+        precision, cast_backend = api["resolve_auto_precision"](
+            arch, modelopt_available=api["modelopt_version"]() is not None
+        )
+    elif precision == "fp16":
+        # An EXPLICIT fp16 needs the same treatment, and this is not a corner case:
+        # the admin's TRT export form always names a precision (it resolves "auto"
+        # itself, against the TRAINER's modelopt), so every remote fp16 build arrives
+        # here explicit. Leaving cast_backend="auto" would hand builder.py its default
+        # for fp16 -- the blanket graph cast -- i.e. exactly the engine UNTRUSTED_FP16
+        # exists to keep out, built silently under an "fp16" label. Mirrors the refusal
+        # in trt_export/cli.py: an arch that needs AutoCast and a node without modelopt
+        # is an error, not a downgrade.
+        cast_backend = api["get_cast_backend"](arch)
+        if cast_backend == "autocast" and api["modelopt_version"]() is None:
+            raise CompileError(
+                f"arch {arch!r} only has a trustworthy fp16 engine via NVIDIA ModelOpt "
+                f"AutoCast (its blanket-cast fp16 is on the safety floor -- see "
+                f"trt_export/arch/__init__.py), but nvidia-modelopt is not installed on "
+                f"this build node:\n"
+                f"    pip install 'nvidia-modelopt[onnx]'\n"
+                f"Request precision='fp32' instead, or build on a node that has it."
+            )
 
     def _hw(value: Optional[HW]) -> Optional[HW]:
         return (int(value[0]), int(value[1])) if value else None
@@ -146,6 +177,7 @@ def compile_engine(
         precision=precision,
         extra_fp32_ops=api["get_fp16_op_block"](arch),
         node_block_substrings=api["get_fp16_node_block"](arch),
+        cast_backend=cast_backend,
         workspace_gb=workspace_gb,
         min_batch=min_batch,
         opt_batch=opt_batch,

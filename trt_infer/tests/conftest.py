@@ -2,9 +2,10 @@
 
 ``test_trt_parity.py`` builds its own per-arch engines to gate numeric parity against
 the torch adapters. The tests here gate the *runtime plumbing* instead — batching,
-the numpy/torch contracts, output slicing — so they only need one engine, and it has
-to be an EfficientNMS arch with a batch profile wider than 1 (the passthrough archs
-are still built batch-1). YOLOX-nano is the cheapest such engine to build.
+the numpy/torch contracts, output slicing — so they only need one engine built with a
+batch profile wider than 1 (any arch in ``trt_export.arch.BATCH_AWARE_ARCHS`` would do
+now that the DETR-family passthrough archs are batch-aware too). YOLOX-nano is the
+cheapest such engine to build.
 
 **This engine is not deterministic, and no fixture here can make it so.** A random-init
 YOLOX emits a score that does not depend on the input at all — the head's stem collapses

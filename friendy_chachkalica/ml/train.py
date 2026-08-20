@@ -24,6 +24,7 @@ try:
         HARD_IMAGE_METRIC,
         HARD_IMAGE_METRIC_DESCRIPTION,
         evaluate_detection,
+        hard_images_top_k,
         select_hard_images,
     )
     from ..postprocess import apply_class_aware_nms
@@ -39,6 +40,7 @@ except ImportError:
         HARD_IMAGE_METRIC,
         HARD_IMAGE_METRIC_DESCRIPTION,
         evaluate_detection,
+        hard_images_top_k,
         select_hard_images,
     )
     from postprocess import apply_class_aware_nms
@@ -533,6 +535,10 @@ _WARM_START_STRUCTURAL_PARAMS = {
     "rfdetr": ("variant", "resolution"),
     # RT-DETR's repository id selects the model topology (r18/r50/v1/v2).
     "rtdetr": ("weights",),
+    # Same reasoning as rtdetr: D-FINE's repo id selects the size (nano through
+    # xlarge) and dataset (coco/obj365/obj2coco) — its own backbone_config, not
+    # a separate variant kwarg.
+    "dfine": ("weights",),
     # ECDet's variant picks the backbone/encoder/decoder widths, and
     # input_max_size is structural too: ECTransformer pre-generates its anchors
     # from eval_spatial_size at build time, so the same weights at a different
@@ -590,7 +596,7 @@ def _warm_start_build_params(
             )
 
     build_params = {**source_params, **current_params}
-    if model_config.name != "rtdetr":
+    if model_config.name not in ("rtdetr", "dfine"):
         # These architectures select topology independently of weights. Build
         # without another download, then restore the Friendy checkpoint below.
         build_params["weights"] = False
@@ -1176,6 +1182,7 @@ def predict_dataset(
     operating_nms_threshold: Optional[float] = None,
     pipeline: Any = None,
     compute_metrics: bool = True,
+    hard_images_top_k_fraction: Optional[float] = None,
 ) -> Dict[str, Any]:
     adapter.eval()
     records = []
@@ -1247,6 +1254,7 @@ def predict_dataset(
         target_classes=target_classes,
         eval_classes=eval_classes,
         operating_nms_threshold=operating_nms_threshold,
+        top_k_fraction=hard_images_top_k_fraction,
     )
     return metrics
 
@@ -1263,21 +1271,30 @@ def _write_hard_images(
     eval_classes: Optional[Dict[int, str]],
     operating_nms_threshold: Optional[float] = None,
     top_k: int = 50,
+    top_k_fraction: Optional[float] = None,
     iou_threshold: float = 0.5,
     score_threshold: Optional[float] = None,
     max_display_predictions: int = 20,
 ) -> None:
-    """Persist the ``top_k`` hardest images alongside the predictions file.
+    """Persist the hardest images alongside the predictions file.
 
     Writes ``<split>_hard_images.json`` next to ``<split>_predictions.pt`` (self-contained:
     image paths + normalized boxes + class names), which the admin viewer renders. Guarded so
     a split with no ground truth is skipped and any failure never sinks the eval that already
     produced its metrics. Ranking uses the deployed operating confidence and NMS;
     AP's low-confidence collection floor remains exclusive to AP integration.
+
+    How many images to keep: ``top_k_fraction`` (e.g. 0.10 for "worst 10%"), when
+    given, wins over the fixed ``top_k`` count — see ``metrics.hard_images_top_k``.
     """
     if not all_targets or not any(int(target['labels'].numel()) for target in all_targets):
         print("[train] Skipping hard-images artifact: no ground-truth labels in split")
         return
+
+    resolved_top_k = hard_images_top_k(
+        len(all_targets), top_k=None if top_k_fraction is not None else top_k,
+        fraction=top_k_fraction or 0.0,
+    )
 
     if score_threshold is None:
         score_threshold = (
@@ -1302,7 +1319,7 @@ def _write_hard_images(
             ranking_predictions,
             all_targets,
             records,
-            top_k=top_k,
+            top_k=resolved_top_k,
             iou_threshold=iou_threshold,
             score_threshold=score_threshold,
             prediction_classes=prediction_classes,
@@ -1319,7 +1336,8 @@ def _write_hard_images(
                 None if operating_nms_threshold is None else float(operating_nms_threshold)
             ),
             "max_display_predictions": int(max_display_predictions),
-            "top_k": int(top_k),
+            "top_k": int(resolved_top_k),
+            "top_k_fraction": top_k_fraction,
             "num_images_ranked": len(all_targets),
             "images": images,
         }

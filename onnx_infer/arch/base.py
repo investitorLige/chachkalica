@@ -5,7 +5,7 @@ genuinely varies between archs at inference time is how the raw onnxruntime
 output list maps onto the canonical Contract-A 3-tensor
 ``(boxes_xyxy_input_px, scores, labels)``.
 
-All archs (fasterrcnn/retinanet/yolox/rtdetr/rfdetr) export through our own wrapper, which
+All archs (fasterrcnn/retinanet/yolox/rtdetr/rfdetr/ecdet/dfine) export through our own wrapper, which
 emits exactly those three tensors in order, so every handler is currently a
 :class:`PassthroughHandler` (identity). The :meth:`adapt_outputs` seam remains
 for a future arch whose graph output layout we don't control (e.g. a native

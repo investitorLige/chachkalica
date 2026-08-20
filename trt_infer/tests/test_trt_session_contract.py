@@ -65,7 +65,8 @@ def test_unpack_efficientnms_accepts_flat_plugin_output():
 
 
 def test_split_passthrough_indexes_the_batch_axis():
-    """rank-3 boxes: a genuinely batch-aware graph, should one ever be exported."""
+    """rank-3 boxes: a genuinely batch-aware graph — what ecdet/rtdetr/rfdetr's
+    exporters now emit (see ``trt_export.arch.BATCH_AWARE_ARCHS``)."""
     boxes = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
     scores = torch.arange(2 * 3, dtype=torch.float32).reshape(2, 3)
     labels = torch.arange(2 * 3, dtype=torch.int64).reshape(2, 3)
@@ -80,10 +81,12 @@ def test_split_passthrough_indexes_the_batch_axis():
 
 
 def test_split_passthrough_keeps_every_detection_when_there_is_no_batch_axis():
-    """rank-2 boxes: what the rfdetr/rtdetr exporters actually emit, since they index
-    the batch away. Indexing it as a batch axis returned detection *zero* and silently
-    dropped the other 299 — and ``to_friendy`` reshaped that lone box into a
-    plausible ``(1, 6)``, so nothing ever raised."""
+    """rank-2 boxes: what an engine built from the old-style export (batch indexed
+    away) emits — still a real shape this has to handle, since an existing engine
+    doesn't get rebuilt just because the exporter changed. Indexing it as a batch
+    axis returned detection *zero* and silently dropped the other 299 — and
+    ``to_friendy`` reshaped that lone box into a plausible ``(1, 6)``, so nothing
+    ever raised."""
     boxes = torch.arange(300 * 4, dtype=torch.float32).reshape(300, 4)
     scores = torch.arange(300, dtype=torch.float32)
     labels = torch.arange(300, dtype=torch.int64)

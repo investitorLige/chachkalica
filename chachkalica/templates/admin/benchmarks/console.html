@@ -65,6 +65,8 @@
   .arch-tag { font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-dim); border: 1px solid var(--line-strong); padding: 2px 7px; }
   .arch-note { color: var(--ink-dim); font-size: 13px; margin: 4px 0 14px; max-width: 80ch; }
 
+  .variant-params { display: block; font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.02em; text-transform: none; color: var(--ink-faint); font-weight: 500; margin-top: 2px; }
+
   .table-scroll { overflow-x: auto; border: 1px solid var(--line); }
   table.bench { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
   table.bench th, table.bench td { padding: 7px 12px; text-align: right; font-variant-numeric: tabular-nums; }
@@ -123,11 +125,12 @@
 
   <section>
     <h2 class="section-head">Overview</h2>
-    <p class="lead">Five detection architectures &times; every registered variant &times; three export formats
+    <p class="lead">Seven detection architectures &times; every registered variant &times; three export formats
       (<code>.pt</code>, <code>.onnx</code>, <code>.engine</code>), timed on synthetic random-init inputs in the
       trainer container &mdash; a compute-cost and precision-behavior instrument, not an accuracy measurement.</p>
-    <p>Measured on an otherwise-idle GPU so throughput is uncontended. Each format runs on GPU and attempts fp16
-      where safe, falling back to fp32 honestly wherever a format's own fp16 path isn't available (hover a
+    <p>Measured on an otherwise-idle GPU so throughput is uncontended &mdash; except ecdet, swept later on a shared
+      one (see its note). Each format runs on GPU and attempts fp16 where safe, falling back to fp32 honestly wherever
+      a format's own fp16 path isn't available &mdash; or wherever fp16 wouldn't ship at all (hover a
       <span class="pill fp32 pill--flagged">FP32</span> badge for why). <b>GPU utilization is an exact, per-process
       CUPTI reading for all three formats</b> &mdash; a single value (mean == peak), not a whole-device NVML sample.
       Use the <b>size</b> switcher above to compare image sizes.</p>
@@ -138,10 +141,24 @@
     <p class="section-sub">One row per metric, three columns per variant (PT / ONNX / ENGINE), so a variant's cost
       across export formats reads left to right.</p>
     <dl class="legend">
+      <dt>Params</dt>
+      <dd>Parameter count under each variant's name, from its freshly-built PT adapter (<code>sum(p.numel() for p in
+        model.parameters())</code>) &mdash; one number per variant, not per format, since <code>.onnx</code>/<code>.engine</code>
+        export from the same PT model. Recomputed per image size rather than assumed constant, since a handful of
+        variants (ecdet, rfdetr, yolox) rebuild at the page's own canvas. <b>rtdetr and rfdetr's <code>base</code></b>
+        are missing this container's params: both build by downloading a config/backbone from Hugging Face, which
+        this environment currently can't reach (persistent TLS error) &mdash; not a re-timed measurement gap, just an
+        unfetched number.</dd>
       <dt>Precision</dt>
-      <dd>What actually ran. An fp16 request can fall back to fp32 per cell: ENGINE if TensorRT won't compile fp16 at
-        that profile; PT if the adapter is <code>supports_amp=False</code>; ONNX if its fp16-cast graph won't load. A
-        dotted-underline <span class="pill fp32 pill--flagged">FP32</span> badge has the reason on hover.</dd>
+      <dd>What actually ran &mdash; and only what could actually ship. An fp16 request falls back to fp32 per cell:
+        ENGINE if TensorRT won't compile fp16 at that profile; PT if the adapter is <code>supports_amp=False</code>;
+        ONNX if its fp16-cast graph won't load. It is also floored to fp32 when an arch is on the fp16 safety floor
+        (<code>UNTRUSTED_FP16</code> &mdash; ecdet and dfine), since an auto-precision export of it ships fp32 &mdash;
+        for ecdet in every format, and for dfine only in PT/ONNX: dfine's <em>engine</em> has a second, trustworthy
+        fp16 route (NVIDIA ModelOpt AutoCast, which keeps the fp16-fragile nodes in fp32), so that is what an
+        auto-precision export builds and what this page times. A dotted-underline
+        <span class="pill fp32 pill--flagged">FP32</span> badge &mdash; and an fp16 one on dfine's engine &mdash; has
+        the reason on hover.</dd>
       <dt>Latency / Throughput</dt>
       <dd>Per-image time (<code>1000/fps</code>) and images/sec over a timed <code>predict()</code> loop grown to
         &ge;2&nbsp;s, <code>cuda.synchronize()</code>-bracketed, with 5 untimed warmup calls first.</dd>
@@ -194,12 +211,29 @@
         badge):</b> fasterrcnn/retinanet/yolox ONNX (the shared fp16-cast graph is accepted by TensorRT but rejected
         by onnxruntime's session loader &rarr; fp32-on-GPU), and rtdetr PT (its adapter sets
         <code>supports_amp=False</code> for a documented decoder/GIoU fp16 overflow).</li>
-      <li><b>ecdet's fp16 numbers are speed-only, not shippable.</b> Its fp16 engine builds and runs fine &mdash;
-        which is what this page times &mdash; but it fails the trained-checkpoint parity gate
-        (<code>trained_fp16_gate.py</code> on the upstream COCO ECDet-S: confident detections drop or shift past the
-        0.05 L1 gate, and <code>fp16_cast</code> reports an out-of-fp16-range constant in the graph). ecdet is
-        therefore in <code>UNTRUSTED_FP16</code>, so an auto-precision export ships <em>fp32</em>. Read ecdet's fp16
-        row as "what fp16 would cost/save if the overflow gets fixed", not as a deployable configuration.</li>
+      <li><b>dfine is timed at fp16 in ENGINE but fp32 in PT/ONNX</b> &mdash; the only arch on this page whose
+        formats disagree, and the disagreement is what ships. Its blanket-cast fp16 fails the parity gate badly
+        (mAP50 0.72 medium / 0.25 large against PyTorch), so <code>onnx_export</code> refuses to write an fp16
+        sidecar and PT is floored with it; its <em>engine</em> goes through ModelOpt AutoCast instead, which keeps
+        the <code>inverse_sigmoid</code> Div/Log, the deformable-attention index math and the wrapper&rsquo;s
+        flattened top-k in fp32 and scores <b>0.996 / 0.983</b> mAP50 against PyTorch &mdash; better than dfine&rsquo;s
+        own fp32 TensorRT engine, which is itself lossy on this architecture (155 of torch&rsquo;s 199 confident
+        detections). Read the ENGINE column as the deployable number and the ONNX column as fp32; the ratio between
+        them is not a pure runtime comparison. Requires <code>nvidia-modelopt</code> on the machine that compiles
+        the engine &mdash; without it an auto-precision build floors dfine to fp32.</li>
+      <li><b>ecdet is timed at fp32 in every format, unlike the five archs above.</b> Its fp16 engine builds and runs
+        fine, but it fails the trained-checkpoint parity gate (<code>trained_fp16_gate.py</code> on the upstream COCO
+        ECDet-S: confident detections drop or shift past the 0.05 L1 gate, and <code>fp16_cast</code> reports an
+        out-of-fp16-range constant in the graph), so ecdet sits in <code>UNTRUSTED_FP16</code> and an auto-precision
+        export ships <em>fp32</em>. The sweep now honours that floor, so these rows are what you can actually deploy
+        &mdash; but they are one precision step behind the rest of the page, so any ecdet-vs-other-arch comparison is
+        fp32-vs-fp16. Measured against the fp16 rows this replaced: ENGINE pays the most (&minus;15&thinsp;% at 320,
+        &minus;50&thinsp;% at 640, &minus;75&thinsp;% at 960 &mdash; fp16's advantage grows with the token grid), PT
+        pays ~&minus;25&thinsp;% at 640/960 and nothing at 320 (overhead-bound there), and <b>ONNX is
+        <em>faster</em></b> at fp32 (+30 to +106&thinsp;%) &mdash; onnxruntime runs the fp16-cast graph worse than the
+        plain fp32 one, the same converter weakness that already forces fasterrcnn/retinanet/yolox ONNX to fp32 above.
+        ecdet's fp16 speed is still measurable (<code>--allow-untrusted-fp16</code>) if the question is "what would
+        fp16 save once the overflow is fixed".</li>
       <li><b>ONNX &Delta;mem is arena reservation, not working set</b> &mdash; onnxruntime grabs a pool on first Run()
         and reuses it, so ONNX reads high and flat (~526&nbsp;MB floor at &le;640, up to 2&ndash;4&nbsp;GB for the
         DETRs at 960 as feature maps grow). Compare ONNX-to-ONNX only.</li>
@@ -260,6 +294,13 @@ function formatMem(mb) {
   return Math.round(mb) + ' MB';
 }
 
+function formatParams(n) {
+  if (n == null) return '';
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M params';
+  if (n >= 1e3) return (n / 1e3).toFixed(0) + 'K params';
+  return n + ' params';
+}
+
 function formatUtil(c) {
   if (c.util_mean == null) return dash();
   const m = Math.round(c.util_mean), p = Math.round(c.util_peak);
@@ -273,7 +314,8 @@ const ARCH_META = {
   rfdetr: { title: 'RF-DETR', tag: 'DETR · nms-free', note: 'fp16 clean on all three formats. Its exported (ONNX/ENGINE) throughput falls off a cliff above ~640 while PT stays flat — resolution-driven, see limitations. ENGINE memory reads a flat ~90 MB where variants share the ViT-S encoder.' },
   rtdetr: { title: 'RT-DETR', tag: 'DETR · nms-free', note: 'ENGINE: static profile takes all four variants from fp32 to fp16, memory scales cleanly with backbone (r18vd → r101vd). ONNX: fp16 clean too. PT stays fp32 on purpose — its adapter documents a decoder/GIoU overflow under fp16 autocast.' },
   yolox: { title: 'YOLOX', tag: 'single-stage', note: 'ENGINE: fp16 clean, memory scales monotonically with variant size (nano → x). PT: fp16 via autocast. ONNX: same fp16-cast-won’t-load issue as fasterrcnn/retinanet.' },
-  ecdet: { title: 'ECDet', tag: 'DETR · nms-free', note: 'Distilled compact-ViT backbone + RT-DETR-style encoder and D-FINE-style decoder; the highest COCO AP per parameter here (51.7/54.3/57.0/57.9 for s/m/l/x at 10–49M). ENGINE compiles straight from the standard ONNX like the other DETRs, batch-1. <strong>fp16 timings are speed-only</strong>: ecdet is in UNTRUSTED_FP16 because its fp16 engine fails the trained-checkpoint parity gate, so an auto-precision build ships fp32 — see limitations.' },
+  ecdet: { title: 'ECDet', tag: 'DETR · nms-free', note: 'Distilled compact-ViT backbone + RT-DETR-style encoder and D-FINE-style decoder; the highest COCO AP per parameter here (51.7/54.3/57.0/57.9 for s/m/l/x at 10–49M). ENGINE compiles straight from the standard ONNX like the other DETRs, batch-1. <strong>Timed at fp32, not fp16</strong>: ecdet is in UNTRUSTED_FP16 because its fp16 engine fails the trained-checkpoint parity gate, so an auto-precision build ships fp32 and the sweep measures fp32 to match — these rows are deployable, but a precision step behind the other archs here (see limitations). <strong>Measured on a shared GPU</strong>, unlike the other five archs above: a live camera-inference/incident-inference workload held ~13.7 GB VRAM and ~9–14% util throughout, so treat ecdet\'s absolute fps as real-world "shared GPU" numbers rather than an idle-machine peak — CUPTI util is still exact per-process regardless.' },
+  dfine: { title: 'D-FINE', tag: 'DETR \u00b7 nms-free', note: 'HGNetV2 backbone + RT-DETR-style encoder with D-FINE\u2019s fine-grained distribution refinement decoder (42.8/48.5/52.3/54.0/55.8 COCO AP for nano/small/medium/large/xlarge at 4\u201362M). Built from the real <code>ustc-community</code> COCO weights in this box\u2019s offline HF cache rather than random-init \u2014 free here, and it makes the params column exact. <strong>The ENGINE row is fp16, the PT/ONNX rows are fp32, and that split is deliberate</strong>: dfine sits in UNTRUSTED_FP16 because its blanket-cast fp16 destroys the model, but its engine has a second route \u2014 NVIDIA ModelOpt AutoCast, which keeps the inverse_sigmoid and top-k index nodes in fp32 \u2014 that reproduces PyTorch (mAP50 0.996 medium / 0.983 large over 24 real images) at ~2\u00d7 the fp32 speed, so that is what an auto-precision export ships and what is timed here. The ONNX fp16 sidecar is that same blanket cast and the exporter refuses to write it, so ONNX is timed fp32 \u2014 a dfine ONNX-vs-ENGINE gap on this page is part precision, not just runtime. <strong>Measured on a lightly shared GPU</strong> (a live camera-inference workload holding ~1.3\u2009GB and ~7\u2009% util throughout, steady rather than bursty) \u2014 far quieter than ecdet\u2019s contended run but not an idle machine; CUPTI util is per-process and exact regardless.' },
 };
 
 function renderArch(archKey) {
@@ -296,7 +338,11 @@ function renderArch(archKey) {
 
   const variantRow = document.createElement('tr');
   variantRow.className = 'variant-row';
-  variantRow.innerHTML = '<th class="rowlabel"></th>' + arch.variants.map(v => `<th colspan="3">${v}</th>`).join('');
+  variantRow.innerHTML = '<th class="rowlabel"></th>' + arch.variants.map(v => {
+    const params = (arch.params || {})[v];
+    const sub = params != null ? `<span class="variant-params">${formatParams(params)}</span>` : '';
+    return `<th colspan="3">${v}${sub}</th>`;
+  }).join('');
 
   const fmtRow = document.createElement('tr');
   fmtRow.className = 'fmt-row';
@@ -329,7 +375,7 @@ function renderArch(archKey) {
 }
 
 const container = document.getElementById('tables');
-['fasterrcnn', 'retinanet', 'rfdetr', 'rtdetr', 'yolox', 'ecdet'].forEach(a => {
+['fasterrcnn', 'retinanet', 'rfdetr', 'rtdetr', 'yolox', 'ecdet', 'dfine'].forEach(a => {
   const el = renderArch(a);
   if (el) container.appendChild(el);
 });

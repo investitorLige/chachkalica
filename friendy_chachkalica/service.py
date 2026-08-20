@@ -202,6 +202,13 @@ class ExportTrtRequest(BaseModel):
     # profile min==opt==max==(H,W). Required to get FP16 on Faster R-CNN, whose graph
     # only compiles FP16 at a static size (a dynamic profile falls back to FP32).
     input_hw: Optional[List[int]] = None
+    # TensorRT batch profile. Default 1/1/1 (today's behavior for every arch).
+    # max_batch > 1 is only accepted for a batch-aware arch (see
+    # ml/checkpoint_info.py's inspect_checkpoint) — build_engine raises otherwise
+    # rather than silently building a profile the graph can't back correctly.
+    min_batch: int = 1
+    opt_batch: int = 1
+    max_batch: int = 1
 
 
 class ExportBundleRequest(BaseModel):
@@ -839,6 +846,14 @@ def export_trt(req: ExportTrtRequest):
         raise HTTPException(status_code=400, detail=f"checkpoint not found: {checkpoint}")
     if req.precision not in ("fp16", "fp32"):
         raise HTTPException(status_code=400, detail=f"precision must be fp16 or fp32, got {req.precision!r}")
+    if not (1 <= req.min_batch <= req.opt_batch <= req.max_batch):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"batch profile must satisfy 1 <= min_batch <= opt_batch <= max_batch, "
+                f"got min={req.min_batch} opt={req.opt_batch} max={req.max_batch}"
+            ),
+        )
 
     static_hw = None
     if req.input_hw is not None:
@@ -859,7 +874,9 @@ def export_trt(req: ExportTrtRequest):
                 if static_hw is not None else {}
             )
             engine_path = build_engine(
-                req.checkpoint_path, req.engine_path, precision=req.precision, **hw_kwargs
+                req.checkpoint_path, req.engine_path, precision=req.precision,
+                min_batch=req.min_batch, opt_batch=req.opt_batch, max_batch=req.max_batch,
+                **hw_kwargs,
             )
         except HTTPException:
             raise

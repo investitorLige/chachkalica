@@ -360,27 +360,30 @@ def _unpack_efficientnms(ordered: list, batch_size: int) -> list:
 
 
 def _split_passthrough(ordered: list, batch_size: int) -> list:
-    """Passthrough outputs (rtdetr/rfdetr) -> one ``[boxes, scores, labels]`` triple
-    per image.
+    """Passthrough outputs (ecdet/rtdetr/rfdetr/dfine) -> one ``[boxes, scores, labels]``
+    triple per image.
 
-    **These graphs have no batch axis.** Both export wrappers index it away before
-    baking the head math — ``onnx_export/arch/rfdetr.py`` (``boxes_n, logits =
-    boxes_n[0], logits[0]``) and ``arch/rtdetr.py`` (``out.logits[0]`` /
-    ``out.pred_boxes[0]``) — so the graph emits ``boxes[N,4] / scores[N] / labels[N]``
-    where **N is the detection count, not the batch size**. Their engines are built
-    with a batch profile of exactly 1 to match.
+    **Batch axis detected by rank, not assumed.** These archs' export wrappers used
+    to index the batch axis away before baking the head math (a single ``[0]`` on
+    the model output, then a flattened top-k), which emitted
+    ``boxes[N,4] / scores[N] / labels[N]`` with N the detection count, not the batch
+    size — and their engines were built with a batch profile of exactly 1 to match.
+    The wrappers now carry a real batch dim through (see each
+    ``onnx_export/arch/*.py`` module docstring and ``trt_export.arch.
+    BATCH_AWARE_ARCHS``), emitting ``boxes[B,K,4] / scores[B,K] / labels[B,K]``
+    instead — but an engine built from the OLD-style export (or from a fresh export
+    with the default batch-1 profile) still only ever has rank-2 outputs, so both
+    shapes have to keep working: rank-2 ``boxes`` means no batch axis (the whole
+    output is one image's detections), rank-3 means a real batch axis to index.
 
-    This used to read ``boxes[i], scores[i], labels[i]``, which at ``batch_size == 1``
-    returned detection *zero* — ``(4,) / () / ()`` — and silently discarded every other
-    detection. ``to_friendy`` then reshaped that lone box into a valid ``(1, 6)``, so
-    nothing raised: an RF-DETR engine emitting 300 detections per crop delivered
-    exactly one, and a person could only ever carry a single PPE label. The ONNX path
-    was never affected — ``OnnxModel.run`` returns the graph's outputs untouched, which
-    is what defines the handler contract these have to meet.
-
-    The batch axis is therefore detected by rank rather than assumed: rank-2 ``boxes``
-    means no batch axis (the current exporters), rank-3 means a genuinely batch-aware
-    graph, should one ever be exported.
+    Getting this wrong at ``batch_size == 1`` on a rank-2 output used to read
+    ``boxes[i], scores[i], labels[i]``, which returned detection *zero* —
+    ``(4,) / () / ()`` — and silently discarded every other detection. ``to_friendy``
+    then reshaped that lone box into a valid ``(1, 6)``, so nothing raised: an
+    RF-DETR engine emitting 300 detections per crop delivered exactly one, and a
+    person could only ever carry a single PPE label. The ONNX path was never
+    affected — ``OnnxModel.run`` returns the graph's outputs untouched, which is
+    what defines the handler contract these have to meet.
     """
     boxes, scores, labels = ordered
     if boxes.ndim <= 2:

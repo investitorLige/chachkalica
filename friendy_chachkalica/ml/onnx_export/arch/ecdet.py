@@ -13,8 +13,13 @@ xyxy (``box_coords: "input_normalized"``). No NMS (ECDet is set-based and
 NMS-free), and no threshold in the graph: the service applies it after top-k,
 mirroring the adapter. Because the graph carries no data-dependent NMS,
 TensorRT compiles this standard export directly — ecdet has **no**
-``trt_export/arch/`` prep, which is what puts it on the passthrough side of the
-split (and therefore on a batch-1 engine profile, like rtdetr/rfdetr).
+``trt_export/arch/`` prep; ``build_engine`` compiles the standard ``.onnx``.
+
+**Batch-aware.** ``top_k`` is a fixed constant per image (see below), so the
+wrapper does the sigmoid/top-k/gather per row of the batch instead of indexing
+batch away, and emits ``(boxes[B,K,4], scores[B,K], labels[B,K])`` — a real
+batch axis TensorRT can build a wider optimization profile around (see
+``trt_export/arch/__init__.py``'s ``BATCH_AWARE_ARCHS``).
 
 The service replicates the adapter's input pipeline: stretch-resize to a square
 ``input_max_size`` canvas (aspect ratio *not* preserved, matching upstream
@@ -79,14 +84,16 @@ def export_ecdet(adapter, *, num_classes, params, class_map, onnx_path: str | Pa
 
         def forward(self, pixel_values):
             out = self.model(pixel_values)
-            logits = out["pred_logits"][0]    # [Q, C]
-            boxes_n = out["pred_boxes"][0]    # [Q, 4] normalized cxcywh
-            cx, cy, w, h = boxes_n[:, 0], boxes_n[:, 1], boxes_n[:, 2], boxes_n[:, 3]
+            logits = out["pred_logits"]    # [B, Q, C]
+            boxes_n = out["pred_boxes"]    # [B, Q, 4] normalized cxcywh
+            cx, cy, w, h = (
+                boxes_n[..., 0], boxes_n[..., 1], boxes_n[..., 2], boxes_n[..., 3]
+            )
             xyxy = torch.stack(
-                [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=1
-            )  # [Q, 4] normalized xyxy
+                [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1
+            )  # [B, Q, 4] normalized xyxy
 
-            num_cls = logits.shape[1]
+            num_queries, num_cls = logits.shape[1], logits.shape[2]
             scores = torch.sigmoid(logits)  # focal-loss path (ECDet default)
             # Clamped exactly as ECDetAdapter.predict clamps it. num_top_queries
             # (300) normally sits below queries*classes, but a config that lowers
@@ -97,11 +104,18 @@ def export_ecdet(adapter, *, num_classes, params, class_map, onnx_path: str | Pa
             # This traces to a constant (torch warns), which is what we want: the
             # graph is static-shaped anyway — fixed canvas, fixed query count — so
             # the detection count is a property of the export, not of the input.
-            top_k = min(num_top_queries, logits.shape[0] * num_cls)
-            top_scores, top_idx = torch.topk(scores.flatten(), top_k)
+            top_k = min(num_top_queries, num_queries * num_cls)
+            flat_scores = scores.reshape(scores.shape[0], -1)  # [B, Q*C]
+            top_scores, top_idx = torch.topk(flat_scores, top_k, dim=1)  # [B, K]
             labels = top_idx % num_cls
             box_idx = top_idx // num_cls
-            return xyxy[box_idx], top_scores, labels.to(torch.int64)
+            # Per-batch-row gather: box_idx[b, k] indexes xyxy[b], not a shared
+            # first dim, so this can't be a plain xyxy[box_idx] fancy-index
+            # (that would index the batch axis itself once B > 1).
+            boxes_out = torch.gather(
+                xyxy, 1, box_idx.unsqueeze(-1).expand(-1, -1, 4)
+            )  # [B, K, 4]
+            return boxes_out, top_scores, labels.to(torch.int64)
 
     wrapper = ECDetExport(model)
     export_detection_wrapper(
@@ -109,6 +123,7 @@ def export_ecdet(adapter, *, num_classes, params, class_map, onnx_path: str | Pa
         onnx_path,
         dummy_hw=(canvas_size, canvas_size),
         dynamic_input_hw=False,
+        batch_aware=True,
     )
 
     return build_meta(

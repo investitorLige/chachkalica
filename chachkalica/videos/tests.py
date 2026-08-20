@@ -749,6 +749,54 @@ class StreamViewTests(VideosBase):
         self.assertEqual(b"".join(resp.streaming_content), b"2345")
 
 
+class CleanupSignalTests(VideosBase):
+    """Deleting a Video/InferenceJob row should also remove its file on disk
+    (see ``videos.signals``), the same convention ``training.signals`` uses."""
+
+    def test_deleting_video_removes_its_file(self):
+        self._touch("clip.mp4")
+        video = Video.objects.create(name="clip", filename="clip.mp4", status=Video.READY)
+        path = video.path()
+        self.assertTrue(path.exists())
+        video.delete()
+        self.assertFalse(path.exists())
+
+    def test_deleting_video_with_no_file_is_safe(self):
+        # e.g. a row still downloading, or one whose download failed.
+        video = Video.objects.create(name="pending", filename="", status=Video.DOWNLOADING)
+        video.delete()  # must not raise
+
+    def test_deleting_inference_job_removes_annotated_video(self):
+        self._touch("clip.mp4")
+        video = Video.objects.create(name="clip", filename="clip.mp4", status=Video.READY)
+        out = inference.output_dir() / "clip_inferred.mp4"
+        out.write_bytes(b"fake-annotated-mp4")
+        job = InferenceJob.objects.create(video=video, output_filename=out.name)
+        job.delete()
+        self.assertFalse(out.exists())
+
+    def test_deleting_inference_job_with_no_output_is_safe(self):
+        self._touch("clip.mp4")
+        video = Video.objects.create(name="clip", filename="clip.mp4", status=Video.READY)
+        job = InferenceJob.objects.create(video=video)  # never finished, output_filename blank
+        job.delete()  # must not raise (was IsADirectoryError before this used a signal)
+
+    def test_deleting_trained_model_cascades_and_cleans_up_inference_job_output(self):
+        """A path that never goes through InferenceJobAdmin at all."""
+        self._touch("clip.mp4")
+        video = Video.objects.create(name="clip", filename="clip.mp4", status=Video.READY)
+        model = TrainedModel.objects.create(name="m1", arch="yolox", checkpoint_path="/tmp/best.pt")
+        out = inference.output_dir() / "clip_inferred.mp4"
+        out.write_bytes(b"fake-annotated-mp4")
+        job = InferenceJob.objects.create(
+            video=video, model_source=InferenceJob.TRAINED, trained_model=model,
+            output_filename=out.name,
+        )
+        model.delete()
+        self.assertFalse(InferenceJob.objects.filter(pk=job.pk).exists())
+        self.assertFalse(out.exists())
+
+
 class DrawBoxesTests(TestCase):
     """``inference.draw_boxes`` — shared with the live camera path, so it has to
     hold up on 4K frames as well as the ~1080p video it was written for."""

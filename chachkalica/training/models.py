@@ -229,26 +229,13 @@ class Experiment(models.Model):
         default=224.0,
         validators=[MinValueValidator(0.0)],
         verbose_name="Person-crop minimum size (px)",
-        help_text="If a detected person's crop (after expand ratio) is narrower or "
-                  "shorter than this many pixels, grow it — using real neighboring "
-                  "frame pixels first, falling back to zero-padding only if the frame "
-                  "itself is smaller than the floor — rather than dropping the person "
-                  "outright; small/distant CCTV subjects must still reach the model. "
-                  "0 disables the floor. Applies to both person-crop pipelines: "
-                  "batch_people only *finds* people in tiles and then crops the "
-                  "original frame, so its crops are exactly as small as "
-                  "people_detect_first's. Introduced after run "
-                  "PPE_v0.4_ppl_first-29's "
-                  "RT-DETR run crashed on epoch 1 batch 1 with 'selected index k out of "
-                  "range': RT-DETR's encoder does topk(num_queries) over its last feature "
-                  "map, which has (padded_size / 32)^2 tokens, so a crop must be large "
-                  "enough to out-token whatever num_queries the model uses. The default "
-                  "224 gives >= (224/32)^2 = 49 tokens (a conservative square-crop floor; "
-                  "real person crops are usually taller than wide, so the true count is "
-                  "typically higher) — comfortably above the 25-query default this app "
-                  "now injects for rtdetr models on this pipeline (see config_gen.model_entry). "
-                  "Raise both together if you deliberately increase num_queries in a "
-                  "model's params.",
+        help_text="Any side of a person crop under this many pixels is grown to the "
+                  "floor — real neighbouring frame pixels first, bilinear upscale only "
+                  "if the frame itself is smaller — instead of the person being "
+                  "dropped, so distant CCTV subjects still reach the model. Sides "
+                  "already at or over the floor are left alone. Keep it above "
+                  "32·√num_queries or DETR-style models crash on topk; 224 clears the "
+                  "25 queries used here. 0 disables.",
     )
     tile_size_px = models.PositiveIntegerField(
         null=True,
@@ -293,6 +280,20 @@ class Experiment(models.Model):
     chain = models.JSONField(
         default=list, blank=True,
         help_text="Ordered pipeline names for the 'chain' pipeline.",
+    )
+
+    # --- fine-tuning provenance ---
+    # Set only by TrainedModelAdmin.fine_tune, which builds one of these (plus its
+    # dataset/model rows) instead of an operator filling out the fields by hand.
+    # editable=False keeps both out of the ordinary Experiment add/change form —
+    # this is bookkeeping the action writes, not something to hand-edit — and out
+    # of ExperimentAdmin's list (see ExperimentAdmin.get_queryset), so the
+    # Experiments tab stays about hand-built configs.
+    is_finetune = models.BooleanField(default=False, editable=False)
+    finetune_source = models.ForeignKey(
+        "TrainedModel", on_delete=models.SET_NULL, null=True, blank=True,
+        editable=False, related_name="finetune_experiments",
+        help_text="The trained model this experiment fine-tunes, when is_finetune.",
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -414,6 +415,7 @@ class ExperimentModel(models.Model):
     RFDETR = "rfdetr"
     FASTERRCNN = "fasterrcnn"
     ECDET = "ecdet"
+    DFINE = "dfine"
     ARCH_CHOICES = [
         (RETINANET, "retinanet"),
         (YOLOX, "yolox"),
@@ -421,6 +423,7 @@ class ExperimentModel(models.Model):
         (RFDETR, "rfdetr"),
         (FASTERRCNN, "fasterrcnn"),
         (ECDET, "ecdet"),
+        (DFINE, "dfine"),
     ]
 
     experiment = models.ForeignKey(Experiment, on_delete=models.CASCADE, related_name="models")
@@ -490,6 +493,23 @@ class TrainingRun(models.Model):
     def __str__(self) -> str:
         name = self.experiment.name if self.experiment else "(deleted experiment)"
         return f"Run #{self.pk} — {name}"
+
+
+class FineTuningRun(TrainingRun):
+    """Proxy for :class:`TrainingRun`, scoped to fine-tune runs.
+
+    Same table, same fields, same behaviour — it exists purely so
+    ``training/admin.py`` can register a second ``ModelAdmin`` over the one
+    table as its own "Fine-tuning runs" tab (Django admin can't register a model
+    twice otherwise). ``FineTuningRunAdmin`` filters its queryset to
+    ``experiment__is_finetune=True`` and ``TrainingRunAdmin``'s own queryset
+    excludes those rows, so a run appears in exactly one tab.
+    """
+
+    class Meta:
+        proxy = True
+        verbose_name = "Fine-tuning run"
+        verbose_name_plural = "Fine-tuning runs"
 
 
 class RunResult(models.Model):
@@ -586,6 +606,11 @@ class TrainedModel(models.Model):
     source_run_result = models.ForeignKey(
         RunResult, on_delete=models.SET_NULL, null=True, blank=True, related_name="trained_models",
     )
+    parent_model = models.ForeignKey(
+        "self", on_delete=models.SET_NULL, null=True, blank=True, related_name="finetuned_children",
+        help_text="The trained model this one was fine-tuned from, if any — set "
+                  "automatically by the 'Fine-tune model…' action.",
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -640,6 +665,16 @@ class ExportRun(models.Model):
     # to the ordinary infer.py. False on every historical row, which is exactly what those
     # bundles hold.
     gpu_infer = models.BooleanField(default=False)
+
+    # TensorRT batch profile: min=opt=max=1 on every historical row, which is exactly
+    # what those engines were built with. A fixed-batch build sets all three equal;
+    # a variable build sets min_batch=1 and opt_batch=max_batch (matching the same
+    # min-1/max-N convention chachak.bundle_export already uses). Local builds only —
+    # a remote build node's bundle assembles its own batch config from the pipeline
+    # request (chachak's infer_batch_size), not from these; see jobs._remote_spec.
+    min_batch = models.PositiveIntegerField(default=1)
+    opt_batch = models.PositiveIntegerField(default=1)
+    max_batch = models.PositiveIntegerField(default=1)
 
     # Where the build ran. NULL means the local trainer — the only possibility
     # before build nodes existed, so every historical row reads correctly. A row
