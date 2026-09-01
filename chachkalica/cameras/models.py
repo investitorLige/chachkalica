@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from django.core.exceptions import ValidationError
 from django.db import models
 
@@ -243,13 +241,13 @@ class CameraInference(models.Model):
         """Absolute path of the model artifact to run.
 
         Mirrors :meth:`videos.models.InferenceJob.model_checkpoint`: trained
-        models carry a possibly project-relative checkpoint path, exported
-        artifacts resolve against the export output directory and bundles against
-        the bundle root (both reject anything escaping their root). Raises
-        ``ValueError`` when the config's model is missing or unusable.
+        models carry a possibly project-relative checkpoint path (see
+        ``TrainedModel.resolved_checkpoint_path``, which also falls back from a
+        missing ``best.pt`` to a sibling ``last.pt``); exported artifacts resolve
+        against the export output directory and bundles against the bundle root
+        (both reject anything escaping their root). Raises ``ValueError`` when
+        the config's model is missing or unusable.
         """
-        from django.conf import settings
-
         if self.model_source == self.EXPORTED:
             from training.services import exports
 
@@ -264,11 +262,7 @@ class CameraInference(models.Model):
 
         if not self.trained_model_id:
             raise ValueError("Live inference has no trained model selected.")
-        raw = (self.trained_model.checkpoint_path or "").strip()
-        if not raw:
-            raise ValueError(f"{self.trained_model.name}: no checkpoint path to run.")
-        path = Path(raw)
-        return str(path if path.is_absolute() else Path(settings.BASE_DIR) / path)
+        return str(self.trained_model.resolved_checkpoint_path())
 
     def interval_seconds(self) -> float:
         """Minimum seconds between two inference calls, from :attr:`target_fps`."""

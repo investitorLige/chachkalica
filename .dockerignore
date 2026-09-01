@@ -20,5 +20,9 @@ chachkalica/
 # checkpoint that make_person_graphs.py reads), never COPYed into an image.
 person_model_test/
 dist/
-inferlica/
 logs/
+
+# inferlica/ is NOT excluded, despite the note above: the trainer image now COPYs it
+# (the bundle benchmark runs from it — see friendy_chachkalica/Dockerfile). It is a few
+# hundred KB of Python with __pycache__ already excluded, so the cost to the buildnode
+# image, which shares this context and does not copy it, is only the context transfer.

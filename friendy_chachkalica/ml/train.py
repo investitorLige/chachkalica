@@ -742,8 +742,22 @@ def train_model(
         adapter.model.load_state_dict(state["model_state_dict"])
         if state.get("optimizer_state_dict") is not None:
             optimizer.load_state_dict(state["optimizer_state_dict"])
+            # load_state_dict restores every param group verbatim, including
+            # 'lr' — silently undoing a bumped config.training.optimizer.lr
+            # (e.g. from the "Extend run" admin action). Reassert it now that
+            # the checkpoint is loaded.
+            for group in optimizer.param_groups:
+                group["lr"] = config.training.optimizer.lr
         if scheduler is not None and state.get("scheduler_state_dict") is not None:
             scheduler.load_state_dict(state["scheduler_state_dict"])
+            # Same problem for the scheduler: its state_dict is just its whole
+            # __dict__, so this also restores base_lrs and, for a cosine
+            # schedule, T_max — re-snapping both to the run's *original*
+            # lr/epoch horizon and undoing an extend. Resync from the
+            # just-rebuilt config.
+            scheduler.base_lrs = [config.training.optimizer.lr for _ in scheduler.base_lrs]
+            if hasattr(scheduler, "T_max"):
+                scheduler.T_max = config.training.epochs
         if scaler is not None and state.get("scaler_state_dict") is not None:
             scaler.load_state_dict(state["scaler_state_dict"])
         history = list(state.get("history") or [])

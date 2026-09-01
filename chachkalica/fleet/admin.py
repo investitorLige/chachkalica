@@ -628,6 +628,7 @@ class DatasetAdmin(admin.ModelAdmin):
                 datasets[1].id,
                 prune_left=prune_left,
                 prune_right=prune_right,
+                job_timeout=jobs.PRUNE_OVERLAPS_JOB_TIMEOUT,
             )
             self.message_user(
                 request,
@@ -721,7 +722,10 @@ class DatasetAdmin(admin.ModelAdmin):
             # request timeout, so it's queued the same way as check_overlapping_images.
             if action not in (None, "", "prune"):
                 return JsonResponse({"error": "duplicate images only support prune"}, status=400)
-            _queue().enqueue(jobs.prune_intra_duplicates, dataset.id)
+            _queue().enqueue(
+                jobs.prune_intra_duplicates, dataset.id,
+                job_timeout=jobs.PRUNE_INTRA_DUPLICATES_JOB_TIMEOUT,
+            )
             return JsonResponse({"queued": True, "dataset": dataset.name, "issue": issue})
 
         try:

@@ -44,7 +44,7 @@ from training.models import (
 from training import model_specs, pipelines
 from training.forms import ExperimentModelForm
 from training.services import (
-    buildnode, combine, config_gen, exports, finetune, ingest, pipeline_meta, promote,
+    buildnode, combine, config_gen, exports, extend, finetune, ingest, pipeline_meta, promote,
     runner, teardown,
 )
 
@@ -285,8 +285,8 @@ class TrainingRunAdmin(admin.ModelAdmin):
     list_filter = ["status", "experiment"]
     inlines = [RunResultInline]
     actions = [
-        "launch_selected", "resume_selected", "pause_selected", "live_training_report",
-        "ingest_selected", "reconcile_selected", "kill_run_gracefully",
+        "launch_selected", "resume_selected", "extend_run", "pause_selected",
+        "live_training_report", "ingest_selected", "reconcile_selected", "kill_run_gracefully",
     ]
     readonly_fields = [
         "experiment", "status", "epoch_progress", "config_yaml_path", "output_dir",
@@ -549,6 +549,70 @@ class TrainingRunAdmin(admin.ModelAdmin):
             run.status = TrainingRun.QUEUED
             run.save(update_fields=["status"])
         self.message_user(request, "Resume job(s) queued — refresh to see progress.")
+
+    @admin.action(description="Extend run (more epochs)…")
+    def extend_run(self, request, queryset):
+        """Give a finished run more epochs (and optionally a new lr), then resume it.
+
+        A plain "Resume from checkpoint" on an already-finished run is a no-op:
+        its config still says the original epoch count, and its output dir
+        already has a ``result.yaml`` the trainer treats as "done, skip". This
+        bumps the source Experiment's ``epochs``/``lr``, rewrites the run's
+        config, moves the stale ``result.yaml`` aside (see
+        ``training.services.extend``), and queues the same resume job
+        "Resume from checkpoint" does — one click instead of three.
+        """
+        if queryset.count() != 1:
+            self.message_user(request, "Select exactly one run to extend.",
+                              level=messages.WARNING)
+            return None
+        run = queryset.first()
+        if run.status not in (TrainingRun.OK, TrainingRun.ERROR, TrainingRun.PAUSED):
+            self.message_user(
+                request,
+                f"Run #{run.pk} is {run.status}; extend only a finished, errored, or "
+                "paused run.",
+                level=messages.WARNING,
+            )
+            return None
+
+        if request.POST.get("apply"):
+            additional_epochs = _int_or_none(request.POST.get("additional_epochs"))
+            if not additional_epochs or additional_epochs < 1:
+                self.message_user(request, "Enter how many more epochs to train.",
+                                  level=messages.WARNING)
+                return None
+            new_lr = _float_or_none(request.POST.get("new_lr"))
+            try:
+                extend.extend_run(run, additional_epochs, new_lr)
+            except ValueError as exc:
+                self.message_user(request, f"Cannot extend run #{run.pk}: {exc}",
+                                  level=messages.ERROR)
+                return None
+
+            queue = _queue()
+            queue.enqueue(jobs.run_training, run.pk, resume=True, job_timeout=jobs.JOB_TIMEOUT)
+            run.status = TrainingRun.QUEUED
+            run.save(update_fields=["status"])
+            self.message_user(
+                request,
+                f"Run #{run.pk} extended by {additional_epochs} epoch(s)"
+                + (f" at lr={new_lr}" if new_lr is not None else "")
+                + " and queued to resume.",
+            )
+            return None
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Extend run #{run.pk}",
+            "run": run,
+            "current_epochs": run.experiment.epochs,
+            "current_lr": run.experiment.lr,
+            "action": "extend_run",
+            "selected": [str(run.pk)],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+        }
+        return TemplateResponse(request, "admin/training/extend_run.html", context)
 
     @admin.action(description="Pause run (stop, keep row for later resume)")
     def pause_selected(self, request, queryset):

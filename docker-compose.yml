@@ -224,6 +224,17 @@ services:
       - ./chachkalica/data:/app/data
       - ./chachkalica/data/source:/app/data/source
       - ./models:/app/models:ro
+      # Nsight Systems, for the bundle benchmark's opt-in per-kernel profile. Mounted
+      # rather than baked into the image because it is ~1.1 GB, and read-only because
+      # nothing here writes to it. Point NSYS_HOST_DIR at whatever the host has (a CUDA
+      # toolkit install puts it under /opt/nvidia/nsight-systems/<version>).
+      #
+      # Nothing breaks if the path is wrong or absent: the harness looks for nsys, finds
+      # none, and records "Nsight profile unavailable" as a warning while every other
+      # measurement proceeds. Tracing works unprivileged; GPU performance counters
+      # (occupancy) do not and are deliberately never requested — see
+      # chachkalica/docs/bundle-benchmarks.md.
+      - ${NSYS_HOST_DIR:-/opt/nvidia/nsight-systems/2025.5.2}:/opt/nsight:ro
     restart: unless-stopped
 
     # ───────────────────────────────── GPU ─────────────────────────────────

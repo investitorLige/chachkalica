@@ -78,12 +78,24 @@ class GpuSample:
     peak_util_pct: Optional[float] = None
     available: bool = False
     error: Optional[str] = None
+    # Trust context, added for the bundle benchmark: a latency number measured
+    # while the card is power- or thermally-capped is not the number the same
+    # bundle produces on an unthrottled card, and without these fields there is
+    # no way to tell the two apart after the fact. Purely additive -- every
+    # existing caller reads only the five fields above.
+    mean_power_w: Optional[float] = None
+    peak_power_w: Optional[float] = None
+    mean_sm_clock_mhz: Optional[float] = None
+    throttle_reasons: List[str] = field(default_factory=list)
 
 
 @dataclass
 class _Samples:
     util_pct: List[float] = field(default_factory=list)
     mem_used_mb: List[float] = field(default_factory=list)
+    power_w: List[float] = field(default_factory=list)
+    sm_clock_mhz: List[float] = field(default_factory=list)
+    throttle_reasons: set = field(default_factory=set)
 
 
 # Computed once per process (the probe allocates real GPU memory, not free)
@@ -220,6 +232,129 @@ def read_current_mem_mb(device_index: int = 0) -> Optional[float]:
             pass
 
 
+# Bit -> name for nvmlDeviceGetCurrentClocksThrottleReasons. Looked up by name on
+# the module rather than hardcoded: the constant set grows between driver releases,
+# and an unknown bit is better reported as its hex value than dropped.
+_THROTTLE_BITS = (
+    ("nvmlClocksThrottleReasonGpuIdle", "gpu-idle"),
+    ("nvmlClocksThrottleReasonApplicationsClocksSetting", "app-clocks-setting"),
+    ("nvmlClocksThrottleReasonSwPowerCap", "sw-power-cap"),
+    ("nvmlClocksThrottleReasonHwSlowdown", "hw-slowdown"),
+    ("nvmlClocksThrottleReasonSyncBoost", "sync-boost"),
+    ("nvmlClocksThrottleReasonSwThermalSlowdown", "sw-thermal"),
+    ("nvmlClocksThrottleReasonHwThermalSlowdown", "hw-thermal"),
+    ("nvmlClocksThrottleReasonHwPowerBrakeSlowdown", "hw-power-brake"),
+    ("nvmlClocksThrottleReasonDisplayClockSetting", "display-clock-setting"),
+)
+
+
+def _throttle_names(pynvml_mod, bits: int) -> List[str]:
+    """Human-readable throttle reasons for a NVML reason bitmask.
+
+    ``gpu-idle`` is dropped: it is set whenever the card has nothing to do, which
+    during a benchmark's own idle gaps is normal and would flag every run.
+    """
+    names = []
+    matched = 0
+    for const_name, label in _THROTTLE_BITS:
+        bit = getattr(pynvml_mod, const_name, None)
+        if bit is None:
+            continue
+        matched |= int(bit)
+        if bits & int(bit) and label != "gpu-idle":
+            names.append(label)
+    leftover = bits & ~matched
+    if leftover:
+        names.append(f"unknown-0x{leftover:x}")
+    return names
+
+
+def _first(*getters, transform=None):
+    """First getter that returns a value, optionally transformed. ``None`` if none do."""
+    for getter in getters:
+        try:
+            value = getter()
+        except Exception:  # noqa: BLE001 - an absent or unsupported NVML getter
+            continue
+        if value is None:
+            continue
+        try:
+            return transform(value) if transform else value
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _decode(value):
+    """NVML string getters return ``bytes`` on some wheel versions, ``str`` on others."""
+    return value.decode() if isinstance(value, bytes) else value
+
+
+def device_context(device_index: int = 0) -> dict:
+    """Static device facts plus a census of who else is on the GPU right now.
+
+    The census is the point: this repo has already published a benchmark sweep that
+    ran against a live camera-inference workload holding ~13.7 GB, and the numbers
+    were not comparable with the idle baseline they were merged next to. A run that
+    records its co-tenants can be labelled contended instead of being quietly wrong.
+    Returns ``{"available": False, ...}`` rather than raising when NVML is absent.
+    """
+    try:
+        import pynvml
+    except ImportError as exc:
+        return {"available": False, "error": f"pynvml not installed: {exc}"}
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+    except Exception as exc:  # noqa: BLE001 - covers pynvml.NVMLError + friends
+        return {"available": False, "error": f"nvmlInit failed: {exc}"}
+
+    def _try(fn, default=None):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001 - any single fact may be unsupported
+            return default
+
+    try:
+        name = _decode(_try(lambda: pynvml.nvmlDeviceGetName(handle)))
+        mem = _try(lambda: pynvml.nvmlDeviceGetMemoryInfo(handle))
+        cotenants = []
+        for proc in _try(lambda: pynvml.nvmlDeviceGetComputeRunningProcesses(handle), []) or []:
+            if int(proc.pid) == os.getpid():
+                continue
+            cotenants.append({
+                "pid": int(proc.pid),
+                "mem_mb": round(float(proc.usedGpuMemory or 0) / (1024 * 1024), 1),
+            })
+        return {
+            "available": True,
+            "name": name,
+            "driver": _decode(_try(pynvml.nvmlSystemGetDriverVersion)),
+            "total_mem_mb": round(float(mem.total) / (1024 * 1024), 1) if mem else None,
+            "used_mem_mb": round(float(mem.used) / (1024 * 1024), 1) if mem else None,
+            # nvidia-ml-py drops and renames getters between versions: the "enforced"
+            # variant is absent on the wheel in this image, so fall back rather than
+            # leaving the report's power headroom permanently blank.
+            "power_limit_w": _first(
+                lambda: pynvml.nvmlDeviceGetEnforcedPowerManagementLimit(handle),
+                lambda: pynvml.nvmlDeviceGetPowerManagementLimit(handle),
+                transform=lambda mw: round(float(mw) / 1000.0, 1),
+            ),
+            "max_sm_clock_mhz": _try(
+                lambda: float(pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_SM))
+            ),
+            "utilization_pct": _try(
+                lambda: float(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
+            ),
+            "cotenants": cotenants,
+        }
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:  # noqa: BLE001 - shutdown failures are never fatal
+            pass
+
+
 class GpuMonitor:
     """Context manager: samples GPU utilization/memory on a background thread
     for the duration of the ``with`` block.
@@ -295,6 +430,27 @@ class GpuMonitor:
             )
         except Exception:  # noqa: BLE001 - a single failed sample must not kill the thread
             pass
+        # Trust context. Each read is guarded separately: these APIs are the most
+        # likely of the lot to be missing on a given driver/wheel pair, and a
+        # missing clock reading must not cost the caller its utilization samples.
+        try:
+            self._samples.power_w.append(
+                float(self._pynvml.nvmlDeviceGetPowerUsage(self._handle)) / 1000.0
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._samples.sm_clock_mhz.append(
+                float(self._pynvml.nvmlDeviceGetClockInfo(
+                    self._handle, self._pynvml.NVML_CLOCK_SM))
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            bits = self._pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(self._handle)
+            self._samples.throttle_reasons.update(_throttle_names(self._pynvml, bits))
+        except Exception:  # noqa: BLE001
+            pass
 
     @property
     def result(self) -> GpuSample:
@@ -303,10 +459,16 @@ class GpuMonitor:
 
         util = self._samples.util_pct
         mem = self._samples.mem_used_mb
+        power = self._samples.power_w
+        clocks = self._samples.sm_clock_mhz
         return GpuSample(
             peak_mem_mb=max(mem) if mem else None,
             mean_util_pct=(sum(util) / len(util)) if util else None,
             peak_util_pct=max(util) if util else None,
             available=True,
             error=None,
+            mean_power_w=(sum(power) / len(power)) if power else None,
+            peak_power_w=max(power) if power else None,
+            mean_sm_clock_mhz=(sum(clocks) / len(clocks)) if clocks else None,
+            throttle_reasons=sorted(self._samples.throttle_reasons),
         )

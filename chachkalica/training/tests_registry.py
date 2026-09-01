@@ -76,6 +76,31 @@ class RegistryTests(TestCase):
         self.assertNotEqual(tm2.name, "dup")
         self.assertTrue(tm2.name.startswith("dup-"))
 
+    def test_resolved_checkpoint_path_passes_through_when_file_exists(self):
+        run_dir = Path(self._tmp.name) / "out/run0"
+        run_dir.mkdir(parents=True)
+        (run_dir / "best.pt").write_bytes(b"")
+        (run_dir / "last.pt").write_bytes(b"")
+        tm = promote.promote_run_result(self.rr, name="both-present")
+        self.assertEqual(tm.resolved_checkpoint_path(), run_dir / "best.pt")
+
+    def test_resolved_checkpoint_path_falls_back_to_sibling_last_pt(self):
+        # No val dataset -> best_checkpoint is empty and only last.pt is ever
+        # written, same as friendy_chachkalica/ml/train.py when best_epoch is
+        # None. Simulates a promoted best.pt that has since gone missing (e.g.
+        # pruned to save disk) while last.pt in the same run dir survives.
+        run_dir = Path(self._tmp.name) / "out/run0"
+        run_dir.mkdir(parents=True)
+        (run_dir / "last.pt").write_bytes(b"")
+        tm = promote.promote_run_result(self.rr, name="best-pruned")
+        self.assertEqual(tm.checkpoint_path, str(run_dir / "best.pt"))
+        self.assertEqual(tm.resolved_checkpoint_path(), run_dir / "last.pt")
+
+    def test_resolved_checkpoint_path_reports_missing_when_neither_exists(self):
+        tm = promote.promote_run_result(self.rr, name="both-missing")
+        self.assertEqual(
+            tm.resolved_checkpoint_path(), Path(self.rr.best_checkpoint))
+
     def test_build_eval_request_shape(self):
         tm = promote.promote_run_result(self.rr, name="m1")
         eval_run = EvalRun.objects.create(

@@ -18,6 +18,16 @@ from fleet.services import overlap as overlap_svc
 from fleet.services import provisioning, sync as sync_svc
 from fleet.services import split as split_svc
 
+# Fingerprinting reads and decodes every image (MD5 + a grayscale dhash) rather
+# than trusting metadata, so cost scales with dataset size, not with how many
+# duplicates actually exist. Measured cold-cache at ~26ms/image; the largest
+# dataset on disk today (person_all, ~79k images) alone already takes ~35min,
+# well past the queue's 900s DEFAULT_TIMEOUT. Sized with headroom for that to
+# grow rather than the current count exactly.
+PRUNE_INTRA_DUPLICATES_JOB_TIMEOUT = 3600
+# prune_overlaps fingerprints two datasets, so it gets proportionally longer.
+PRUNE_OVERLAPS_JOB_TIMEOUT = 2 * PRUNE_INTRA_DUPLICATES_JOB_TIMEOUT
+
 
 def _mark_running(obj, action: str | None):
     if action is not None:

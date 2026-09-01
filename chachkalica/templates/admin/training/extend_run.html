@@ -1,0 +1,36 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Extend <strong>run #{{ run.pk }}</strong> ({{ run.experiment.name }}) with more epochs.</p>
+<p class="help">Currently trained for {{ current_epochs }} epoch(s) at lr={{ current_lr }}.
+Resumes from its <code>last.pt</code> checkpoint — weights, optimizer, and scheduler state
+carry over; this isn't a fresh run.</p>
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="apply" value="1">
+
+  <div class="form-row">
+    <label for="additional_epochs">Additional epochs:</label>
+    <input type="number" name="additional_epochs" id="additional_epochs" min="1" step="1"
+           value="10" autofocus required>
+    <p class="help">Added on top of the current {{ current_epochs }}, so the run trains up to
+    {{ current_epochs }} + this many.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="new_lr">New learning rate:</label>
+    <input type="number" name="new_lr" id="new_lr" min="0" step="any">
+    <p class="help">Optional. Leave blank to keep the current lr ({{ current_lr }}).</p>
+  </div>
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Extend and resume">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+{% endblock %}

@@ -54,6 +54,11 @@ HERE = Path(__file__).resolve().parent
 # Single-GPU safety: refuse a new launch while one is running unless overridden.
 MAX_CONCURRENT = int(os.environ.get("FC_MAX_CONCURRENT", "1"))
 
+# The bundle benchmark's result file, written inside the request's output_dir. Named
+# here because it is a contract with the caller: Django's ingest job reads exactly
+# this path back out of the shared data mount.
+BENCHMARK_RESULT_NAME = "benchmark.json"
+
 # --- Operational logging -----------------------------------------------------
 # Overridable so containers can point logs at a mounted volume; defaults to the
 # repo root (HERE.parent) since the service runs with cwd=HERE.
@@ -61,6 +66,7 @@ LOGS_DIR = Path(os.environ.get("FC_LOGS_DIR", HERE.parent / "logs"))
 TRAIN_LOG_DIR = LOGS_DIR / "train"
 EVAL_LOG_DIR = LOGS_DIR / "eval"
 PIPELINE_LOG_DIR = LOGS_DIR / "pipeline"
+BENCHMARK_LOG_DIR = LOGS_DIR / "benchmark"
 OTHER_LOG_DIR = LOGS_DIR / "other"
 _LOG_FMT = "%(asctime)s [%(name)s] %(levelname)s %(message)s"
 
@@ -73,7 +79,8 @@ def _configure_logging() -> None:
     for the shared console output. ``fc`` itself does not propagate, so records
     don't get duplicated by uvicorn's root logger.
     """
-    for d in (TRAIN_LOG_DIR, EVAL_LOG_DIR, PIPELINE_LOG_DIR, OTHER_LOG_DIR):
+    for d in (TRAIN_LOG_DIR, EVAL_LOG_DIR, PIPELINE_LOG_DIR, BENCHMARK_LOG_DIR,
+              OTHER_LOG_DIR):
         d.mkdir(parents=True, exist_ok=True)
     root = logging.getLogger("fc")
     root.setLevel(logging.INFO)
@@ -116,6 +123,11 @@ def _eval_log(eval_id: int) -> logging.Logger:
 
 def _pipeline_log(pipeline_id: int) -> logging.Logger:
     return _logger(f"fc.pipeline.{pipeline_id}", PIPELINE_LOG_DIR / f"pipeline-{pipeline_id}.log")
+
+
+def _benchmark_log(benchmark_id: int) -> logging.Logger:
+    return _logger(f"fc.benchmark.{benchmark_id}",
+                   BENCHMARK_LOG_DIR / f"benchmark-{benchmark_id}.log")
 
 
 _configure_logging()
@@ -237,6 +249,40 @@ class ExportBundleRequest(BaseModel):
     gpu_infer: bool = False
 
 
+class BenchmarkBundleRequest(BaseModel):
+    """Benchmark an exported bundle through the bundle's own vendored runtime.
+
+    Runs here rather than in Django's env for the obvious reason — web/worker have no
+    GPU, the trainer owns it — and as a tracked subprocess rather than synchronously,
+    because a sweep with warmup, three timing passes and a stage pass per cell takes
+    minutes, not seconds.
+
+    ``benchmark_id`` is the caller's row id; it keys the job so status can be polled
+    and the run stopped, exactly like ``run_id`` does for ``/train``.
+    """
+
+    benchmark_id: int
+    bundle_dir: str
+    images: str
+    output_dir: str
+    max_images: Optional[int] = 24
+    batch_sizes: str = "1"
+    concurrency: str = "1"
+    warmup: int = 30
+    calls: int = 200
+    min_duration_s: float = 2.0
+    measure_stages: bool = True
+    skip_bare_model: bool = False
+    # Opt-in: an extra sequential pass that re-runs one cell under Nsight Systems in a
+    # child process and leaves a .nsys-rep plus per-kernel CSVs in the output dir.
+    # Absent from an older caller's payload, which pydantic reads as False.
+    profile_nsys: bool = False
+    device: Optional[str] = None
+    fmt: Optional[str] = None
+    conf: Optional[float] = None
+    detector_conf: Optional[float] = None
+
+
 class PromoteLabelsRequest(BaseModel):
     """Write a finished run's predictions into a dataset's source ``labels/``.
 
@@ -309,15 +355,26 @@ def health():
     return {"status": "ok", "active": _active_count()}
 
 
-def _spawn(key: str, cmd: list[str], output_dir: Path) -> dict:
-    """Launch ``cmd`` as a tracked subprocess logging into output_dir/service.log."""
+def _spawn(key: str, cmd: list[str], output_dir: Path,
+           extra_env: Optional[dict] = None) -> dict:
+    """Launch ``cmd`` as a tracked subprocess logging into output_dir/service.log.
+
+    ``extra_env`` is layered over this process's environment — used by the bundle
+    benchmark, which runs as ``python -m inferlica.…`` and so needs the repo root on
+    ``PYTHONPATH`` (``cwd`` is HERE, one level below it). Absent for every other
+    caller, whose environment is unchanged.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "service.log"
     log_file = open(log_path, "w", encoding="utf-8")
+    env = None
+    if extra_env:
+        env = {**os.environ, **{str(k): str(v) for k, v in extra_env.items()}}
     # start_new_session=True puts the child in its own process group so a later
     # stop can signal the whole group (run.py may spawn dataloader/worker procs).
     proc = subprocess.Popen(
-        cmd, cwd=str(HERE), stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True,
+        cmd, cwd=str(HERE), stdout=log_file, stderr=subprocess.STDOUT,
+        start_new_session=True, env=env,
     )
     job = {
         "proc": proc,
@@ -956,6 +1013,114 @@ def export_bundle(req: ExportBundleRequest):
 
     log.info("bundled %s -> %s", config.model_checkpoint, bundle_dir)
     return {"bundle_dir": str(bundle_dir)}
+
+
+@app.post("/benchmark_bundle")
+def benchmark_bundle(req: BenchmarkBundleRequest):
+    """Launch a bundle benchmark as a tracked subprocess.
+
+    Gated on ``MAX_CONCURRENT`` like ``/train`` and counted in ``_active_count``, and
+    that is not mere tidiness: a benchmark sharing the GPU with a training run does
+    not fail, it produces plausible numbers that are simply wrong. (The harness also
+    records a co-tenant census and stamps the result ``contended`` for whatever it
+    cannot prevent — another stack on the same card, say.)
+    """
+    log = _benchmark_log(req.benchmark_id)
+    bundle_dir = Path(req.bundle_dir)
+    images = Path(req.images)
+    if not (bundle_dir / "pipeline.json").is_file():
+        log.error("benchmark rejected: not a bundle: %s", bundle_dir)
+        raise HTTPException(status_code=400,
+                            detail=f"not a bundle (no pipeline.json): {bundle_dir}")
+    if not images.exists():
+        log.error("benchmark rejected: images not found: %s", images)
+        raise HTTPException(status_code=400, detail=f"images not found: {images}")
+
+    harness = HERE.parent / "inferlica" / "benchmark" / "bundle_bench.py"
+    if not harness.is_file():
+        log.error("benchmark unavailable: harness missing at %s", harness)
+        raise HTTPException(
+            status_code=501,
+            detail=f"benchmark harness not present in this image: {harness}",
+        )
+
+    with _lock:
+        key = f"bench-{req.benchmark_id}"
+        existing = _jobs.get(key)
+        if existing and _job_status(existing) == "running":
+            log.info("benchmark already running (pid=%s); ignoring duplicate launch",
+                     existing["pid"])
+            return {"benchmark_id": req.benchmark_id, "status": "running",
+                    "pid": existing["pid"], "output_dir": existing["output_dir"]}
+        if _active_count() >= MAX_CONCURRENT:
+            log.warning("benchmark rejected: trainer busy (%d active >= %d max)",
+                        _active_count(), MAX_CONCURRENT)
+            raise HTTPException(status_code=409,
+                                detail="trainer busy: another job is active")
+
+        output_dir = Path(req.output_dir)
+        cmd = [
+            sys.executable, "-m", "inferlica.benchmark.bundle_bench",
+            "--bundle", str(bundle_dir),
+            "--images", str(images),
+            "--out", str(output_dir / BENCHMARK_RESULT_NAME),
+            "--batch-sizes", req.batch_sizes,
+            "--concurrency", req.concurrency,
+            "--warmup", str(req.warmup),
+            "--calls", str(req.calls),
+            "--min-duration", str(req.min_duration_s),
+        ]
+        if req.max_images:
+            cmd += ["--max-images", str(req.max_images)]
+        if not req.measure_stages:
+            cmd.append("--no-stages")
+        if req.skip_bare_model:
+            cmd.append("--no-bare-model")
+        if req.profile_nsys:
+            cmd.append("--nsys")
+        if req.device:
+            cmd += ["--device", req.device]
+        if req.fmt:
+            cmd += ["--format", req.fmt]
+        if req.conf is not None:
+            cmd += ["--conf", str(req.conf)]
+        if req.detector_conf is not None:
+            cmd += ["--detector-conf", str(req.detector_conf)]
+
+        # cwd is HERE (see _spawn), whose parent holds inferlica/ -- so `-m` needs
+        # the repo root on sys.path, the same relationship chachak already relies on.
+        env_path = str(HERE.parent)
+        job = _spawn(key, cmd, output_dir, extra_env={"PYTHONPATH": env_path})
+        log.info("launched benchmark: pid=%s bundle=%s images=%s batches=%s streams=%s",
+                 job["pid"], bundle_dir, images, req.batch_sizes, req.concurrency)
+        return {"benchmark_id": req.benchmark_id, "status": "running",
+                "pid": job["pid"], "output_dir": str(output_dir)}
+
+
+@app.get("/benchmarks/{benchmark_id}")
+def benchmark_status(benchmark_id: int):
+    job = _jobs.get(f"bench-{benchmark_id}")
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown benchmark_id")
+    payload = {"benchmark_id": benchmark_id, **_status_payload(job)}
+    result_path = Path(job["output_dir"]) / BENCHMARK_RESULT_NAME
+    payload["result_path"] = str(result_path) if result_path.is_file() else None
+    return payload
+
+
+@app.post("/benchmarks/{benchmark_id}/stop")
+def stop_benchmark(benchmark_id: int, grace: float = 10.0):
+    log = _benchmark_log(benchmark_id)
+    with _lock:
+        job = _jobs.get(f"bench-{benchmark_id}")
+        if job is None:
+            log.warning("stop requested for unknown benchmark")
+            raise HTTPException(status_code=404, detail="unknown benchmark_id")
+        log.info("stop requested (grace=%ss)", grace)
+        outcome = _stop_job(job, grace=grace)
+    log.info("stop outcome=%s returncode=%s", outcome, job.get("returncode"))
+    return {"benchmark_id": benchmark_id, "status": _job_status(job),
+            "outcome": outcome, "returncode": job.get("returncode")}
 
 
 @app.post("/promote_labels")

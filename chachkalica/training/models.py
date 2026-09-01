@@ -621,6 +621,36 @@ class TrainedModel(models.Model):
     def __str__(self) -> str:
         return self.name
 
+    def resolved_checkpoint_path(self):
+        """Absolute path to this model's checkpoint file, project-relative or not.
+
+        ``checkpoint_path`` is usually already the best available one — promotion
+        prefers ``best.pt`` and only falls back to ``last.pt`` when a run had no
+        val dataset to score a best epoch against (see
+        ``training.services.promote``). But that choice is frozen at promotion
+        time, and a ``best.pt`` recorded then can stop existing later — pruned to
+        save disk, or a run whose val dataset was dropped after the fact — while
+        a sibling ``last.pt`` in the same run dir still does. When that happens,
+        fall back to it here instead of failing every action that runs this
+        model. Existence isn't checked otherwise — callers still see a missing
+        path they should report as such.
+        """
+        from pathlib import Path
+
+        from django.conf import settings
+
+        raw = (self.checkpoint_path or "").strip()
+        if not raw:
+            raise ValueError(f"{self.name}: no checkpoint path to run.")
+        path = Path(raw)
+        if not path.is_absolute():
+            path = Path(settings.BASE_DIR) / path
+        if path.name == "best.pt" and not path.exists():
+            fallback = path.with_name("last.pt")
+            if fallback.exists():
+                return fallback
+        return path
+
 
 class ExportRun(models.Model):
     """One queued ONNX/TensorRT/``.pt`` export of a single checkpoint (best or last).

@@ -1,0 +1,482 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% comment %}
+One benchmark run, rendered from the stored result JSON.
+
+Extends the admin base (rather than being a standalone page like the arch console) so
+it keeps the nav and a back link — this is a per-row report reached from a changelist,
+not a published document.
+
+The palette is the arch console's, reused for continuity; the class prefix is `bb-` so
+nothing here can collide with it. Crucially, `console.html` is NOT extended or
+included: `inferlica/benchmark/gen_console_artifact.py` re-extracts that file's own
+<style>/<script> to build the published artifact, and it would break on a page that
+had been refactored to share.
+
+Everything below the header is drawn client-side from `bb-data`, because the stage set
+is not fixed: a newer bundle version can declare its own stages (see
+bundle_stages.load_stage_plan) and this template must render whatever arrives, in the
+order it arrives, without being edited.
+{% endcomment %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  .bb {
+    --bb-bg: #0a0f0c; --bb-panel: #0e1512; --bb-inset: #0b1210; --bb-head: #0c1613;
+    --bb-line: #1b2b23; --bb-line-strong: #23402f;
+    --bb-ink: #dbe9e0; --bb-dim: #6f8c7c; --bb-faint: #48594e;
+    --bb-accent: #45d992; --bb-accent-soft: #2a8f63; --bb-wash: rgba(69,217,146,.09);
+    --bb-warn: #e3b341; --bb-warn-wash: rgba(227,179,65,.1);
+    --bb-err: #e3695f;
+    --bb-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    background: var(--bb-bg); color: var(--bb-ink);
+    border: 1px solid var(--bb-line); border-radius: 6px;
+    padding: 22px 24px 28px; margin-top: 8px;
+    font-family: var(--bb-mono); font-size: 12.5px; line-height: 1.55;
+  }
+  .bb a { color: var(--bb-accent); }
+  .bb h2.bb-head {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .14em;
+    color: var(--bb-dim); font-weight: 600; margin: 30px 0 10px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .bb h2.bb-head::after {
+    content: ""; flex: 1; height: 1px;
+    background: linear-gradient(to right, var(--bb-line-strong), transparent);
+  }
+  .bb-top {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px;
+    padding-bottom: 14px; border-bottom: 1px solid var(--bb-line-strong);
+  }
+  .bb-title { font-size: 16px; font-weight: 700; letter-spacing: .01em; }
+  .bb-sub { color: var(--bb-dim); }
+  .bb-facts { display: flex; flex-wrap: wrap; gap: 6px 10px; margin-top: 12px; }
+  .bb-fact {
+    background: var(--bb-inset); border: 1px solid var(--bb-line);
+    border-radius: 3px; padding: 3px 9px; font-size: 11.5px;
+  }
+  .bb-fact b { color: var(--bb-dim); font-weight: 500; margin-right: 5px; }
+  .bb-banner {
+    margin-top: 16px; padding: 11px 14px; border-radius: 4px; font-size: 12px;
+    border: 1px solid var(--bb-warn); background: var(--bb-warn-wash); color: var(--bb-warn);
+  }
+  .bb-banner ul { margin: 6px 0 0; padding-left: 18px; }
+  .bb-banner li { margin: 3px 0; }
+  .bb-scroll { overflow-x: auto; }
+  .bb table {
+    border-collapse: collapse; width: 100%; min-width: 520px;
+    font-variant-numeric: tabular-nums; background: var(--bb-panel);
+  }
+  .bb th, .bb td {
+    border: 1px solid var(--bb-line); padding: 5px 10px; text-align: right;
+    white-space: nowrap;
+  }
+  .bb thead th { background: var(--bb-head); color: var(--bb-ink); font-weight: 600; }
+  .bb tbody tr:nth-child(odd) td { background: rgba(255,255,255,.012); }
+  .bb tbody tr:hover td { background: var(--bb-wash); }
+  .bb .bb-rowlabel {
+    text-align: left; position: sticky; left: 0; z-index: 1;
+    background: var(--bb-head); color: var(--bb-dim); font-weight: 500;
+  }
+  .bb tbody tr:hover .bb-rowlabel { background: var(--bb-head); }
+  .bb .bb-group td {
+    background: var(--bb-inset); color: var(--bb-accent-soft);
+    text-transform: uppercase; letter-spacing: .1em; font-size: 10.5px; text-align: left;
+  }
+  .bb-pill {
+    display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 10.5px;
+    border: 1px solid var(--bb-line-strong); color: var(--bb-dim);
+  }
+  .bb-pill--ok { color: var(--bb-accent); border-color: var(--bb-accent-soft); }
+  .bb-pill--warn { color: var(--bb-warn); border-color: var(--bb-warn); }
+  .bb-pill--err { color: var(--bb-err); border-color: #7a2f2a; }
+  .bb-pill--flagged { border-bottom-style: dotted; cursor: help; }
+  .bb-dash { color: var(--bb-faint); }
+  .bb-note { color: var(--bb-dim); font-size: 11.5px; margin: 8px 0 0; }
+  .bb-stage-name { text-align: left; }
+  .bb-stage-d1 { padding-left: 26px; }
+  .bb-stage-d2 { padding-left: 44px; color: var(--bb-dim); }
+  .bb-bar { position: relative; display: block; height: 4px; margin-top: 3px;
+            background: var(--bb-line); border-radius: 2px; overflow: hidden; }
+  .bb-bar > i { position: absolute; inset: 0 auto 0 0; background: var(--bb-accent-soft); }
+  .bb-bar--residual > i { background: var(--bb-line-strong); }
+  .bb ul.bb-limits { list-style: none; padding-left: 0; color: var(--bb-dim); }
+  .bb ul.bb-limits li { margin: 6px 0; padding-left: 16px; position: relative; }
+  .bb ul.bb-limits li::before {
+    content: "\25B8"; position: absolute; left: 0; color: var(--bb-accent-soft);
+  }
+  .bb dl.bb-legend { display: grid; grid-template-columns: max-content 1fr;
+                     gap: 5px 16px; margin: 0; color: var(--bb-dim); }
+  .bb dl.bb-legend dt { color: var(--bb-ink); }
+  .bb dl.bb-legend dd { margin: 0; }
+</style>
+{% endblock %}
+
+{% block content %}
+<p><a href="{{ back_url }}">&larr; Back to bundle benchmarks</a></p>
+
+{{ report_json|json_script:"bb-data" }}
+
+<div class="bb" id="bb-root" data-nsys-url="{{ nsys_url }}">
+  <div class="bb-top">
+    <span class="bb-title">{{ benchmark.bundle_name|default:benchmark.bundle_path }}</span>
+    <span class="bb-sub">run #{{ benchmark.pk }}</span>
+    <span class="bb-sub">{{ status_badge_html }}</span>
+  </div>
+  <div id="bb-body"></div>
+</div>
+
+{% verbatim %}
+<script>
+(function () {
+  const DATA = JSON.parse(document.getElementById('bb-data').textContent);
+  const body = document.getElementById('bb-body');
+
+  if (!DATA || !DATA.cells) {
+    body.innerHTML = '<p class="bb-note">This run stored no result. If it failed, the '
+      + 'reason is on the row itself (<code>last_error</code>); the trainer also keeps '
+      + 'its own log under <code>logs/benchmark/</code>.</p>';
+    return;
+  }
+
+  const esc = (value) => String(value == null ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const dash = '<span class="bb-dash">&mdash;</span>';
+  const num = (value, digits, unit) => (value == null || Number.isNaN(value))
+    ? dash : esc(Number(value).toFixed(digits)) + (unit ? ' ' + unit : '');
+  const mem = (mb) => mb == null ? dash
+    : (mb >= 1000 ? num(mb / 1024, 2, 'GB') : num(mb, 1, 'MB'));
+
+  const cells = DATA.cells || [];
+  const ok = cells.filter((cell) => !cell.error);
+
+  // ---------------------------------------------------------------- header
+  const bundle = DATA.bundle || {}, env = DATA.env || {}, cfg = DATA.config || {};
+  const classNames = Object.values(bundle.classes || {});
+  const facts = [
+    ['format', bundle.fmt],
+    ['pipeline', bundle.pipeline],
+    ['classes', classNames.length ? classNames.join(', ') : null],
+    ['batch ceiling', bundle.max_batch == null ? 'uncapped' : bundle.max_batch],
+    ['bundle size', bundle.size_mb == null ? null : bundle.size_mb + ' MB'],
+    ['device', env.device],
+    ['gpu', env.gpu],
+    ['driver', env.driver],
+    ['torch', env.torch],
+    ['tensorrt', env.tensorrt],
+    ['onnxruntime', env.onnxruntime],
+    ['providers', (env.onnx_providers || []).join(', ') || null],
+    ['frames', cfg.image_count],
+    ['warmup', cfg.warmup],
+    ['timed calls', cfg.calls],
+    ['images', cfg.images],
+    ['measured', DATA.generated],
+    ['took', DATA.duration_s == null ? null : DATA.duration_s + ' s'],
+  ].filter((pair) => pair[1] !== null && pair[1] !== undefined && pair[1] !== '');
+
+  let html = '<div class="bb-facts">' + facts.map(
+    (pair) => '<span class="bb-fact"><b>' + esc(pair[0]) + '</b>' + esc(pair[1]) + '</span>'
+  ).join('') + '</div>';
+
+  // Caveats first, deliberately: a contended run or a CPU fallback changes how every
+  // number below should be read, and burying that under the tables would be dishonest.
+  const warnings = DATA.warnings || [];
+  if (warnings.length) {
+    html += '<div class="bb-banner"><b>Read these first</b><ul>'
+      + warnings.map((w) => '<li>' + esc(w) + '</li>').join('') + '</ul></div>';
+  }
+
+  // ----------------------------------------------------------- headline table
+  const label = (cell) => 'batch ' + cell.batch + (cell.concurrency > 1
+    ? ' × ' + cell.concurrency + ' streams' : '');
+
+  function table(rows, columns, columnLabel) {
+    let out = '<div class="bb-scroll"><table><thead><tr><th class="bb-rowlabel"></th>';
+    columns.forEach((column) => { out += '<th>' + esc(columnLabel(column)) + '</th>'; });
+    out += '</tr></thead><tbody>';
+    rows.forEach((row) => {
+      if (row.group) {
+        out += '<tr class="bb-group"><td colspan="' + (columns.length + 1) + '">'
+          + esc(row.group) + '</td></tr>';
+        return;
+      }
+      out += '<tr><td class="bb-rowlabel"'
+        + (row.title ? ' title="' + esc(row.title) + '"' : '') + '>'
+        + esc(row.label) + '</td>';
+      columns.forEach((column) => { out += '<td>' + row.value(column) + '</td>'; });
+      out += '</tr>';
+    });
+    return out + '</tbody></table></div>';
+  }
+
+  const p = (cell, key) => (cell.latency_ms || {})[key];
+  const HEADLINE = [
+    { group: 'latency (device-side, per frame)' },
+    { label: 'p50', value: (c) => num(p(c, 'p50'), 2, 'ms') },
+    { label: 'p90', value: (c) => num(p(c, 'p90'), 2, 'ms') },
+    { label: 'p99', value: (c) => num(p(c, 'p99'), 2, 'ms') },
+    { label: 'mean ± sd', value: (c) => p(c, 'mean') == null ? dash
+        : num(p(c, 'mean'), 2, '') + ' ± ' + num(p(c, 'std'), 2, 'ms') },
+    { label: 'samples', title: 'inference calls the percentiles are drawn from',
+      value: (c) => p(c, 'samples') == null ? dash : esc(p(c, 'samples')) },
+    { label: 'source', title: 'CUDA events where available, else host wall clock',
+      value: (c) => esc(c.latency_source || '') || dash },
+
+    { group: 'throughput (unsynchronized loop)' },
+    { label: 'fps', value: (c) => num(c.fps, 1, 'fps') },
+    { label: 'fps / stream', title: 'flat across streams means the runtime serializes',
+      value: (c) => num(c.fps_per_stream, 1, 'fps') },
+    { label: 'frames timed', value: (c) => c.frames == null ? dash : esc(c.frames) },
+    { label: 'detections / frame', title: 'NMS cost scales with this',
+      value: (c) => num(c.detections_mean, 1, '') },
+
+    { group: 'gpu' },
+    { label: 'busy', title: 'CUPTI per-process kernel time over the loop wall time',
+      value: (c) => c.gpu_busy_pct == null ? dash
+        : num(c.gpu_busy_pct, 1, '%') + ' <span class="bb-pill">'
+          + esc(c.util_method || '') + '</span>' },
+    { label: 'Δmem at load', title: 'NVML per-process growth while the bundle loaded',
+      value: (c) => mem((c.mem || {}).load_delta_mb) },
+    { label: 'torch peak', title: 'partial: the torch allocator cannot see TensorRT or onnxruntime arenas',
+      value: (c) => mem((c.mem || {}).torch_peak_mb) },
+    { label: 'device peak', title: 'whole-device NVML peak — a ceiling, not this process',
+      value: (c) => mem((c.mem || {}).nvml_peak_mb) },
+    { label: 'host RSS peak', value: (c) => mem((c.mem || {}).host_rss_peak_mb) },
+    { label: 'power', value: (c) => (c.power || {}).mean_w == null ? dash
+        : num(c.power.mean_w, 0, '') + ' / ' + num(c.power.peak_w, 0, 'W') },
+    { label: 'sm clock', value: (c) => num((c.power || {}).mean_sm_clock_mhz, 0, 'MHz') },
+    { label: 'throttling', value: (c) => {
+        const reasons = (c.power || {}).throttle_reasons || [];
+        return reasons.length
+          ? '<span class="bb-pill bb-pill--warn">' + esc(reasons.join(', ')) + '</span>'
+          : '<span class="bb-pill bb-pill--ok">none</span>';
+      } },
+
+    { group: 'cold start' },
+    { label: 'build runtime', title: 'loading every artifact and assembling the pipeline',
+      value: (c) => num((c.coldstart || {}).build_runtime_ms, 0, 'ms') },
+    { label: '· detector', value: (c) => num((c.coldstart || {}).detector_load_ms, 0, 'ms') },
+    { label: '· model', value: (c) => num((c.coldstart || {}).model_load_ms, 0, 'ms') },
+    { label: 'first call', title: 'why warmup is not optional',
+      value: (c) => num((c.coldstart || {}).first_call_ms, 0, 'ms') },
+  ];
+
+  html += '<h2 class="bb-head">Results</h2>';
+  if (!ok.length) {
+    html += '<p class="bb-note">Every cell failed. See the messages below.</p>';
+  } else {
+    html += table(HEADLINE, ok, label);
+  }
+
+  // ------------------------------------------------------------- instruments
+  const inst = (cell, key) => (cell.instruments || {})[key];
+  const INSTRUMENTS = [
+    { label: 'T1 wall clock', title: 'host time around the call, synchronized',
+      value: (c) => num(inst(c, 't1_wall_ms'), 2, 'ms') },
+    { label: 'T2 CUDA events', title: 'the device’s own elapsed time',
+      value: (c) => num(inst(c, 't2_cuda_event_ms'), 2, 'ms') },
+    { label: 'T3 CUPTI kernels', title: 'device time actually spent in kernels',
+      value: (c) => num(inst(c, 't3_cupti_device_ms'), 2, 'ms') },
+    { label: 'T4 bare model', title: 'the artifact alone, outside this harness',
+      value: (c) => num(inst(c, 't4_bare_model_ms'), 2, 'ms') },
+    { label: 'model calls / frame', title: 'tiles or person crops per frame — T4 is compared per call',
+      value: (c) => c.model_calls_per_frame == null ? dash : esc(c.model_calls_per_frame) },
+    { label: 'spread', value: (c) => {
+        const spread = inst(c, 'spread_pct');
+        if (spread == null) { return dash; }
+        const cls = inst(c, 'disagree') ? ' bb-pill--warn' : ' bb-pill--ok';
+        return '<span class="bb-pill' + cls + '">' + num(spread, 0, '%') + '</span>';
+      } },
+  ];
+
+  if (ok.length) {
+    html += '<h2 class="bb-head">Four instruments, and what they disagree about</h2>';
+    html += table(INSTRUMENTS, ok, label);
+    if (DATA.bare_model && DATA.bare_model.error) {
+      html += '<p class="bb-note">T4 unavailable (' + esc(DATA.bare_model.tool) + '): '
+        + esc(DATA.bare_model.error) + '</p>';
+    }
+    ok.forEach((cell) => {
+      const notes = (cell.instruments || {}).notes || [];
+      if (!notes.length) { return; }
+      html += '<p class="bb-note"><b>' + esc(label(cell)) + '</b> &mdash; '
+        + notes.map(esc).join(' · ') + '</p>';
+    });
+  }
+
+  // ------------------------------------------------------------------ stages
+  const staged = ok.filter((cell) => (cell.stages || []).length);
+  if (staged.length) {
+    // Rows come from the data, not from a list in this file: a bundle may declare its
+    // own stage set, and the report has to render whatever it declares.
+    const seen = [];
+    staged.forEach((cell) => (cell.stages || []).forEach((stage) => {
+      if (!seen.some((row) => row.id === stage.id)) {
+        seen.push({ id: stage.id, label: stage.label, depth: stage.depth || 0 });
+      }
+    }));
+
+    const stageOf = (cell, id) => (cell.stages || []).find((stage) => stage.id === id);
+    const rows = seen.map((row) => ({
+      label: row.label,
+      indent: row.depth,
+      value: (cell) => {
+        const stage = stageOf(cell, row.id);
+        if (!stage || stage.ms == null) {
+          return '<span class="bb-pill">' + esc(stage ? stage.coverage : 'absent') + '</span>';
+        }
+        const width = Math.max(0, Math.min(100, stage.pct == null ? 0 : stage.pct));
+        const residual = stage.coverage === 'residual' ? ' bb-bar--residual' : '';
+        const calls = stage.calls_per_frame && stage.calls_per_frame !== 1
+          ? ' ×' + stage.calls_per_frame : '';
+        return num(stage.ms, 2, 'ms') + ' <span class="bb-dash">'
+          + (stage.pct == null ? '' : stage.pct.toFixed(1) + '%') + esc(calls) + '</span>'
+          + '<span class="bb-bar' + residual + '"><i style="width:' + width + '%"></i></span>';
+      },
+    }));
+    rows.push({ label: 'stage-pass total', value: (cell) =>
+      num(cell.stage_pass_total_ms, 2, 'ms') });
+    rows.push({ label: 'instrumentation overhead',
+      title: 'the synchronizes the stage pass adds; the headline latency above does not pay it',
+      value: (cell) => num(cell.instrumentation_overhead_ms, 2, 'ms') });
+
+    html += '<h2 class="bb-head">Where the frame budget goes</h2>';
+    let out = '<div class="bb-scroll"><table><thead><tr><th class="bb-rowlabel">stage</th>';
+    staged.forEach((cell) => { out += '<th>' + esc(label(cell)) + '</th>'; });
+    out += '</tr></thead><tbody>';
+    rows.forEach((row) => {
+      const cls = 'bb-rowlabel bb-stage-name'
+        + (row.indent ? ' bb-stage-d' + row.indent : '');
+      out += '<tr><td class="' + cls + '"'
+        + (row.title ? ' title="' + esc(row.title) + '"' : '') + '>'
+        + esc(row.label) + '</td>';
+      staged.forEach((cell) => { out += '<td>' + row.value(cell) + '</td>'; });
+      out += '</tr>';
+    });
+    html += out + '</tbody></table></div>';
+
+    const diag = staged[0].stage_diagnostics || {};
+    html += '<p class="bb-note">Stage plan: <b>' + esc(diag.plan_source || '?') + '</b>'
+      + (diag.probes_absent && diag.probes_absent.length
+        ? ' · not present in this bundle: ' + esc(diag.probes_absent.join(', '))
+        : '') + '</p>';
+  }
+
+  // ------------------------------------------------- nsight per-kernel profile
+  // What CUPTI's aggregate cannot give: which kernels the device time went into.
+  // Rendered from whatever nsys stats produced, so an absent report says why.
+  const nsys = DATA.nsys || {};
+  if (nsys.available || (nsys.reason && nsys.reason !== 'not requested')) {
+    html += '<h2 class="bb-head">Kernel profile (Nsight Systems)</h2>';
+  }
+  if (nsys.available) {
+    const cell = nsys.profiled_cell || {};
+    html += '<p class="bb-note">Captured on batch ' + esc(cell.batch) + ' over '
+      + esc(cell.calls) + ' call(s), in a separate child process after every timed pass '
+      + '— so it perturbs nothing above. ' + esc(nsys.kernel_count) + ' distinct kernels, '
+      + num(nsys.kernel_total_ms, 2, 'ms') + ' of device time in total.</p>';
+
+    const url = document.getElementById('bb-root').dataset.nsysUrl;
+    if (url) {
+      html += '<p class="bb-note">Full timeline: <a href="' + esc(url) + '">download '
+        + esc(nsys.report_file) + '</a> and open it in the Nsight Systems GUI. The '
+        + 'per-kernel CSVs sit beside it in <code>' + esc(nsys.directory) + '</code>.</p>';
+    }
+
+    const kernelRows = (rows, unitLabel) => {
+      let out = '<div class="bb-scroll"><table><thead><tr>'
+        + '<th class="bb-rowlabel">' + esc(unitLabel) + '</th><th>share</th>'
+        + '<th>total</th><th>count</th><th>avg</th><th>median</th></tr></thead><tbody>';
+      rows.forEach((row) => {
+        const width = Math.max(0, Math.min(100, row.time_pct || 0));
+        out += '<tr><td class="bb-rowlabel bb-stage-name" title="' + esc(row.full_name)
+          + '">' + esc(row.name) + '</td>'
+          + '<td>' + num(row.time_pct, 1, '%')
+          + '<span class="bb-bar"><i style="width:' + width + '%"></i></span></td>'
+          + '<td>' + num(row.total_ms, 2, 'ms') + '</td>'
+          + '<td>' + (row.instances == null ? dash : esc(row.instances)) + '</td>'
+          + '<td>' + num(row.avg_us, 1, 'µs') + '</td>'
+          + '<td>' + num(row.med_us, 1, 'µs') + '</td></tr>';
+      });
+      return out + '</tbody></table></div>';
+    };
+
+    if ((nsys.kernels || []).length) {
+      html += kernelRows(nsys.kernels, 'kernel');
+    }
+    if ((nsys.memory || []).length) {
+      html += '<p class="bb-note">Host&harr;device transfers:</p>'
+        + kernelRows(nsys.memory, 'operation');
+    }
+    if ((nsys.api || []).length) {
+      html += '<p class="bb-note">CUDA API calls (host side — a large '
+        + '<code>cudaMemcpy</code> or <code>cudaStreamSynchronize</code> share is the '
+        + 'same story the stage table tells):</p>' + kernelRows(nsys.api, 'call');
+    }
+    if (nsys.counters) {
+      html += '<p class="bb-note">' + esc(nsys.counters) + '</p>';
+    }
+    if (nsys.version) {
+      html += '<p class="bb-note">' + esc(nsys.version) + '</p>';
+    }
+  } else if (nsys.reason && nsys.reason !== 'not requested') {
+    html += '<p class="bb-note">Not captured: ' + esc(nsys.reason) + '</p>';
+  }
+
+  // ------------------------------------------------------------ failed cells
+  const failed = cells.filter((cell) => cell.error);
+  if (failed.length) {
+    html += '<h2 class="bb-head">Cells that failed</h2><ul class="bb-limits">'
+      + failed.map((cell) => '<li>batch ' + esc(cell.batch) + ' × '
+        + esc(cell.concurrency) + ': ' + esc(cell.error) + '</li>').join('')
+      + '</ul>';
+  }
+
+  // ----------------------------------------------------------------- reading
+  html += '<h2 class="bb-head">Reading this page</h2><dl class="bb-legend">'
+    + '<dt>latency vs throughput</dt><dd>Two separate loops. Latency synchronizes every '
+    + 'call, which is what makes a sample mean anything; throughput does not, because '
+    + 'the synchronize destroys the pipelining that sets it. They are not convertible '
+    + 'into each other.</dd>'
+    + '<dt>T1 &asymp; T2</dt><dd>GPU-bound: the host adds nothing.</dd>'
+    + '<dt>T1 &gt;&gt; T2</dt><dd>Host-bound. The stage table names the stage.</dd>'
+    + '<dt>T3 &lt;&lt; T2</dt><dd>The device is idle inside the call — launch '
+    + 'overhead, sync bubbles, or a swarm of tiny kernels.</dd>'
+    + '<dt>T4</dt><dd>The model artifact timed by a separate harness (polygraphy for an '
+    + 'engine, a bare onnxruntime session for ONNX), compared per model call so a '
+    + 'tiling pipeline does not read as wrapper overhead.</dd>'
+    + '<dt>kernel profile</dt><dd>Opt-in. A separate child process re-runs one cell under Nsight Systems, so it costs an extra capture and perturbs none of the numbers above. It answers <i>which kernels</i>, where the stage table answers <i>which stage</i>.</dd>'
+    + '<dt>coverage</dt><dd><code>direct</code> a wrapped call; <code>residual</code> '
+    + 'a parent minus its measured children; <code>unavailable</code> this bundle’s '
+    + 'vendored runtime has no such call — not zero, unknown.</dd>'
+    + '<dt>&Delta;mem at load</dt><dd>What holding this bundle costs. Per-process, from '
+    + 'NVML. <code>torch peak</code> beside it is partial by construction.</dd>'
+    + '</dl>';
+
+  html += '<h2 class="bb-head">Known limitations</h2><ul class="bb-limits">'
+    + '<li>GPU utilization is per-process kernel time, not SM or tensor-core occupancy. '
+    + 'Occupancy needs GPU performance counters, which need CAP_SYS_ADMIN — the trainer '
+    + 'container is unprivileged, so the Nsight pass captures a trace (which it can) and '
+    + 'never asks for counters (which would fail the whole capture).</li>'
+    + '<li>With the Nsight pass this page says which stage <i>and</i> which kernel. It '
+    + 'still does not say why a kernel is slow inside itself — that is Nsight Compute '
+    + '(<code>ncu</code>), and out of scope here.</li>'
+    + '<li>The Nsight pass runs once per benchmark, on the first cell, not once per '
+    + 'cell — a capture is expensive and the kernel mix does not vary much with batch '
+    + 'size. The profiled cell is named above the table.</li>'
+    + '<li>Device peak memory is whole-device and so includes any co-tenant; the '
+    + 'per-process figure is the load delta.</li>'
+    + '<li>The stage pass synchronizes at each boundary, so its total exceeds the '
+    + 'headline latency. Read stage <i>shares</i>, not stage absolutes.</li>'
+    + '<li>Concurrency loads one full copy of the bundle per stream, so the memory cost '
+    + 'is real and linear; it is not a shared-context measurement.</li>'
+    + '<li>An ONNX bundle runs one image per session call regardless of batch size, so '
+    + 'on ONNX a larger batch only ever moves the person detector.</li>'
+    + '</ul>';
+
+  body.innerHTML = html;
+})();
+</script>
+{% endverbatim %}
+{% endblock %}

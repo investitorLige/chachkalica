@@ -47,4 +47,5 @@ The cleanup command removes only the container. It does not delete the Docker vo
 - [Pipeline Metadata](pipeline-metadata.md) — a model carries the pipeline it was trained through, in every format; every action prefills from it
 - [Infer Bundles](infer-bundles.md) — drop a self-contained bundle in `data/bundles` and run it from any inference form; what "Sync bundle" checks
 - [Build Nodes](build-nodes.md) — register other GPU machines and compile TensorRT engines/bundles on them, so a bundle is valid on the GPU it will actually run on
+- [Bundle Benchmarks](bundle-benchmarks.md) — measure an exported bundle on real frames: latency percentiles, throughput, GPU memory, and where the frame budget actually goes
 - [.pt Bundles](pt-bundles.md) — export a checkpoint plus its full catalog/pipeline/training provenance as one `.tar.gz`, to catalog on another machine

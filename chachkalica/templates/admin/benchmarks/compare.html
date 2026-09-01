@@ -1,0 +1,202 @@
+{% extends "admin/base_site.html" %}
+
+{% comment %}
+Two or more benchmark runs side by side, with deltas against the leftmost (oldest
+selected) run — the question this page exists for is "did it get slower", which a
+single run's report cannot answer.
+
+Compares the batch-1 single-stream cell of each run, because that is the only cell
+every run is guaranteed to have; a run whose sweep did not include it is shown as
+missing rather than silently compared against a different batch size.
+{% endcomment %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  .bc {
+    --bc-bg: #0a0f0c; --bc-panel: #0e1512; --bc-inset: #0b1210; --bc-head: #0c1613;
+    --bc-line: #1b2b23; --bc-line-strong: #23402f;
+    --bc-ink: #dbe9e0; --bc-dim: #6f8c7c; --bc-faint: #48594e;
+    --bc-accent: #45d992; --bc-accent-soft: #2a8f63;
+    --bc-warn: #e3b341; --bc-err: #e3695f;
+    background: #0a0f0c; color: var(--bc-ink);
+    border: 1px solid var(--bc-line); border-radius: 6px; padding: 22px 24px 28px;
+    margin-top: 8px; font-size: 12.5px; line-height: 1.55;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  .bc a { color: var(--bc-accent); }
+  .bc h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .14em;
+    color: var(--bc-dim); font-weight: 600; margin: 28px 0 10px;
+  }
+  .bc-scroll { overflow-x: auto; }
+  .bc table {
+    border-collapse: collapse; width: 100%; min-width: 520px;
+    font-variant-numeric: tabular-nums; background: var(--bc-panel);
+  }
+  .bc th, .bc td {
+    border: 1px solid var(--bc-line); padding: 5px 10px; text-align: right;
+    white-space: nowrap;
+  }
+  .bc thead th { background: var(--bc-head); font-weight: 600; }
+  .bc thead th small { display: block; color: var(--bc-dim); font-weight: 400; }
+  .bc .bc-rowlabel {
+    text-align: left; position: sticky; left: 0; background: var(--bc-head);
+    color: var(--bc-dim); font-weight: 500;
+  }
+  .bc .bc-group td {
+    background: var(--bc-inset); color: var(--bc-accent-soft); text-align: left;
+    text-transform: uppercase; letter-spacing: .1em; font-size: 10.5px;
+  }
+  .bc-delta { display: block; font-size: 10.5px; }
+  .bc-better { color: var(--bc-accent); }
+  .bc-worse { color: var(--bc-err); }
+  .bc-flat { color: var(--bc-faint); }
+  .bc-dash { color: var(--bc-faint); }
+  .bc-pill {
+    display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 10.5px;
+    border: 1px solid var(--bc-warn); color: var(--bc-warn);
+  }
+  .bc-note { color: var(--bc-dim); font-size: 11.5px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<p><a href="{{ back_url }}">&larr; Back to bundle benchmarks</a></p>
+
+{{ compare_json|json_script:"bc-data" }}
+
+<div class="bc"><div id="bc-body"></div></div>
+
+{% verbatim %}
+<script>
+(function () {
+  const DATA = JSON.parse(document.getElementById('bc-data').textContent);
+  const body = document.getElementById('bc-body');
+  const runs = DATA.runs || [];
+
+  const esc = (v) => String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const dash = '<span class="bc-dash">&mdash;</span>';
+
+  // The batch-1 single-stream cell: the only one every sweep is guaranteed to hold.
+  runs.forEach((run) => {
+    const cells = ((run.result || {}).cells || []).filter((c) => !c.error);
+    run.cell = cells.find((c) => c.batch === 1 && c.concurrency === 1) || null;
+  });
+
+  const baseline = runs[0];
+  if (!baseline.cell) {
+    body.innerHTML = '<p class="bc-note">The leftmost run has no batch-1 single-stream '
+      + 'cell, so there is nothing to compare the others against. Re-run it with '
+      + '<code>1</code> in the batch sizes.</p>';
+    return;
+  }
+
+  // "Better" is direction-dependent: lower is better for latency and memory, higher
+  // for throughput. Getting this backwards would colour a regression green.
+  const METRICS = [
+    { group: 'latency (lower is better)' },
+    { label: 'p50', get: (c) => (c.latency_ms || {}).p50, unit: 'ms', lower: true },
+    { label: 'p90', get: (c) => (c.latency_ms || {}).p90, unit: 'ms', lower: true },
+    { label: 'p99', get: (c) => (c.latency_ms || {}).p99, unit: 'ms', lower: true },
+    { group: 'throughput (higher is better)' },
+    { label: 'fps', get: (c) => c.fps, unit: 'fps', lower: false, digits: 1 },
+    { group: 'memory (lower is better)' },
+    { label: 'Δmem at load', get: (c) => (c.mem || {}).load_delta_mb, unit: 'MB',
+      lower: true, digits: 1 },
+    { label: 'host RSS peak', get: (c) => (c.mem || {}).host_rss_peak_mb, unit: 'MB',
+      lower: true, digits: 0 },
+    { group: 'other' },
+    { label: 'gpu busy', get: (c) => c.gpu_busy_pct, unit: '%', lower: null, digits: 1 },
+    { label: 'detections / frame', get: (c) => c.detections_mean, unit: '',
+      lower: null, digits: 1 },
+    { label: 'first call', get: (c) => (c.coldstart || {}).first_call_ms, unit: 'ms',
+      lower: true, digits: 0 },
+    { label: 'model calls / frame', get: (c) => c.model_calls_per_frame, unit: '',
+      lower: null, digits: 0 },
+  ];
+
+  let html = '<div class="bc-scroll"><table><thead><tr><th class="bc-rowlabel"></th>';
+  runs.forEach((run, index) => {
+    html += '<th>' + esc(run.label)
+      + '<small>' + esc(run.fmt || '?') + ' · ' + esc(run.created.slice(0, 10))
+      + (index === 0 ? ' · baseline' : '') + '</small>'
+      + (run.contended ? '<span class="bc-pill">contended</span>' : '')
+      + '</th>';
+  });
+  html += '</tr></thead><tbody>';
+
+  METRICS.forEach((metric) => {
+    if (metric.group) {
+      html += '<tr class="bc-group"><td colspan="' + (runs.length + 1) + '">'
+        + esc(metric.group) + '</td></tr>';
+      return;
+    }
+    const digits = metric.digits == null ? 2 : metric.digits;
+    const base = baseline.cell ? metric.get(baseline.cell) : null;
+    html += '<tr><td class="bc-rowlabel">' + esc(metric.label) + '</td>';
+    runs.forEach((run, index) => {
+      const value = run.cell ? metric.get(run.cell) : null;
+      if (value == null) { html += '<td>' + dash + '</td>'; return; }
+      let out = esc(Number(value).toFixed(digits)) + (metric.unit ? ' ' + metric.unit : '');
+      if (index > 0 && base) {
+        const pct = (value - base) / base * 100;
+        let cls = 'bc-flat';
+        if (Math.abs(pct) >= 2 && metric.lower !== null) {
+          const better = metric.lower ? pct < 0 : pct > 0;
+          cls = better ? 'bc-better' : 'bc-worse';
+        }
+        out += '<span class="bc-delta ' + cls + '">'
+          + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%</span>';
+      }
+      html += '<td>' + out + '</td>';
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table></div>';
+
+  // Stages, but only across runs that measured them and only for shared stage ids —
+  // two bundle versions may declare different stage sets, and inventing rows for the
+  // union would show a stage as absent when it simply does not exist there.
+  const withStages = runs.filter((run) => run.cell && (run.cell.stages || []).length);
+  if (withStages.length >= 2) {
+    const ids = [];
+    withStages[0].cell.stages.forEach((stage) => {
+      if (withStages.every((run) => run.cell.stages.some((s) => s.id === stage.id))) {
+        ids.push(stage);
+      }
+    });
+    if (ids.length) {
+      html += '<h2>Stage shares (% of the stage pass)</h2>';
+      html += '<div class="bc-scroll"><table><thead><tr><th class="bc-rowlabel">stage</th>';
+      withStages.forEach((run) => { html += '<th>' + esc(run.label) + '</th>'; });
+      html += '</tr></thead><tbody>';
+      ids.forEach((template) => {
+        html += '<tr><td class="bc-rowlabel" style="padding-left:'
+          + (10 + (template.depth || 0) * 16) + 'px">' + esc(template.label) + '</td>';
+        withStages.forEach((run) => {
+          const stage = run.cell.stages.find((s) => s.id === template.id);
+          html += '<td>' + (stage && stage.pct != null
+            ? esc(stage.pct.toFixed(1)) + '%' : dash) + '</td>';
+        });
+        html += '</tr>';
+      });
+      html += '</tbody></table></div>';
+      html += '<p class="bc-note">Shares, not absolutes: the stage pass synchronizes at '
+        + 'every boundary, so its total is inflated in every run alike.</p>';
+    }
+  }
+
+  const contended = runs.filter((run) => run.contended);
+  if (contended.length && contended.length !== runs.length) {
+    html += '<p class="bc-note"><b>Careful:</b> '
+      + contended.map((run) => esc(run.label)).join(', ')
+      + ' ran with another process on the GPU and the others did not, so these '
+      + 'deltas mix a real change with a difference in conditions.</p>';
+  }
+
+  body.innerHTML = html;
+})();
+</script>
+{% endverbatim %}
+{% endblock %}

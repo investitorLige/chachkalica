@@ -319,13 +319,13 @@ class InferenceJob(models.Model):
     def model_checkpoint(self) -> str:
         """Absolute path of the model artifact to run.
 
-        Trained models carry a checkpoint path that may be project-relative;
-        exported artifacts resolve against the export output directory and
-        bundles against the bundle root (both reject anything escaping their
-        root). Raises ``ValueError`` when the job's model is missing or unusable.
+        Trained models carry a checkpoint path that may be project-relative (see
+        ``TrainedModel.resolved_checkpoint_path``, which also falls back from a
+        missing ``best.pt`` to a sibling ``last.pt``); exported artifacts resolve
+        against the export output directory and bundles against the bundle root
+        (both reject anything escaping their root). Raises ``ValueError`` when
+        the job's model is missing or unusable.
         """
-        from django.conf import settings
-
         if self.model_source == self.EXPORTED:
             from training.services import exports
 
@@ -338,11 +338,7 @@ class InferenceJob(models.Model):
 
         if not self.trained_model_id:
             raise ValueError("Inference job has no trained model.")
-        raw = (self.trained_model.checkpoint_path or "").strip()
-        if not raw:
-            raise ValueError(f"{self.trained_model.name}: no checkpoint path to run.")
-        path = Path(raw)
-        return str(path if path.is_absolute() else Path(settings.BASE_DIR) / path)
+        return str(self.trained_model.resolved_checkpoint_path())
 
     def output_path(self) -> Path:
         from videos.services.inference import output_dir

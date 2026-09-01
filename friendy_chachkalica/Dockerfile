@@ -79,6 +79,12 @@ COPY friendy_chachkalica/ /app/friendy_chachkalica/
 COPY chachak/ /app/chachak/
 COPY onnx_infer/ /app/onnx_infer/
 COPY trt_infer/ /app/trt_infer/
+# The benchmark tooling. Baked in rather than hand-copied: the bundle benchmark is
+# reached from the Django admin (see /benchmark_bundle in service.py), so it has to
+# be present in every container built from this image, not just in one somebody
+# `docker cp`-ed into. It also reuses inferlica/benchmark/gpu_monitor.py, which is
+# where this repo's correct per-process GPU memory and utilization reads live.
+COPY inferlica/ /app/inferlica/
 
 # Listen on the port Django targets (TrainingSettings.service_base_url). The
 # value is overridable at runtime via the FC_PORT env var; EXPOSE is only docs.

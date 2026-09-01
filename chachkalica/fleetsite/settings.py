@@ -61,6 +61,7 @@ INSTALLED_APPS = [
     "eval_pipelines",
     "videos",
     "cameras",
+    "benchmarks",
 ]
 
 MIDDLEWARE = [

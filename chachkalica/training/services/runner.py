@@ -355,3 +355,70 @@ def export_bundle(
             f"trainer /export_bundle returned HTTP {resp.status_code}: {detail}"
         )
     return resp.json()
+
+
+def launch_benchmark(benchmark, ts: TrainingSettings | None = None) -> dict:
+    """Ask the service to benchmark one exported bundle.
+
+    Asynchronous, unlike the export calls: a sweep with warmup plus three timing
+    passes and a stage pass per cell runs for minutes, so the trainer tracks it as a
+    subprocess and :mod:`benchmarks.jobs` polls it — the same shape as ``/train``.
+
+    ``benchmark`` is a ``benchmarks.models.BundleBenchmark``; it is passed rather than
+    unpacked so the payload stays in one place next to the endpoint's request model.
+    """
+    payload = {
+        "benchmark_id": benchmark.pk,
+        "bundle_dir": str(benchmark.absolute_bundle_dir()),
+        "images": benchmark.resolved_images_path(),
+        "output_dir": benchmark.output_dir or benchmark.resolved_output_dir(),
+        "max_images": benchmark.max_images or None,
+        "batch_sizes": benchmark.batch_sizes,
+        "concurrency": benchmark.concurrency,
+        "warmup": benchmark.warmup,
+        "calls": benchmark.calls,
+        "min_duration_s": benchmark.min_duration_s,
+        "measure_stages": benchmark.measure_stages,
+        "skip_bare_model": benchmark.skip_bare_model,
+        "profile_nsys": benchmark.profile_nsys,
+        "fmt": benchmark.fmt or None,
+    }
+    resp = requests.post(f"{base_url(ts)}/benchmark_bundle", json=payload, timeout=TIMEOUT)
+    if resp.status_code >= 400:
+        detail = resp.text
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and body.get("detail"):
+            detail = str(body["detail"])
+        raise RuntimeError(
+            f"trainer /benchmark_bundle returned HTTP {resp.status_code}: {detail}"
+        )
+    return resp.json()
+
+
+def fetch_benchmark_status(benchmark, ts: TrainingSettings | None = None) -> dict:
+    """The service's view of a benchmark run.
+
+    A 404 means the service has no record — it was restarted mid-run — reported as
+    ``{"status": "unknown"}`` so the poller can fall back to looking for the result
+    file on the shared mount rather than hanging at "running" forever.
+    """
+    resp = requests.get(f"{base_url(ts)}/benchmarks/{benchmark.pk}", timeout=TIMEOUT)
+    if resp.status_code == 404:
+        return {"status": "unknown"}
+    resp.raise_for_status()
+    return resp.json()
+
+
+def stop_benchmark(benchmark, grace: float = 10.0,
+                   ts: TrainingSettings | None = None) -> dict:
+    resp = requests.post(
+        f"{base_url(ts)}/benchmarks/{benchmark.pk}/stop",
+        params={"grace": grace}, timeout=TIMEOUT,
+    )
+    if resp.status_code == 404:
+        return {"status": "unknown"}
+    resp.raise_for_status()
+    return resp.json()
