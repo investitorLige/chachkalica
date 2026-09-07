@@ -126,6 +126,53 @@ class FrameExtractionJob(models.Model):
         return f"{self.video.name} → {self.dataset_name}"
 
 
+class RenderPreset(models.Model):
+    """A saved marketing look, by name.
+
+    The "Run model inference for marketing…" form has forty-odd style fields, and
+    a batch of clips for the same deck wants the same forty-odd answers. The form
+    already arrives carrying the last look used, which covers "do another one like
+    that one"; a preset covers "we have three looks and I pick between them".
+
+    Holds the *look* only, deliberately — not the model, pipeline or detector.
+    Those come from the model's own recorded metadata (see
+    ``training.services.pipeline_meta``), and a preset that overrode them would
+    quietly undo that convention.
+
+    Same shape as ``InferenceJob.render_style``: a whole style dict, validated
+    through :func:`videos.services.render_style.normalize` when it is read back,
+    so a preset saved by an older version of that module still loads.
+    """
+
+    name = models.CharField(
+        max_length=120, unique=True,
+        help_text="What this look is called in the preset dropdown.",
+    )
+    style = models.JSONField(
+        default=dict,
+        help_text="The style dict (see videos.services.render_style).",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "Render preset"
+        verbose_name_plural = "Render presets"
+
+    def __str__(self) -> str:
+        return self.name
+
+    def summary(self) -> str:
+        """The couple of choices that identify a look at a glance — same pair the
+        Inferred videos list shows."""
+        from videos.services import render_style
+
+        style = render_style.normalize(self.style)
+        return f"{style['box_style']} · {style['palette']}"
+
+
 class InferenceJob(models.Model):
     """One "Run model inference…" run: a model applied frame-by-frame to a video,
     with detected boxes burned onto an annotated output video.
@@ -155,6 +202,14 @@ class InferenceJob(models.Model):
     For a bundle those knobs are not the operator's to choose: a bundle ships the
     geometry its weights were tuned with, so the admin renders them read-only and
     :meth:`sync_bundle` re-derives them from the manifest on save.
+
+    ``render_style`` is orthogonal to all of that: it is *how the result looks*,
+    not what ran. Empty (the ordinary "Run model inference…" action) means the
+    plain overlay; the "Run model inference for marketing…" action fills it with
+    a full style dict (see :mod:`videos.services.render_style`). Kept as one JSON
+    blob rather than thirty columns because nothing queries or filters on an
+    individual knob — the row is the record of a look, read back whole by the
+    renderer and by the form when a run is duplicated.
     """
 
     QUEUED = "queued"
@@ -270,6 +325,13 @@ class InferenceJob(models.Model):
         help_text="Run inference every Nth frame; frames in between reuse the last "
                   "inferred boxes. Higher = faster, less temporally precise.",
     )
+    render_style = models.JSONField(
+        default=dict, blank=True,
+        help_text="Look of the burned-in overlay, as written by the \"Run model "
+                  "inference for marketing…\" action (see "
+                  "videos.services.render_style). Empty = the plain overlay the "
+                  "ordinary inference action draws.",
+    )
 
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=QUEUED)
     last_error = models.TextField(blank=True)
@@ -293,6 +355,11 @@ class InferenceJob(models.Model):
 
     def __str__(self) -> str:
         return f"{self.video.name} → {self.model_label()} [{self.pipeline}]"
+
+    def is_marketing(self) -> bool:
+        """Whether this run was configured for looks (the marketing action) as
+        opposed to the plain overlay."""
+        return bool(self.render_style)
 
     def model_label(self) -> str:
         """Human name of the model this job runs, whichever source it came from."""

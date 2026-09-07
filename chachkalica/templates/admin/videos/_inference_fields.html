@@ -1,0 +1,196 @@
+{% comment %}
+The model + pipeline half of an inference form: which model runs, and what
+geometry the frames reach it through. Shared verbatim by "Run model inference…"
+and "Run model inference for marketing…" — the two differ only in what they add
+around it (the marketing form adds a Look section and a preview), and a knob
+added here has to appear on both or the two actions quietly stop being the same
+run.
+
+Expects the context videos.admin._inference_wizard builds, and must sit inside
+that page's <form>.
+{% endcomment %}
+  {% if is_bundle %}
+    <div class="form-row" data-bundle-sync="{{ bundle_sync_url }}">
+      <label for="bundle_path">Infer bundle:</label>
+      <select name="bundle_path" id="bundle_path" data-bundle-select required>
+        <option value="">———</option>
+        {% for b in bundles %}
+          <option value="{{ b.relpath }}"
+                  {% if selected_model == b.relpath %}selected{% endif %}>
+            {{ b.relpath }} — {{ b.pipeline|default:"unknown pipeline" }},
+            {{ b.kind }}, {{ b.size_mb }} MB{% if not b.ok %} (BROKEN){% endif %}
+          </option>
+        {% endfor %}
+      </select>
+      <p>
+        <input type="button" class="button" value="Sync bundle" data-bundle-button>
+        <label style="font-weight:normal;margin-left:10px">
+          <input type="checkbox" data-bundle-load-test checked>
+          load the model on the GPU to prove it runs here
+        </label>
+      </p>
+      <div data-bundle-report
+           style="margin-top:8px;font-family:monospace;font-size:11px;line-height:1.6"></div>
+      <p class="help">
+        {% if bundles %}
+          Bundle directories under <code>{{ bundles_root }}</code>, newest first. Pick one and
+          press <strong>Sync bundle</strong>: it reads the bundle's
+          <code>pipeline.json</code>, checks its model / detector / classes, then fills the
+          pipeline fields below from it and locks them — a bundle ships the geometry its
+          weights were tuned with, and those values are re-read from it when the job is
+          submitted. The load test additionally proves the artifacts load <em>on this
+          machine</em>, which is the check a TensorRT engine copied from another machine most
+          needs; it briefly takes the GPU and evicts the trainer's warm model.
+        {% else %}
+          No bundles under <code>{{ bundles_root }}</code>. Export a model (Models →
+          &ldquo;Export best + last to ONNX/TensorRT…&rdquo;) — each export writes a
+          <code>…-bundle/</code> beside its artifact — or copy a bundle directory in from
+          another machine, or point <em>bundles_root</em> in Training settings at where yours
+          live.
+        {% endif %}
+      </p>
+    </div>
+  {% elif is_exported %}
+    <div class="form-row">
+      <label for="artifact_path">Exported model:</label>
+      <select name="artifact_path" id="artifact_path" required>
+        {% for a in artifacts %}
+          <option value="{{ a.relpath }}"
+                  {% if selected_model == a.relpath %}selected{% endif %}>
+            {{ a.relpath }} — {{ a.kind }}, {{ a.size_mb }} MB
+          </option>
+        {% endfor %}
+      </select>
+      <p class="help">
+        {% if artifacts %}
+          ONNX and TensorRT artifacts found under <code>{{ exports_root }}</code>, newest
+          first — the newest is preselected, with the pipeline it was exported with already
+          filled in below. A TensorRT engine only runs on the GPU + TensorRT version it was
+          built for.
+        {% else %}
+          No <code>.onnx</code> / <code>.engine</code> files under
+          <code>{{ exports_root }}</code>. Export a model first (Models →
+          &ldquo;Export best + last to ONNX/TensorRT…&rdquo;), or point
+          <em>exports_root</em> in Training settings at the directory holding them.
+        {% endif %}
+      </p>
+    </div>
+  {% else %}
+    <div class="form-row">
+      <label for="trained_model">Trained model:</label>
+      <select name="trained_model" id="trained_model" required>
+        {% for tm in trained_models %}
+          <option value="{{ tm.pk }}"
+                  {% if selected_model == tm.pk|stringformat:"s" %}selected{% endif %}>
+            {{ tm.name }} ({{ tm.arch }})
+          </option>
+        {% endfor %}
+      </select>
+      <p class="help">Newest model preselected, with the pipeline it was trained through
+      already filled in below — submit as-is to serve it the way it was trained. Switching
+      models reapplies that model's own pipeline; every field stays editable if you want to
+      serve it differently.</p>
+    </div>
+  {% endif %}
+
+  <div class="form-row">
+    <label for="pipeline">Pipeline:</label>
+    <select name="pipeline" id="pipeline" required>
+      {% for value, label in pipeline_choices %}
+        <option value="{{ value }}" {% if values.pipeline == value %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <p class="help">How each frame reaches the model: whole frame (<code>raw</code>), tiled,
+    or cropped around detected people. The fields below narrow to the selected pipeline's
+    settings; blank fields use chachak's defaults.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ detector_pipelines }} {{ chain_pipelines }}">
+    <label for="detector_checkpoint">Detector checkpoint:</label>
+    <input type="text" name="detector_checkpoint" id="detector_checkpoint" size="60"
+           value="{{ values.detector_checkpoint }}">
+    <p class="help">Path to the person-detector checkpoint (<code>.pt</code>,
+    <code>.onnx</code> or <code>.engine</code>). Required for
+    <code>people_detect_first</code> and <code>batch_people</code> (and any chain that
+    includes them).</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ detector_pipelines }} {{ chain_pipelines }}">
+    <label for="detector_expand_ratio">Person-box expand ratio:</label>
+    <input type="number" name="detector_expand_ratio" id="detector_expand_ratio"
+           min="0" max="10" step="0.01" value="{{ values.detector_expand_ratio }}">
+    <p class="help">Grow each detected person box by this fraction before cropping
+    (0.10 = +10%). Match what the model was trained with.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ detector_pipelines }} {{ chain_pipelines }}">
+    <label for="detector_min_box_size">Person-crop minimum size (px):</label>
+    <input type="number" name="detector_min_box_size" id="detector_min_box_size"
+           min="0" step="1" value="{{ values.detector_min_box_size }}">
+    <p class="help">Grow person crops smaller than this instead of dropping them. Only used
+    by <code>people_detect_first</code> and <code>batch_people</code>.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ chain_pipelines }}">
+    <label for="chain">Chain:</label>
+    <input type="text" name="chain" id="chain" size="60"
+           placeholder="e.g. batch_detect, people_detect_first"
+           value="{{ values.chain }}">
+    <p class="help">Ordered, comma-separated pipeline names to run in sequence and merge.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ tiling_pipelines }}">
+    <label for="tile_size_px">Tile size (px):</label>
+    <input type="number" name="tile_size_px" id="tile_size_px" min="1" step="1"
+           value="{{ values.tile_size_px }}">
+    <p class="help">Fixed square tile size — overrides the two percentages below. Set this to
+    the resolution the model was trained at to preserve its native pixel scale.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ tiling_pipelines }}">
+    <label for="tile_width_pct">Tile width %:</label>
+    <input type="number" name="tile_width_pct" id="tile_width_pct" min="1" max="100" step="1"
+           value="{{ values.tile_width_pct }}">
+    <p class="help">Tile width as a percent (1–100) of each frame's width.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ tiling_pipelines }}">
+    <label for="tile_height_pct">Tile height %:</label>
+    <input type="number" name="tile_height_pct" id="tile_height_pct" min="1" max="100" step="1"
+           value="{{ values.tile_height_pct }}">
+    <p class="help">Tile height as a percent (1–100) of each frame's height.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ tiling_pipelines }}">
+    <label for="overlap">Tile overlap:</label>
+    <input type="number" name="overlap" id="overlap" min="0" max="0.99" step="0.05"
+           value="{{ values.overlap }}">
+    <p class="help">Fraction (0–1) by which adjacent tiles overlap.</p>
+  </div>
+
+  <div class="form-row" data-pipelines="{{ merging_pipelines }}">
+    <label for="merge_nms_iou">Merge NMS IoU:</label>
+    <input type="number" name="merge_nms_iou" id="merge_nms_iou"
+           min="0" max="1" step="0.05" value="{{ values.merge_nms_iou }}">
+    <p class="help">Class-aware NMS IoU used to merge the predictions a pipeline makes
+    across tiles / person crops back into one set of boxes. Blank uses chachak's default.
+    Match what the model was trained with.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="score_threshold">Score threshold:</label>
+    <input type="number" name="score_threshold" id="score_threshold"
+           min="0" max="1" step="0.01"
+           value="{{ values.score_threshold }}" required>
+    <p class="help">Detections below this confidence are dropped.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="frame_stride">Frame stride:</label>
+    <input type="number" name="frame_stride" id="frame_stride" min="1"
+           value="{{ values.frame_stride }}" required>
+    <p class="help">Run inference every Nth frame; frames in between reuse the last
+    inferred boxes. Higher = faster, less temporally precise. Pipelines run the model
+    several times per frame, so raise this for anything but <code>raw</code>.</p>
+  </div>
+

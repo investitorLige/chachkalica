@@ -1,0 +1,16 @@
+# Pinned to the 5.x line, which is what the adapters are written against:
+#   * the generic auto class is AutoModelForImageTextToText — 4.x's
+#     AutoModelForVision2Seq was removed, so a 4.x pin breaks SmolVLM/InternVL;
+#   * from_pretrained takes `dtype`, not 4.x's `torch_dtype`.
+# Independent of the trainer's own transformers pin — this backend has its own
+# image, so the two never have to agree.
+transformers>=5.16,<6
+accelerate>=0.30
+qwen-vl-utils>=0.0.8
+pillow>=10.0
+fastapi>=0.110
+uvicorn>=0.29
+requests>=2.31
+# Only needed for the 8-bit/4-bit quantization options on a VLM model row;
+# harmless to have installed when they are left as "none".
+bitsandbytes>=0.43

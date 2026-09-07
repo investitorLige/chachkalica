@@ -62,13 +62,25 @@ INSTALLED_APPS = [
     "videos",
     "cameras",
     "benchmarks",
+    "vlm",
+    "admin_sections",
 ]
+
+# Videos are the one thing operators upload through the browser (the VLM Videos
+# tab). Django spools any file part past this to a temp file instead of holding
+# it in memory; set explicitly so that behaviour is deliberate rather than
+# incidental. Note this does not cap the upload — there is no proxy in front of
+# gunicorn — but gunicorn's own --timeout does bound a slow one.
+FILE_UPLOAD_MAX_MEMORY_SIZE = 5 * 1024 * 1024
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     # Serves static files (admin CSS + the fleet theme) under gunicorn, where
     # Django would not on its own. Must sit right after SecurityMiddleware.
     "whitenoise.middleware.WhiteNoiseMiddleware",
+    # Routes /admin/s/<slug>/... to the per-project admin front — must run
+    # before URL resolution, so as early as possible. See admin_sections/middleware.py.
+    "admin_sections.middleware.SectionAdminMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -91,6 +103,7 @@ TEMPLATES = [
                 "django.template.context_processors.request",
                 "django.contrib.auth.context_processors.auth",
                 "django.contrib.messages.context_processors.messages",
+                "admin_sections.context_processors.admin_sections_nav",
             ],
         },
     },

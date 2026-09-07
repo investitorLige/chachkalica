@@ -3,7 +3,10 @@
 
 Owns the deserialized engine + execution context and runs one pre-processed
 ``[B,3,H,W]`` batch through it, returning the three Contract-A outputs
-(``boxes``/``scores``/``labels``) in that canonical order.
+(``boxes``/``scores``/``labels``) in that canonical order. One arch (rtmo) isn't
+a detection triple at all — see ``RTMO_OUTPUTS`` below — and gets a same-shaped
+``(dets, keypoints)`` pair instead, per image, for its ArchHandler to turn into
+Contract A itself.
 
 Two entry points over one implementation:
 
@@ -40,6 +43,14 @@ CANONICAL_OUTPUTS = ("boxes", "scores", "labels")
 # EfficientNMS_TRT plugin outputs (retinanet / yolox engines). Fixed-size; the
 # valid count is in ``num_detections``. Unpacked back into (boxes, scores, labels).
 EFFICIENTNMS_OUTPUTS = ("num_detections", "detection_boxes", "detection_scores", "detection_classes")
+
+# RTMO (pose) engine outputs. Not a detection triple at all — see
+# onnx_infer/arch/rtmo.py — so this pair is handed to the ArchHandler as-is,
+# per-image, rather than unpacked into (boxes, scores, labels) here. Dynamic
+# per-image row count (the graph NMSes itself), same as EfficientNMS_TRT's
+# num_detections case, but with no fixed-size padding to slice against:
+# TensorRT reports each image's real count directly via the output allocator.
+RTMO_OUTPUTS = ("dets", "keypoints")
 
 
 def _torch_dtype_for(trt, torch, trt_dtype):
@@ -158,13 +169,22 @@ class TrtModel:
             else:
                 self._output_names.append(tname)
         self.input_name = self._input_names[0]
-        # Two graph output layouts, auto-detected by tensor name:
+        # Three graph output layouts, auto-detected by tensor name:
         #   * EfficientNMS_TRT (retinanet/yolox): 4 fixed-size outputs; unpack to
         #     (boxes, scores, labels) by slicing to num_detections.
+        #   * rtmo (pose): (dets, keypoints) — not a detection triple; handed to
+        #     the ArchHandler as that pair, one per image.
         #   * passthrough (rtdetr/rfdetr): already (boxes, scores, labels).
         self._efficientnms = set(EFFICIENTNMS_OUTPUTS).issubset(set(self._output_names))
+        # Set EQUALITY, not issubset (which is right only for EfficientNMS's fixed
+        # four): ``dets`` is a name other pose/DETR-family exports use too, so a
+        # subset test would claim one of those as rtmo and hand keypoint code a
+        # tensor that isn't keypoints — with nothing raising.
+        self._rtmo = set(RTMO_OUTPUTS) == set(self._output_names)
         if self._efficientnms:
             self._emit_order = list(EFFICIENTNMS_OUTPUTS)
+        elif self._rtmo:
+            self._emit_order = list(RTMO_OUTPUTS)
         elif set(CANONICAL_OUTPUTS).issubset(set(self._output_names)):
             self._emit_order = list(CANONICAL_OUTPUTS)
         else:
@@ -256,6 +276,8 @@ class TrtModel:
         ordered = [outputs[tname] for tname in self._emit_order]
         if self._efficientnms:
             return _unpack_efficientnms(ordered, batch_size)
+        if self._rtmo:
+            return _split_rtmo(ordered, batch_size)
         return _split_passthrough(ordered, batch_size)
 
     def run(self, batched: np.ndarray) -> list:
@@ -397,3 +419,16 @@ def _split_passthrough(ordered: list, batch_size: int) -> list:
             )
         return [[boxes, scores, labels]]
     return [[boxes[i], scores[i], labels[i]] for i in range(batch_size)]
+
+
+def _split_rtmo(ordered: list, batch_size: int) -> list:
+    """``[dets[B,N,5], keypoints[B,N,17,3]]`` -> one ``[dets_i, keypoints_i]``
+    pair per image — **not** a Contract-A triple; ``RTMOHandler`` makes one out
+    of the pair (see ``onnx_infer/arch/rtmo.py``).
+
+    Always batch-first, so unlike :func:`_split_passthrough` this needs no
+    rank-based fallback: the mmdeploy export never indexes the batch axis away
+    the way this repo's own export wrappers used to.
+    """
+    dets, keypoints = ordered
+    return [[dets[i], keypoints[i]] for i in range(batch_size)]

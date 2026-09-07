@@ -21,6 +21,11 @@ x-app: &app
     # bind-mount sources must be host paths. ${PWD} is the project dir at
     # `docker compose up` time.
     FLEET_HOST_DATA_DIR: ${PWD}/data
+    # This standalone stack has no vlm-backend of its own (that is the unified
+    # compose's job), so VLM runs target one published on the host. Without
+    # this the worker would try to resolve a service name that does not exist
+    # here and every frame would fail.
+    VLM_BACKEND_URL: ${VLM_BACKEND_URL:-http://host.docker.internal:9091}
   volumes:
     - ./data:/app/data
     - /var/run/docker.sock:/var/run/docker.sock

@@ -1,0 +1,15 @@
+# Runtime dependencies for this bundle. Nothing beyond what the app's own
+# vendor/onnx_infer + vendor/trt_infer already need — this arch's handler
+# (vendor/onnx_infer/arch/rtmo.py) is pure numpy, no extra library required.
+torch
+numpy
+pillow
+
+# CPU inference against models/rtmo.trt.onnx. For GPU, install onnxruntime-gpu
+# instead (matched to your CUDA version).
+onnxruntime
+
+# Only needed to run models/rtmo.engine directly (outside this app). Must be
+# TensorRT 11.1.0.106 — see models/rtmo.engine.json — or the engine will not
+# deserialize.
+# tensorrt

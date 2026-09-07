@@ -129,6 +129,51 @@ bundle must live where the trainer can see it. `data/` is bind-mounted at
 `docker-compose.yml`), which is why the bundle root defaults inside it. A bundle
 root outside that tree will validate fine and fail at inference.
 
+## A bundle that wasn't exported here — `rtmo-posture`
+
+Most bundles in `data/bundles` came out of `chachak.bundle_export`, which means
+their arch, their preprocessing and their runtime were all decided in this repo.
+`rtmo-posture` is the exception worth knowing about, because it shows what a
+bundle from outside has to bring with it.
+
+RTMO is a bottom-up, whole-frame, multi-person **pose** estimator — an
+mmpose/mmdeploy `end2end.onnx`, not anything trained here. Its graph emits
+`(dets[B,N,5], keypoints[B,N,17,3])` rather than Contract A's
+`(boxes, scores, labels)`, so three things had to exist before it could be a
+model source at all:
+
+* `onnx_infer/arch/rtmo.py` — the arch handler. Contract A has no keypoint field,
+  so it *spends* each person's 17 joints on a geometry heuristic that emits one
+  of three classes — `standing`, `sitting`, `lying` — and drops the joints. In
+  the app this is a posture classifier that happens to be a pose model inside.
+* `trt_infer/session.py` — a third output layout (`RTMO_OUTPUTS`), detected by
+  tensor name, handing the ArchHandler that pair per image instead of unpacking a
+  triple. **If a re-export ever renames those tensors, nothing raises**: the pair
+  is silently read as `(boxes, scores, labels)`.
+* `pipeline: "raw"` in the manifest — whole frame straight to the model, no
+  tiling and no person-crop, because the model finds every person itself. Note
+  `raw` is a *serving* pipeline (`InferenceJob.RAW`), not one of chachak's, which
+  is why this bundle carries no `runtime/` + `infer.py`: chachak has no `raw`
+  pipeline to generate a standalone entrypoint for. **Sync bundle** reports that
+  as an `info`, not a failure — this app serves it fine, it just doesn't travel
+  as a self-running directory.
+
+Its engine is rebuilt the ordinary way, from the ONNX the bundle carries beside
+it — rtmo needs no EfficientNMS surgery, so there is no `.pt` involved:
+
+```bash
+docker compose run --rm --no-deps trainer python -m ml.trt_export.cli \
+    /app/data/bundles/rtmo-posture-bundle/models/rtmo.trt.onnx \
+    -o /app/data/bundles/rtmo-posture-bundle/models/rtmo.engine
+```
+
+Two things that bite here and are written up in the bundle's own `README.md`:
+the build needs a few GB of free VRAM and reports a shortage as
+`Could not find any implementation for node`, which reads like a graph problem;
+and `meta.layout: "bgr"` makes preprocess *reverse* the channel axis, so the
+graph only sees the order it wants because every caller in this repo hands it
+RGB. Feed it BGR and it loses about ten points of recall without erroring.
+
 ## Bundles vs loose artifacts
 
 Both are offered; they answer different needs.

@@ -1,0 +1,11 @@
+# The two large artifacts this directory carries are copies of
+# bundles_dir/rtmo-posture-bundle/models/, which the repo root ignores for the
+# same reason: ~400 MB of build output does not belong in git. They are here so
+# the directory is self-contained on disk — re-copy them, or rebuild the engine
+# with build/build_engine.py, on a fresh clone.
+bundle/models/*.engine
+bundle/models/*.onnx
+
+results/
+__pycache__/
+*.py[cod]

@@ -1,0 +1,26 @@
+# Everything in this directory, by what needs it.
+#
+# Always:
+numpy
+pillow            # run_pose.py's image I/O and --draw (the app uses cv2 instead)
+
+# To run bundle/models/rtmo.engine (build/, run_pose.py --model *.engine):
+#   torch      — vendor/trt_infer owns its CUDA stream and device memory through
+#                torch, which is how it avoids a pycuda/cuda-python dependency.
+#   tensorrt   — NOT pinned here on purpose. An engine only deserializes under
+#                the TensorRT version that built it (11.1.0.106 for the shipped
+#                engine — see bundle/models/rtmo.engine.json). Get it from the
+#                NGC container, not from PyPI: docker/Dockerfile.gpu in the repo
+#                root pins nvcr.io/nvidia/tensorrt:26.07-py3.
+torch>=2.2
+# tensorrt
+
+# To run bundle/models/rtmo.trt.onnx on CPU (the escape hatch, and the reference
+# side of build/verify_engine.py). onnxruntime-gpu instead, matched to your CUDA,
+# if you want it on the card:
+onnxruntime
+
+# Build-only, and only for the --fp16 path of build/build_engine.py (which is
+# known to fail on this graph — see README.md):
+# onnx
+# onnxconverter_common

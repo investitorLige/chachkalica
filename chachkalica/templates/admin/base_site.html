@@ -8,13 +8,40 @@
 {% endblock %}
 
 {% block branding %}
-<div id="site-name"><a href="{% url 'admin:index' %}">Chachkalica Fleet</a></div>
+<div id="site-name">
+  <a href="{% if nav_current_section %}/admin/s/{{ nav_current_section.slug }}/{% else %}{% url 'admin:index' %}{% endif %}">
+    {{ nav_current_section.name|default:"Chachkalica Fleet" }}
+  </a>
+</div>
 {% endblock %}
 
 {% block nav-global %}
+{% if not nav_current_section %}
+{# Global fleet dashboard — not part of fleetsite/urls.py under a section's own urlconf, and not project-scoped anyway. #}
 <a href="{% url 'benchmark-console' %}"
    style="margin-left:18px;padding:4px 12px;border:1px solid #2a8f63;border-radius:3px;
           color:#45d992;font-size:12px;font-weight:600;letter-spacing:.04em;text-decoration:none;">
   Arch console
 </a>
+{% endif %}
+
+{# One admin front per project — see admin_sections app. #}
+<span style="margin-left:18px;padding:4px 0 4px 14px;border-left:1px solid rgba(255,255,255,.25);">
+  <a href="/admin/"
+     style="color:#9fd7ff;font-size:12px;text-decoration:none;margin-right:12px;
+            {% if not nav_current_section %}font-weight:700;text-decoration:underline;{% endif %}">
+    Main admin
+  </a>
+  {% for section in nav_admin_sections %}
+  <a href="/admin/s/{{ section.slug }}/"
+     style="color:#9fd7ff;font-size:12px;text-decoration:none;margin-right:12px;
+            {% if nav_current_section.slug == section.slug %}font-weight:700;text-decoration:underline;{% endif %}">
+    {{ section.name }}
+  </a>
+  {% endfor %}
+  <a href="/admin/admin_sections/adminsection/add/"
+     style="color:#45d992;font-size:12px;font-weight:600;text-decoration:none;">
+    + New admin
+  </a>
+</span>
 {% endblock %}

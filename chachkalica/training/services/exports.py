@@ -378,6 +378,24 @@ def read_pipeline_defaults(relpath: str, ts: TrainingSettings | None = None) -> 
 _EXPORT_STEM_SUFFIXES = ("-best", "-last")
 
 
+def _model_from_catalogue(artifact: Path):
+    """The catalogued :class:`~training.models.TrainedModel` ``artifact`` is an
+    export of, matched on the filename the export actions produce, or ``None``.
+    """
+    from training.models import TrainedModel
+
+    stem = artifact.stem
+    candidates = [stem] + [
+        stem[: -len(suffix)] for suffix in _EXPORT_STEM_SUFFIXES if stem.endswith(suffix)
+    ]
+    return (
+        TrainedModel.objects
+        .filter(name__in=candidates)
+        .select_related("source_run_result__run__experiment")
+        .first()
+    )
+
+
 def _pipeline_defaults_from_catalogue(artifact: Path) -> dict | None:
     """Pipeline metadata for a sidecar-less artifact, via the model it was exported
     from — matched on the filename the export actions produce.
@@ -385,20 +403,34 @@ def _pipeline_defaults_from_catalogue(artifact: Path) -> dict | None:
     Best-effort by design: an artifact whose name no longer matches any
     catalogued model just gets ``None``, same as before.
     """
-    from training.models import TrainedModel
     from training.services import pipeline_meta
 
-    stem = artifact.stem
-    candidates = [stem] + [
-        stem[: -len(suffix)] for suffix in _EXPORT_STEM_SUFFIXES if stem.endswith(suffix)
-    ]
-    model = (
-        TrainedModel.objects
-        .filter(name__in=candidates)
-        .select_related("source_run_result__run__experiment")
-        .first()
-    )
+    model = _model_from_catalogue(artifact)
     return pipeline_meta.for_trained_model(model) if model is not None else None
+
+
+def read_class_names(relpath: str, ts: TrainingSettings | None = None) -> list[str]:
+    """Class names an artifact predicts, ordered by class id.
+
+    The ``.meta.json`` sidecar written beside every export first, then the
+    catalogued model whose export this is (same filename match as
+    :func:`_pipeline_defaults_from_catalogue`) for the artifacts exported before
+    that sidecar existed.
+
+    ``[]`` when neither has anything on record — a class space is not something
+    an ``.onnx``/``.engine`` can be asked for without loading it, so a caller
+    offering these names in a form has to cope with not knowing them.
+    """
+    try:
+        artifact = resolve(relpath, ts)
+    except ValueError:
+        return []
+
+    names = _classes_from_meta(artifact)
+    if names:
+        return list(names)
+    model = _model_from_catalogue(artifact)
+    return list(model.classes or []) if model is not None else []
 
 
 # ------------------------------------------------------------------- .pt bundle

@@ -18,6 +18,13 @@ reached over HTTP — see ``training/services/runner.py``), so each inferred
 frame is written to a reusable temp jpg before the call; the loop is
 sequential so a single path is safe to reuse.
 
+How the boxes *look* is a second, separable question: a job with an empty
+``render_style`` gets :func:`draw_boxes` below (one line width, hashed colors —
+the overlay for looking at what a model did), and a job carrying a style dict
+gets :class:`videos.services.render_style.MarketingRenderer` instead (see the
+"Run model inference for marketing…" action). Only the drawing call and the
+encode settings differ; the frame loop is the same one.
+
 Encoding goes through an ``ffmpeg`` subprocess (already installed in this image
 for the video downloader's merge step) rather than ``cv2.VideoWriter``:
 ``opencv-python-headless`` wheels don't ship a licensed H.264 encoder, and its
@@ -212,13 +219,33 @@ def run_inference_on_video(job) -> dict:
         capture.release()
         raise RuntimeError(f"Could not read frame size from video: {video_path}")
 
+    # A styled job draws through the marketing renderer and may also be cut down
+    # to a delivery resolution; a plain one keeps every existing default.
+    renderer = None
+    crf = None
+    out_width, out_height = width, height
+    if job.render_style:
+        from videos.services import render_style
+
+        renderer = render_style.MarketingRenderer(job.render_style)
+        encode = render_style.encode_options(job.render_style)
+        crf = encode["crf"]
+        if encode["output_height"] and encode["output_height"] < height:
+            # Resized before drawing, not by ffmpeg afterwards: the style's line
+            # widths and label sizes are in output pixels, so a 4K frame drawn at
+            # 4K and then squeezed to 1080p would hand back a third of the stroke
+            # the operator chose. Inference still sees the full-resolution frame.
+            out_height = encode["output_height"] - (encode["output_height"] % 2)
+            out_width = round(width * out_height / height / 2) * 2
+
     ffmpeg = subprocess.Popen(
         [
             "ffmpeg", "-y",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{width}x{height}", "-r", str(fps),
+            "-s", f"{out_width}x{out_height}", "-r", str(fps),
             "-i", "-",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            *(["-crf", str(crf), "-preset", "slow"] if crf is not None else []),
             str(output_path),
         ],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -242,7 +269,16 @@ def run_inference_on_video(job) -> dict:
                 current_boxes = response.get("boxes", [])
                 frames_processed += 1
 
-            draw_boxes(frame, current_boxes)
+            if (out_width, out_height) != (width, height):
+                frame = cv2.resize(frame, (out_width, out_height),
+                                   interpolation=cv2.INTER_AREA)
+            if renderer is not None:
+                # Every frame, not only inferred ones: the renderer's easing is
+                # per rendered frame, which is what turns a held box (stride > 1)
+                # into one that glides to its next position.
+                renderer.draw(frame, current_boxes)
+            else:
+                draw_boxes(frame, current_boxes)
             ffmpeg.stdin.write(frame.tobytes())
             frames_total += 1
     finally:
@@ -265,4 +301,144 @@ def run_inference_on_video(job) -> dict:
         "output_filename": job.output_filename,
         "frames_total": frames_total,
         "frames_processed": frames_processed,
+    }
+
+
+# --------------------------------------------------------------------- preview
+
+#: Where :func:`preview_frame` parks the model's answer for one frame, so that
+#: re-rendering the same frame with a different *look* costs no GPU. Under the
+#: output directory (already ours, already excluded from the video scanner by its
+#: leading dot) rather than a Django cache: the marketing form is served by the
+#: web container and there may be several of them, while this survives a restart
+#: and is shared between them.
+_PREVIEW_CACHE_ENTRIES = 200
+
+#: Previews are drawn at most this tall. The style's sizes scale with the frame
+#: in both directions (see render_style), so a 1080p preview of a 4K render is a
+#: faithful proportional preview of it — and a 4K jpeg base64'd into a page is
+#: not something to hand a browser on every slider nudge.
+_PREVIEW_MAX_HEIGHT = 1080
+
+
+def _preview_cache_dir() -> Path:
+    d = output_dir() / ".preview_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _preview_cache_key(payload: dict, video_path: Path, frame_index: int) -> str:
+    """Identity of "these boxes": the exact model request, the video's bytes (by
+    size + mtime, cheap and good enough for a preview) and which frame."""
+    import json
+
+    try:
+        stat = video_path.stat()
+        fingerprint = f"{stat.st_size}:{int(stat.st_mtime)}"
+    except OSError:
+        fingerprint = "?"
+    material = json.dumps(
+        {**payload, "image_path": ""}, sort_keys=True, default=str
+    ) + f"|{video_path}|{fingerprint}|{frame_index}"
+    return hashlib.sha256(material.encode()).hexdigest()[:32]
+
+
+def _prune_preview_cache() -> None:
+    entries = sorted(_preview_cache_dir().glob("*.json"), key=lambda p: p.stat().st_mtime)
+    for path in entries[:-_PREVIEW_CACHE_ENTRIES]:
+        path.unlink(missing_ok=True)
+
+
+def preview_frame(job, position: float = 0.5, *, use_cache: bool = True) -> dict:
+    """Render one frame of ``job``'s video the way the finished video will look.
+
+    The feedback loop the marketing action is built around: thirty style knobs
+    are unusable if seeing their effect means re-encoding a five-minute clip, so
+    the form previews a single frame instead. ``position`` is a fraction of the
+    video's duration.
+
+    The model runs only on a cache miss — the inference result for a given
+    (payload, video, frame) is stable, so dragging a slider re-draws from the
+    cached boxes and never touches the trainer's GPU. ``use_cache=False`` forces
+    a re-run, which is what the form's explicit "re-run the model" does.
+
+    ``job`` need not be saved; nothing here reads its pk. Returns
+    ``{"jpeg", "width", "height", "boxes", "frame_index", "frames_total",
+    "cached"}``. Raises ``RuntimeError`` for an unreadable video or model.
+    """
+    import json
+
+    import cv2
+
+    from training.services import runner
+    from videos.services import render_style
+
+    payload = build_predict_payload(job)
+    video_path = job.video.path()
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    try:
+        frames_total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        position = min(max(float(position), 0.0), 1.0)
+        # Never the very last frame: some containers report a frame count one
+        # past what actually decodes, and a preview that fails at the far end of
+        # the slider looks like a broken feature.
+        frame_index = int(position * max(frames_total - 2, 0)) if frames_total > 2 else 0
+        if frame_index:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            # A seek can land on a non-decodable position in a damaged file; the
+            # first frame always decodes if anything does.
+            capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            frame_index = 0
+            ok, frame = capture.read()
+        if not ok or frame is None:
+            raise RuntimeError(f"Could not read a frame from {video_path.name}.")
+    finally:
+        capture.release()
+
+    cache_path = _preview_cache_dir() / f"{_preview_cache_key(payload, video_path, frame_index)}.json"
+    boxes, cached = None, False
+    if use_cache and cache_path.is_file():
+        try:
+            boxes = json.loads(cache_path.read_text())
+            cached = True
+        except (OSError, json.JSONDecodeError):
+            boxes = None
+    if boxes is None:
+        tmp_frame_path = _preview_cache_dir() / f".preview_{cache_path.stem}.jpg"
+        try:
+            cv2.imwrite(str(tmp_frame_path), frame)
+            response = runner.predict_image({**payload, "image_path": str(tmp_frame_path)})
+        finally:
+            tmp_frame_path.unlink(missing_ok=True)
+        boxes = response.get("boxes", [])
+        cache_path.write_text(json.dumps(boxes))
+        _prune_preview_cache()
+
+    height, width = frame.shape[:2]
+    encode = render_style.encode_options(job.render_style)
+    target_height = min(encode["output_height"] or height, height, _PREVIEW_MAX_HEIGHT)
+    if target_height != height:
+        target_width = round(width * target_height / height)
+        frame = cv2.resize(frame, (target_width, target_height),
+                           interpolation=cv2.INTER_AREA)
+
+    drawn = render_style.MarketingRenderer(job.render_style, still=True).draw(frame, boxes)
+    ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    if not ok:
+        raise RuntimeError("Could not encode the preview frame.")
+
+    return {
+        "jpeg": buffer.tobytes(),
+        "width": frame.shape[1],
+        "height": frame.shape[0],
+        "boxes": drawn,
+        "detections": len(boxes),
+        "frame_index": frame_index,
+        "frames_total": frames_total,
+        "cached": cached,
     }

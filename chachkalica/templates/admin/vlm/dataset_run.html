@@ -1,0 +1,295 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  /* Same visual language as the eval analytics page: tabular numbers, a green
+     diagonal against red confusions, and an explicit light palette on the
+     matrix so its labels stay legible under the admin's dark theme too. */
+  .vds { max-width: 1200px; }
+  .vds h2 { margin-top: 1.6em; border-bottom: 1px solid #ccc; padding-bottom: .3em; }
+  .vds .note { color: #777; font-size: 12px; }
+  .vds .meta { color: #666; margin: 6px 0; }
+  .vds .meta b { color: inherit; }
+  .vds pre.prompt {
+    white-space: pre-wrap; background: #f8f8f8; border: 1px solid #ddd;
+    border-radius: 4px; padding: 8px; max-width: 720px; margin: 4px 0;
+  }
+  .vds .tiles { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+  .vds .tile {
+    border: 1px solid #ddd; border-radius: 6px; padding: 8px 14px;
+    background: #fafafa; min-width: 110px;
+  }
+  .vds .tile .v {
+    font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; color: #222;
+  }
+  .vds .tile .l { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: .04em; }
+  .vds .tile.na .v { color: #bbb; }
+  .vds table { border-collapse: collapse; margin: 12px 0; background: #fff; }
+  .vds th, .vds td {
+    padding: 6px 12px; border-bottom: 1px solid #e0e0e0; text-align: right;
+    font-variant-numeric: tabular-nums; color: #222; background-color: #fff;
+  }
+  .vds th.rowlabel, .vds td.rowlabel { text-align: left; font-weight: 600; }
+  .vds thead th { text-align: right; font-size: 12px; color: #333; }
+  .vds thead th.rowlabel { text-align: left; }
+  .vds td.na { color: #bbb; }
+  .vds table.cmx th, .vds table.cmx td { border: 1px solid #dcdcdc; padding: 5px 12px; }
+  .vds table.cmx thead th { text-align: center; }
+  .vds table.cmx th.corner { text-align: left; font-weight: 400; font-size: 11px; color: #666; }
+  .vds table.cmx th.rowlabel { background: #f2f2f2; }
+  .vds table.cmx td.cmcell, .vds table.cmx td.diag { color: #fff !important; font-weight: 700; }
+  .vds table.cmx td.cmcell { background: rgba(198, 40, 40, calc(var(--i) * 0.82)); }
+  .vds table.cmx td.diag { background: rgba(20, 120, 55, calc(var(--i) * 0.9)); }
+
+  .vds table.answers { width: 100%; }
+  .vds table.answers td, .vds table.answers th { text-align: left; vertical-align: top; }
+  .vds table.answers td.seq { text-align: right; color: #888; width: 4em; }
+  .vds table.answers td.thumb { width: 84px; }
+  .vds table.answers img { width: 72px; height: 54px; object-fit: cover; border-radius: 3px; background: #eee; }
+  .vds table.answers td.answer { font-size: 13px; max-width: 460px; }
+  .vds .cls { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 9px;
+              background: #eef2ff; color: #3730a3; margin: 0 3px 2px 0; }
+  .vds .cls.gt { background: #ecfdf5; color: #065f46; }
+  .vds .verdict-ok { color: #14692b; font-weight: 700; }
+  .vds .verdict-bad { color: #ba2121; font-weight: 700; }
+  .vds .verdict-na { color: #999; }
+  .vds .row-error { color: #ba2121; font-size: 12px; }
+  .vds .errornote { margin: 8px 0; }
+  .vds .banner {
+    margin: 8px 0; padding: 8px 10px; border-radius: 4px;
+    background: #fff7ed; border: 1px solid #fed7aa; color: #9a3412; max-width: 720px;
+  }
+  .vds .regrade { border: 1px solid #ddd; border-radius: 6px; padding: 10px 14px;
+                  background: #fafafa; max-width: 720px; }
+  .vds .regrade input[type=text] { width: 100%; }
+  .vds .regrade td, .vds .regrade th { border: 0; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="vds">
+
+<p class="meta">
+  <b>{{ run.dataset_name_snapshot }}</b>
+  · {{ run.model_label_snapshot|default:"VLM" }}
+  · {% if run.image_limit %}capped at {{ run.image_limit }} image(s){% else %}all images{% endif %}
+  {% if run.grade %}· graded{% else %}· not graded{% endif %}
+</p>
+<p class="meta">
+  status: <strong id="vds-status">{{ run.status }}</strong>
+  · answered <span id="vds-progress">{{ run.images_processed }}{% if run.images_total %}/{{ run.images_total }}{% endif %}</span> image(s)
+  · <span id="vds-errors">{{ run.errors_count }}</span> failure(s)
+</p>
+<pre class="prompt">{{ run.prompt_snapshot }}</pre>
+
+{% if run.last_error %}<p class="errornote">{{ run.last_error }}</p>{% endif %}
+
+<p>
+  <a href="{{ back_url }}" class="button cancel-link">Back to dataset runs</a>
+  {% if not is_terminal %}
+    <form action="{{ cancel_url }}" method="post" style="display:inline">
+      {% csrf_token %}
+      <button type="submit" class="button" style="margin-left:6px">Stop this run</button>
+    </form>
+  {% endif %}
+</p>
+
+{% if run.grade %}
+  <h2>Analytics</h2>
+  {% if metrics.graded_images %}
+    <div class="tiles">
+      <div class="tile{% if metrics.exact_match_accuracy is None %} na{% endif %}">
+        <div class="v" id="vds-accuracy">
+          {% if metrics.exact_match_accuracy is None %}&mdash;
+          {% else %}{{ metrics.exact_match_accuracy|floatformat:3 }}{% endif %}
+        </div>
+        <div class="l">exact match</div>
+      </div>
+      <div class="tile"><div class="v">{{ metrics.exact_matches }}</div><div class="l">successes</div></div>
+      <div class="tile"><div class="v">{{ metrics.graded_images }}</div><div class="l">graded images</div></div>
+      <div class="tile{% if metrics.micro.f1 is None %} na{% endif %}">
+        <div class="v">{% if metrics.micro.f1 is None %}&mdash;{% else %}{{ metrics.micro.f1|floatformat:3 }}{% endif %}</div>
+        <div class="l">micro F1</div>
+      </div>
+      <div class="tile{% if metrics.macro.f1 is None %} na{% endif %}">
+        <div class="v">{% if metrics.macro.f1 is None %}&mdash;{% else %}{{ metrics.macro.f1|floatformat:3 }}{% endif %}</div>
+        <div class="l">macro F1</div>
+      </div>
+      {% if metrics.unlabeled_images %}
+        <div class="tile"><div class="v">{{ metrics.unlabeled_images }}</div><div class="l">unlabeled, skipped</div></div>
+      {% endif %}
+    </div>
+    <p class="note">An image is an <em>exact match</em> when the answer names every class its
+      label file annotates and no class it does not — so a right answer with an extra claim
+      still counts as a miss, and the per-class table below is what says which half went
+      wrong. Images with no label file are not scored at all; images whose call failed are
+      left out too and counted as failures instead.</p>
+
+    <h3>Per class</h3>
+    <table>
+      <thead>
+        <tr>
+          <th class="rowlabel">Class</th>
+          <th>Precision</th><th>Recall</th><th>F1</th>
+          <th>TP</th><th>FP</th><th>FN</th><th>Labeled in</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in metrics.per_class %}
+          <tr>
+            <td class="rowlabel">{{ row.name }}</td>
+            <td {% if row.precision is None %}class="na"{% endif %}>{% if row.precision is None %}&mdash;{% else %}{{ row.precision|floatformat:3 }}{% endif %}</td>
+            <td {% if row.recall is None %}class="na"{% endif %}>{% if row.recall is None %}&mdash;{% else %}{{ row.recall|floatformat:3 }}{% endif %}</td>
+            <td {% if row.f1 is None %}class="na"{% endif %}>{% if row.f1 is None %}&mdash;{% else %}{{ row.f1|floatformat:3 }}{% endif %}</td>
+            <td>{{ row.tp }}</td><td>{{ row.fp }}</td><td>{{ row.fn }}</td><td>{{ row.support }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="note">A class the model claimed that the labels never annotate is a false
+      positive (FP); one the labels annotate that the model never claimed is a false
+      negative (FN). A class with no labels and no claims is left out of the macro average
+      rather than scored zero.</p>
+
+    {% if confusion %}
+      <h3>Confusion</h3>
+      <p class="note">Only the {{ confusion.total }} image(s) whose label file annotates
+        <em>exactly one</em> class — the one case where a wrong answer has a single
+        meaning. Rows are the labeled class, columns are what the answer named, so the
+        diagonal is correct. <em>(none)</em> means the answer named no class at all,
+        <em>(multiple)</em> that it named several.</p>
+      <table class="cmx">
+        <thead>
+          <tr>
+            <th class="corner">labeled ＼ answered</th>
+            {% for label in confusion.columns %}<th>{{ label }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in confusion.rows %}
+            <tr>
+              <th class="rowlabel">{{ row.actual }}</th>
+              {% for cell in row.cells %}
+                <td class="{% if cell.is_diagonal %}diag{% else %}cmcell{% endif %}"
+                    style="--i: {{ cell.intensity }}">{{ cell.value }}</td>
+              {% endfor %}
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+
+    <h3>Grading configuration</h3>
+    <form class="regrade" action="{{ regrade_url }}" method="post">
+      {% csrf_token %}
+      <p class="note" style="margin-top:0">The answers are already paid for, so re-scoring
+        them is free: add the words this model actually uses for each class and re-grade.
+        The class's own name is always matched, separators and simple plurals are
+        flexible (<code>hard_hat</code> finds “hard hat”, “hard-hats”, “hardhat”), and a
+        comma separates terms.</p>
+      <table>
+        <tbody>
+          {% for alias in alias_rows %}
+            <tr>
+              <td class="rowlabel" style="white-space:nowrap">{{ alias.name }}</td>
+              <td><input type="text" name="alias__{{ alias.name }}" value="{{ alias.aliases }}"
+                         placeholder="extra terms, comma separated"></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p style="margin:6px 0">
+        <label style="font-weight:400">
+          <input type="checkbox" name="negation_aware" {% if run.negation_aware %}checked{% endif %}>
+          Read negated mentions (“no helmet”) as absent
+        </label>
+      </p>
+      <p class="submit-row" style="margin:0;padding:6px 0;text-align:left">
+        <button type="submit" class="default">Re-grade</button>
+      </p>
+    </form>
+  {% else %}
+    <p class="banner">Nothing has been graded yet.
+      {% if is_terminal %}None of this run's images had a label file, so there was nothing
+        to compare the answers against.{% else %}Scores appear as images are answered.{% endif %}
+    </p>
+  {% endif %}
+{% endif %}
+
+<h2>Answers</h2>
+<p class="note">Click an image to open it full size with its ground-truth boxes
+  drawn on — the label file's own geometry, not anything the model produced.
+  {% if only_mismatches %}
+    Showing mismatches only{% if total_rows > shown %} — first {{ shown }} of {{ total_rows }}{% else %} ({{ shown }}){% endif %}.
+    <a href="{{ report_url }}">Show all</a>
+  {% else %}
+    Showing {{ shown }}{% if total_rows > shown %} of {{ total_rows }} (first {{ row_limit }}){% endif %}.
+    {% if run.grade %}<a href="{{ report_url }}&amp;only=mismatches">Show mismatches only</a>{% endif %}
+  {% endif %}
+</p>
+
+<table class="answers">
+  <thead>
+    <tr>
+      <th class="seq">#</th>
+      <th>Image</th>
+      <th>File</th>
+      {% if run.grade %}<th>Labeled</th><th>Answered</th><th>OK</th>{% endif %}
+      <th>Answer</th>
+      <th>ms</th>
+    </tr>
+  </thead>
+  <tbody id="vds-rows" data-graded="{% if run.grade %}1{% else %}0{% endif %}">
+    {% for row in rows %}
+      <tr data-seq="{{ row.seq }}">
+        <td class="seq">{{ row.seq }}</td>
+        <td class="thumb">
+          {# The link asks for the annotated copy, the thumbnail for the plain
+             file — 300 rows must not mean 300 redraws on page load. #}
+          <a href="{{ image_url }}?result={{ row.pk }}&amp;labels=1" target="_blank"
+             title="{% if row.has_label %}Open with its labels drawn on{% else %}No label file — opens the plain image{% endif %}">
+            <img loading="lazy" src="{{ image_url }}?result={{ row.pk }}" alt="{{ row.image_filename }}">
+          </a>
+        </td>
+        <td>{{ row.image_filename }}</td>
+        {% if run.grade %}
+          <td>
+            {% if not row.has_label %}<span class="verdict-na">unlabeled</span>
+            {% elif not row.gt_classes %}<span class="verdict-na">nothing</span>
+            {% else %}{% for name in row.gt_classes %}<span class="cls gt">{{ name }}</span>{% endfor %}{% endif %}
+          </td>
+          <td>
+            {% for name in row.predicted_classes %}<span class="cls">{{ name }}</span>{% endfor %}
+            {% if not row.predicted_classes %}<span class="verdict-na">—</span>{% endif %}
+          </td>
+          <td>
+            {% if row.matched is None %}<span class="verdict-na">—</span>
+            {% elif row.matched %}<span class="verdict-ok">✓</span>
+            {% else %}<span class="verdict-bad">✗</span>{% endif %}
+          </td>
+        {% endif %}
+        <td class="answer">
+          {{ row.text }}
+          {% if row.error %}<div class="row-error">{{ row.error }}</div>{% endif %}
+        </td>
+        <td>{{ row.latency_ms|default_if_none:"—" }}</td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p id="vds-empty" {% if rows %}hidden{% endif %} class="note">
+  {% if is_terminal %}No answers to show.{% else %}Waiting for the first image…{% endif %}
+</p>
+
+</div>
+
+{{ last_seq|json_script:"vds-last-seq" }}
+{{ progress_url|json_script:"vds-progress-url" }}
+{{ image_url|json_script:"vds-image-url" }}
+{{ is_terminal|json_script:"vds-is-terminal" }}
+{{ live_append|json_script:"vds-live-append" }}
+{{ row_limit|json_script:"vds-row-limit" }}
+
+<script src="{% static 'vlm/dataset_run.js' %}"></script>
+{% endblock %}

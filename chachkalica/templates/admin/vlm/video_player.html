@@ -1,0 +1,30 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<style>
+  #vlm-stage { max-width: 960px; }
+  #vlm-stage video { width: 100%; height: auto; border-radius: 6px; background: #000; }
+  #vlm-meta { margin: 8px 0; color: #666; }
+  #vlm-error { color: #ba2121; margin: 8px 0; }
+</style>
+
+<div id="vlm-stage">
+  {% if exists %}
+    <video controls preload="metadata" src="{{ stream_url }}"></video>
+  {% else %}
+    <p id="vlm-error">No file on disk for this video yet.</p>
+  {% endif %}
+  <p id="vlm-meta"><strong>{{ video.name }}</strong>
+    · status: {{ video.status }}
+    {% if video.source_fps %}· {{ video.source_fps|floatformat:3 }} fps{% endif %}
+    {% if video.width %}· {{ video.width }}×{{ video.height }}{% endif %}
+  </p>
+  {% if video.last_error %}
+    <p id="vlm-error">{{ video.last_error }}</p>
+  {% endif %}
+</div>
+
+<p style="margin-top:12px">
+  <a href="../" class="button cancel-link">Back to videos</a>
+</p>
+{% endblock %}

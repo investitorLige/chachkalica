@@ -15,13 +15,14 @@ from .fasterrcnn import FasterRCNNHandler
 from .retinanet import RetinaNetHandler
 from .rfdetr import RFDetrHandler
 from .rtdetr import RTDetrHandler
+from .rtmo import RTMOHandler
 from .yolox import YOLOXHandler
 
 ARCH_REGISTRY: dict[str, ArchHandler] = {
     handler.name: handler
     for handler in (
         FasterRCNNHandler(), RetinaNetHandler(), YOLOXHandler(), RTDetrHandler(), RFDetrHandler(),
-        ECDetHandler(), DFineHandler(),
+        ECDetHandler(), DFineHandler(), RTMOHandler(),
     )
 }
 

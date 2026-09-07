@@ -14,9 +14,14 @@
       <source src="{{ stream_url }}" type="video/mp4">
       Your browser cannot play this video.
     </video>
-    <p id="vp-meta"><strong>{{ job.video.name }}</strong> · model {{ job.trained_model.name }}
+    <p id="vp-meta"><strong>{{ job.video.name }}</strong> · model {{ job.model_label }}
       · {{ job.frames_processed }}/{{ job.frames_total }} frames inferred
+      {% if job.render_style %}· marketing render{% endif %}
     </p>
+    {# Same-origin, so the browser saves the file instead of navigating to it —
+       a marketing render exists to be handed to someone. #}
+    <p><a class="button" href="{{ stream_url }}" download="{{ job.output_filename }}">
+      ⭳ download</a></p>
   {% else %}
     <p id="vp-error">No output file on disk for this job (status: {{ job.status }}).
       {% if job.last_error %} {{ job.last_error }}{% endif %}</p>

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "name": "rtmo-posture-bundle",
+  "artifacts": {
+    "model": "models/rtmo.engine"
+  },
+  "pipeline": "raw",
+  "chain": [],
+  "score_threshold": 0.4,
+  "infer_batch_size": 1,
+  "merge_nms_iou": 0.5,
+  "notes": "RTMO (bottom-up whole-frame pose estimator, mmpose/mmdeploy export). Finds every person and their pose directly on the full frame, no tiling and no person-detector crop, so this runs as pipeline 'raw'. The engine's own graph does its NMS (TensorRT parses the exporter's NonMaxSuppression node as a native internal NMS layer — no plugin, no graph surgery); the RTMOHandler in vendor/onnx_infer/arch/rtmo.py then turns each person's 17 COCO keypoints into a standing/sitting/lying label, which is what actually reaches Detection.boxes as class_name. Batch is structurally 1 (engine built with a static [1,3,640,640] profile, matching how every other whole-frame bundle here runs one image per forward pass)."
+}

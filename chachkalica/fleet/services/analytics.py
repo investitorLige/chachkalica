@@ -44,19 +44,9 @@ _CROWDED_MIN = 10
 _BOUNDS_TOL = 1e-3
 
 
-def _find_label_file(labels_dir: Path, image_filename: str) -> Path | None:
-    """Locate an image's YOLO label file, mirroring ``load_predictions_for_image``.
-
-    Tries ``<image_filename>.txt`` (the app's own convention, e.g. ``img.jpg.txt``)
-    then ``<stem>.txt`` (standard YOLO, e.g. ``img.txt``). Returns None if neither.
-    """
-    for candidate in (
-        labels_dir / f"{image_filename}.txt",
-        labels_dir / f"{Path(image_filename).stem}.txt",
-    ):
-        if candidate.exists():
-            return candidate
-    return None
+#: Locating an image's label file is shared with the VLM dataset runner, so it
+#: lives beside ``labels_source_dir`` rather than being spelled out twice.
+_find_label_file = datasets_svc.find_label_file
 
 
 def _pct(part: int, whole: int) -> float:

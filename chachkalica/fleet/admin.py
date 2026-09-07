@@ -202,34 +202,10 @@ def _preview_label_dir(request, dataset):
 def _read_label_shapes(label_dir, image_path, class_names):
     """Parse an image's label ``.txt`` into normalized draw shapes.
 
-    Uses the same pairing the rest of the app uses (``<stem>.txt`` then
-    ``<image>.txt``) and :func:`txt_format.parse_label_text`, which auto-detects
-    the app's ``W H`` header vs header-less YOLO and splits polygons from boxes.
-    Each shape is ``{class_id, class_name, kind, bbox, polygon}`` with normalized
-    center-xywh ``bbox`` and, for polygons, a flat normalized ``polygon`` list.
+    Shared with the VLM dataset report, which burns the same shapes onto the
+    image server-side, so the parsing lives beside ``labels_source_dir``.
     """
-    from fleet.reconcile import txt_format
-
-    label_dir = Path(label_dir)
-    candidates = [label_dir / f"{image_path.stem}.txt", label_dir / f"{image_path.name}.txt"]
-    label_file = next((c for c in candidates if c.exists()), None)
-    if label_file is None:
-        return []
-    _w, _h, objects = txt_format.parse_label_text(label_file.read_text())
-    shapes = []
-    for obj in objects:
-        class_id = obj["class_id"]
-        name = class_names[class_id] if 0 <= class_id < len(class_names) else str(class_id)
-        cx, cy, w, h = obj["bbox"]
-        polygon = obj.get("polygon")
-        shapes.append({
-            "class_id": class_id,
-            "class_name": name,
-            "kind": "polygon" if polygon else "box",
-            "bbox": {"cx": cx, "cy": cy, "w": w, "h": h},
-            "polygon": polygon or [],
-        })
-    return shapes
+    return datasets_svc.label_shapes(label_dir, image_path.name, class_names)
 
 
 @admin.register(Dataset)

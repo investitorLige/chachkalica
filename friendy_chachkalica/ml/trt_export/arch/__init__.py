@@ -364,8 +364,28 @@ ARCH_FP16_NODE_BLOCK = {
 # supporting evidence, not a measurement. The tensor-level fp32-vs-fp16 diff probe used
 # on ecdet is the tool to confirm it. Note the earlier from-scratch UNDERFLOW finding is
 # NOT what is happening here: these are trained weights with a healthy backbone.
+#
 # ─────────────────────────────────────────────────────────────────────────────
-UNTRUSTED_FP16: set[str] = {"ecdet", "dfine"}
+# rtmo — 2026-09-02. On the floor for a different reason than the two above: this
+# arch has no trustworthy fp16 engine because it has no fp16 GRAPH. rtmo is not a
+# friendy-trained arch — it is an mmpose/mmdeploy ``end2end.onnx`` export carried in
+# as-is (see ``onnx_infer/arch/rtmo.py``), and both casters choke on it rather than
+# producing something TensorRT will parse:
+#
+#   * ``fp16_cast``'s onnxruntime converter emits duplicate ``*_cast_to_fp32`` output
+#     names, and the parser fails topological sort — the same converter bug this file
+#     already documents for op-blocked rtdetr/ecdet graphs.
+#   * ``onnxconverter_common``'s cast gets past that and then hits a genuine
+#     ``Float``/``Half`` mismatch on an ElementWise ``Mul`` two nodes later, inside the
+#     graph's own baked NMS/decode machinery.
+#
+# Neither is a tactic-search failure that a retry fixes, and a hand-patched fp16 graph
+# was not worth chasing: the fp32 engine already runs a whole 640² frame in ~9ms, far
+# inside any camera's frame rate, and this arch is only ever run at batch 1 on a whole
+# frame. Without this entry ``auto`` would request fp16, waste a cast + a failed build
+# on every rebuild, and land on fp32 anyway via ``builder.py``'s fallback.
+# ─────────────────────────────────────────────────────────────────────────────
+UNTRUSTED_FP16: set[str] = {"ecdet", "dfine", "rtmo"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAST BACKEND — 2026-08-18. The floor above says "this arch's fp16 engine is not

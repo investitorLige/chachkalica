@@ -29,6 +29,12 @@ urlpatterns = [
         admin.site.admin_view(bundle_sync_view),
         name="bundle-sync",
     ),
+    # Every project's own blank admin front — /admin/s/<slug>/, one row in
+    # AdminSection per front, no code change or redeploy to add one — is NOT
+    # routed here. SectionAdminMiddleware intercepts it earlier (swapping in
+    # admin_sections.section_urlconf) before URL resolution ever sees this
+    # urlconf; see that middleware's docstring for why a urlpattern with a
+    # captured slug doesn't work.
     path("admin/", admin.site.urls),
     path("django-rq/", include("django_rq.urls")),
     path("", include("fleet.urls")),

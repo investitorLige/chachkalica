@@ -1108,6 +1108,27 @@ class ExportPipelineMetadataTests(TestCase):
         self.assertIsNone(
             exports.read_pipeline_defaults("something-nobody-catalogued.onnx"))
 
+    def test_class_names_come_from_the_meta_sidecar_in_class_id_order(self):
+        import json
+
+        artifact = self._artifact("exp-export-best.onnx")
+        artifact.with_suffix(exports.META_SIDECAR_SUFFIX).write_text(json.dumps(
+            {"class_map": {"1": "vest", "0": "helmet"}}))
+        self.assertEqual(exports.read_class_names("exp-export-best.onnx"),
+                         ["helmet", "vest"])
+
+    def test_class_names_fall_back_to_the_catalogued_model(self):
+        self._artifact("exp-export-last.engine")   # no .meta.json beside it
+        self.model.classes = ["helmet", "head"]
+        self.model.save()
+        self.assertEqual(exports.read_class_names("exp-export-last.engine"),
+                         ["helmet", "head"])
+
+    def test_class_names_are_empty_when_nothing_is_on_record(self):
+        self._artifact("nobody-catalogued-best.onnx")
+        self.assertEqual(exports.read_class_names("nobody-catalogued-best.onnx"), [])
+        self.assertEqual(exports.read_class_names("../escape.onnx"), [])
+
     def test_bundle_request_is_built_from_the_frozen_record(self):
         artifact = self._artifact("exp-export-best.onnx")
         self.model.classes = ["helmet", "head"]

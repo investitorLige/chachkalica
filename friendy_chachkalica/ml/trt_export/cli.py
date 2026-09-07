@@ -59,6 +59,38 @@ except ImportError:  # run flat (cwd on sys.path), mirroring onnx_export/cli.py
 HW = Tuple[int, int]
 
 
+def _graph_input_name(onnx_path: Path) -> str:
+    """The name of ``onnx_path``'s single input tensor.
+
+    Everything this repo exports itself is named :data:`INPUT_NAME`, and that used
+    to be assumed here — but a graph can also arrive from *outside* (rtmo is an
+    mmpose/mmdeploy ``end2end.onnx``, whose input is plainly called ``input``), and
+    the name is what the optimization profile is keyed on. Assuming the wrong one
+    means the profile is registered for a tensor the network doesn't have, so the
+    real input keeps its dynamic dims and the build fails on an unsatisfied shape
+    rather than on anything that names the cause.
+
+    Falls back to :data:`INPUT_NAME` if the graph can't be read — the same engine
+    that got built before this function existed.
+    """
+    try:
+        import onnx
+
+        graph = onnx.load(str(onnx_path), load_external_data=False).graph
+        initializers = {init.name for init in graph.initializer}
+        inputs = [i.name for i in graph.input if i.name not in initializers]
+    except Exception as exc:  # a malformed graph fails far more legibly in the parser
+        print(f"[trt] Could not read {onnx_path.name}'s input name ({exc}); "
+              f"assuming {INPUT_NAME!r}")
+        return INPUT_NAME
+    if len(inputs) != 1:
+        raise ValueError(
+            f"{onnx_path.name} has {len(inputs)} graph inputs ({', '.join(inputs) or 'none'}); "
+            f"this builder profiles exactly one image input."
+        )
+    return inputs[0]
+
+
 def _load_adapter(checkpoint_path: Path):
     """Rebuild a trained adapter from a ``.pt``, exactly like the ONNX exporter."""
     import torch
@@ -225,7 +257,7 @@ def build_engine(
         min_hw=prof_min,
         opt_hw=prof_opt,
         max_hw=prof_max,
-        input_name=INPUT_NAME,
+        input_name=_graph_input_name(onnx_to_build),
         precision=precision,
         extra_fp32_ops=resolved_fp32_ops,
         node_block_substrings=resolved_node_block,

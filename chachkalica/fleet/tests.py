@@ -990,3 +990,47 @@ class ShapeSplitTests(TestCase):
         with self.assertRaises(RuntimeError):
             shape_split.split_by_shape(dataset, "ds-boxes", "ds-polygons")
         self.assertFalse((self.src / "ds-polygons").exists())
+
+
+class LabelShapesTests(TestCase):
+    """``label_shapes`` backs both label overlays — the preview canvas and the
+    VLM dataset report's burned-in boxes — so its output shape is a contract."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.labels_dir = Path(self.tmp.name) / "labels"
+        self.labels_dir.mkdir()
+
+    def test_a_box_keeps_its_normalized_geometry_and_gets_its_name(self):
+        (self.labels_dir / "img.txt").write_text("2 0.5 0.4 0.2 0.1\n", encoding="utf-8")
+        shapes = datasets_svc.label_shapes(self.labels_dir, "img.jpg", _PPE_NAMES)
+        self.assertEqual(len(shapes), 1)
+        self.assertEqual(shapes[0]["kind"], "box")
+        self.assertEqual(shapes[0]["class_name"], "helmet")
+        self.assertEqual(shapes[0]["bbox"],
+                         {"cx": 0.5, "cy": 0.4, "w": 0.2, "h": 0.1})
+
+    def test_a_polygon_survives_as_a_polygon(self):
+        (self.labels_dir / "img.txt").write_text(
+            "0 0.1 0.1 0.5 0.2 0.4 0.6\n", encoding="utf-8")
+        shape = datasets_svc.label_shapes(self.labels_dir, "img.jpg", _PPE_NAMES)[0]
+        self.assertEqual(shape["kind"], "polygon")
+        self.assertEqual(len(shape["polygon"]), 6)
+
+    def test_an_unknown_class_id_is_shown_not_dropped(self):
+        """The point is to display the annotation, warts included."""
+        (self.labels_dir / "img.txt").write_text("99 0.5 0.5 0.1 0.1\n", encoding="utf-8")
+        shape = datasets_svc.label_shapes(self.labels_dir, "img.jpg", _PPE_NAMES)[0]
+        self.assertEqual(shape["class_name"], "99")
+
+    def test_no_label_file_means_no_shapes(self):
+        self.assertEqual(
+            datasets_svc.label_shapes(self.labels_dir, "img.jpg", _PPE_NAMES), [],
+        )
+
+    def test_the_app_s_own_image_dot_txt_naming_is_found_too(self):
+        (self.labels_dir / "img.jpg.txt").write_text(
+            "7 0.5 0.5 0.1 0.1\n", encoding="utf-8")
+        shape = datasets_svc.label_shapes(self.labels_dir, "img.jpg", _PPE_NAMES)[0]
+        self.assertEqual(shape["class_name"], "vest")

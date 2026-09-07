@@ -31,7 +31,9 @@ if str(REPO_ROOT) not in sys.path:
 
 torch = pytest.importorskip("torch")
 
-from trt_infer.session import _split_passthrough, _unpack_efficientnms  # noqa: E402
+from trt_infer.session import (  # noqa: E402
+    _split_passthrough, _split_rtmo, _unpack_efficientnms,
+)
 
 
 # --------------------------------------------------------------- pure output slicing
@@ -106,6 +108,22 @@ def test_split_passthrough_rejects_a_real_batch_it_cannot_split():
         _split_passthrough(
             [torch.zeros(300, 4), torch.zeros(300), torch.zeros(300, dtype=torch.int64)], 2
         )
+
+
+
+def test_split_rtmo_hands_back_the_pair_per_image():
+    """rtmo is not a detection triple: ``RTMOHandler`` wants ``(dets, keypoints)``
+    for one image and makes Contract A out of them itself (posture from the
+    joints). Splitting is the whole job here — no unpacking, no slicing."""
+    dets = torch.arange(2 * 3 * 5, dtype=torch.float32).reshape(2, 3, 5)
+    keypoints = torch.arange(2 * 3 * 17 * 3, dtype=torch.float32).reshape(2, 3, 17, 3)
+
+    pairs = _split_rtmo([dets, keypoints], 2)
+
+    assert [len(pair) for pair in pairs] == [2, 2]
+    for i in range(2):
+        torch.testing.assert_close(pairs[i][0], dets[i])
+        torch.testing.assert_close(pairs[i][1], keypoints[i])
 
 
 # ------------------------------------------------------------------ engine plumbing
@@ -327,7 +345,11 @@ def test_a_real_passthrough_engine_returns_every_detection_it_emitted(real_bundl
             # parity test still fails loudly on it, which is where that belongs.
             unloadable.append(f"{engine.name} ({exc})")
             continue
-        if model._efficientnms:
+        # Only the passthrough layout is this test's subject. EfficientNMS engines
+        # unpack elsewhere, and an rtmo engine doesn't emit a detection triple at
+        # all — it emits ``(dets, keypoints)``, so unpacking three below would
+        # raise on a bundle that is working perfectly.
+        if model._efficientnms or model._rtmo:
             continue
 
         canvas = int(model.meta.input.size)

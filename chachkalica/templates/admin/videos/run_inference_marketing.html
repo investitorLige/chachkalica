@@ -1,0 +1,561 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% comment %}
+"Run model inference for marketing…" — the same form as run_inference.html
+(shared verbatim through _inference_fields.html) plus the two things that make
+this action worth having separately: a Look section, and a live preview of one
+frame rendered through the exact renderer the job will use.
+
+Layout is two columns with the preview sticky on the right, because styling is a
+loop: change a knob, look at the frame, change the next one. Every field is
+named "style_<knob>" — videos.services.render_style.parse_form reads them back
+by that convention, and the preview endpoint is handed this whole form, so a
+knob added here needs no wiring beyond a row in that module's field tables.
+{% endcomment %}
+
+{% block content %}
+<style>
+  .mk-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 42%);
+                gap: 24px; align-items: start; }
+  @media (max-width: 1100px) { .mk-columns { grid-template-columns: minmax(0, 1fr); } }
+  .mk-preview { position: sticky; top: 12px; }
+  .mk-preview img { width: 100%; border-radius: 6px; background: #111; display: block; }
+  .mk-shot { background: #111; border-radius: 6px; min-height: 180px; display: flex;
+             align-items: center; justify-content: center; color: #888; font-size: 12px;
+             padding: 4px; text-align: center; }
+  .mk-meta { color: #666; font-size: 11px; margin: 6px 0 0; }
+  .mk-error { color: #ba2121; font-size: 12px; margin: 6px 0 0; white-space: pre-wrap; }
+  .mk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+             gap: 2px 18px; padding: 8px 12px 12px; }
+  .mk-field { padding: 6px 0; }
+  .mk-field > label { display: block; font-weight: 600; font-size: 11px;
+                      text-transform: uppercase; color: #666; margin-bottom: 3px; }
+  .mk-field input[type=text], .mk-field input[type=number], .mk-field select {
+    width: 100%; box-sizing: border-box; }
+  .mk-field input[type=range] { width: calc(100% - 46px); vertical-align: middle; }
+  .mk-field output { display: inline-block; width: 40px; text-align: right;
+                     font-family: monospace; font-size: 11px; color: #444; }
+  .mk-field .help { font-size: 11px; margin: 2px 0 0; padding: 0; }
+  .mk-check { display: flex; align-items: center; gap: 6px; padding-top: 14px; }
+  .mk-check label { font-weight: normal; text-transform: none; font-size: 12px;
+                    color: #333; margin: 0; }
+  .mk-wide { grid-column: 1 / -1; }
+</style>
+
+<p>Run a model over <strong>{{ video.name }}</strong> and burn the detections on in a form
+fit to show someone — then collect the finished file from the Inferred videos tab.</p>
+
+{# Re-posts the action without a model_source, which lands back on step 1. #}
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <p><input type="submit" class="button" value="← Change model type"></p>
+</form>
+
+<div class="mk-columns">
+<form action="" method="post" id="mk-form" data-preview-url="{{ preview_url }}"
+      data-video="{{ video.pk }}">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="model_source" value="{{ model_source }}">
+  <input type="hidden" name="apply" value="1">
+
+  <div class="module">
+    <h2>Model &amp; pipeline</h2>
+    <div style="padding: 8px 12px 12px">
+      {% include "admin/videos/_inference_fields.html" %}
+    </div>
+  </div>
+
+  {# ----------------------------------------------------------------- preset #}
+  <div class="module" id="mk-presets" data-save-url="{{ preset_save_url }}">
+    <h2>Preset</h2>
+    <div style="padding: 8px 12px 12px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select id="mk-preset-select" style="min-width:220px">
+          <option value="">— start from the settings below —</option>
+          {% for preset in presets %}
+            <option value="{{ preset.pk }}">{{ preset.name }}</option>
+          {% endfor %}
+        </select>
+        <input type="button" class="button" id="mk-preset-load" value="Load preset">
+      </div>
+      <p class="help" style="font-size:11px">A saved look — everything under
+      Boxes, Colour, Labels, What to show, Scene, Motion and Output file.
+      Deliberately not the model or the pipeline: those come from the model's own
+      recorded metadata. Save one with the button at the bottom of this form;
+      rename or delete them under <em>Render presets</em>.</p>
+    </div>
+  </div>
+
+  {# ------------------------------------------------------------------ boxes #}
+  <div class="module">
+    <h2>Boxes</h2>
+    <div class="mk-grid">
+      <div class="mk-field">
+        <label for="style_box_style">Outline</label>
+        <select name="style_box_style" id="style_box_style">
+          {% for value, label in box_style_choices %}
+            <option value="{{ value }}"
+              {% if style_values.style_box_style == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+        <p class="help">Corner brackets read as "tracking"; a plain rectangle reads as
+        "detected". Both beat a hard box on close-up footage.</p>
+      </div>
+      <div class="mk-field">
+        <label for="style_thickness">Line thickness</label>
+        <input type="number" name="style_thickness" id="style_thickness" min="1" max="40"
+               step="1" value="{{ style_values.style_thickness }}">
+        <p class="help">Pixels at 1080p — scaled to whatever the output resolution is.</p>
+      </div>
+      <div class="mk-field" data-when="style_box_style=rounded glow double">
+        <label for="style_corner_radius">Corner radius</label>
+        <input type="number" name="style_corner_radius" id="style_corner_radius"
+               min="0" max="200" step="1" value="{{ style_values.style_corner_radius }}">
+        <p class="help">0 is a sharp rectangle.</p>
+      </div>
+      <div class="mk-field" data-when="style_box_style=corners crosshair">
+        <label for="style_corner_length">Bracket length</label>
+        <input type="number" name="style_corner_length" id="style_corner_length"
+               min="2" max="500" step="1" value="{{ style_values.style_corner_length }}">
+        <p class="help">How far each corner mark runs along the box's sides — also
+        sizes the crosshair's edge ticks and centre mark.</p>
+      </div>
+      <div class="mk-field" data-when="style_box_style=dashed">
+        <label for="style_dash_length">Dash length</label>
+        <input type="number" name="style_dash_length" id="style_dash_length"
+               min="2" max="200" step="1" value="{{ style_values.style_dash_length }}">
+      </div>
+      <div class="mk-field" data-when="style_box_style=dotted">
+        <label for="style_dot_spacing">Dot spacing</label>
+        <input type="number" name="style_dot_spacing" id="style_dot_spacing"
+               min="2" max="200" step="1" value="{{ style_values.style_dot_spacing }}">
+        <p class="help">Gap between beads; the beads themselves follow the line
+        thickness.</p>
+      </div>
+      <div class="mk-field" data-when="style_box_style=double">
+        <label for="style_double_gap">Double-line gap</label>
+        <input type="number" name="style_double_gap" id="style_double_gap"
+               min="1" max="100" step="1" value="{{ style_values.style_double_gap }}">
+      </div>
+      <div class="mk-field" data-when="style_box_style=chamfer">
+        <label for="style_chamfer_size">Chamfer size</label>
+        <input type="number" name="style_chamfer_size" id="style_chamfer_size"
+               min="2" max="200" step="1" value="{{ style_values.style_chamfer_size }}">
+        <p class="help">How much of each corner is cut away.</p>
+      </div>
+      <div class="mk-field" data-when="style_box_style=glow">
+        <label for="style_glow_spread">Glow spread</label>
+        <input type="number" name="style_glow_spread" id="style_glow_spread"
+               min="1" max="60" step="1" value="{{ style_values.style_glow_spread }}">
+        <p class="help">How far the bloom fans out past the line. Works best on
+        dark footage with a saturated colour.</p>
+      </div>
+      <div class="mk-field" data-when="style_box_style=sketch">
+        <label for="style_sketch_jitter">Sketch jitter</label>
+        <input type="number" name="style_sketch_jitter" id="style_sketch_jitter"
+               min="0" max="40" step="1" value="{{ style_values.style_sketch_jitter }}">
+        <p class="help">How far the hand wobbles. The wobble is fixed per class,
+        not re-rolled each frame — a reseeded jitter boils like video noise.</p>
+      </div>
+      <div class="mk-field">
+        <label for="style_box_opacity">Outline opacity</label>
+        <input type="range" name="style_box_opacity" id="style_box_opacity"
+               min="0" max="1" step="0.05" value="{{ style_values.style_box_opacity }}"
+               class="mk-range"><output></output>
+      </div>
+      <div class="mk-field">
+        <label for="style_fill_opacity">Fill opacity</label>
+        <input type="range" name="style_fill_opacity" id="style_fill_opacity"
+               min="0" max="1" step="0.02" value="{{ style_values.style_fill_opacity }}"
+               class="mk-range"><output></output>
+        <p class="help">A wash of the box's own colour inside it. Around 0.1 marks the
+        subject without hiding it.</p>
+      </div>
+      <div class="mk-field mk-check">
+        <input type="hidden" name="style_has_shadow" value="1">
+        <input type="checkbox" name="style_shadow" id="style_shadow"
+               {% if style_values.style_shadow %}checked{% endif %}>
+        <label for="style_shadow">Dark halo behind lines and text</label>
+      </div>
+    </div>
+  </div>
+
+  {# ------------------------------------------------------------------ colour #}
+  <div class="module">
+    <h2>Colour</h2>
+    <div class="mk-grid">
+      <div class="mk-field">
+        <label for="style_color_mode">Colour by</label>
+        <select name="style_color_mode" id="style_color_mode">
+          {% for value, label in color_mode_choices %}
+            <option value="{{ value }}"
+              {% if style_values.style_color_mode == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="mk-field" data-when="style_color_mode=class">
+        <label for="style_palette">Palette</label>
+        <select name="style_palette" id="style_palette">
+          {% for value, label in palette_choices %}
+            <option value="{{ value }}"
+              {% if style_values.style_palette == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+        <p class="help">Each class takes a colour from this palette and keeps it across
+        runs.</p>
+      </div>
+      <div class="mk-field" data-when="style_color_mode=fixed">
+        <label for="style_fixed_color">Box colour</label>
+        <input type="color" name="style_fixed_color" id="style_fixed_color"
+               value="{{ style_values.style_fixed_color }}">
+      </div>
+      <div class="mk-field" data-when="style_color_mode=confidence">
+        <label for="style_conf_low_color">Low confidence</label>
+        <input type="color" name="style_conf_low_color" id="style_conf_low_color"
+               value="{{ style_values.style_conf_low_color }}">
+      </div>
+      <div class="mk-field" data-when="style_color_mode=confidence">
+        <label for="style_conf_high_color">High confidence</label>
+        <input type="color" name="style_conf_high_color" id="style_conf_high_color"
+               value="{{ style_values.style_conf_high_color }}">
+      </div>
+      <div class="mk-field mk-wide" data-when="style_color_mode=class">
+        <label for="style_class_colors">Per-class overrides</label>
+        <input type="text" name="style_class_colors" id="style_class_colors"
+               placeholder="helmet=#ff0000, vest=#3b82f6"
+               value="{{ style_values.style_class_colors }}">
+        <p class="help">Pin specific classes to specific colours — brand colours, or the
+        one class a clip is about. Everything else keeps the palette.</p>
+      </div>
+    </div>
+  </div>
+
+  {# ----------------------------------------------------------------- labels #}
+  <div class="module">
+    <h2>Labels</h2>
+    <div class="mk-grid">
+      <div class="mk-field mk-check">
+        <input type="hidden" name="style_has_show_label" value="1">
+        <input type="checkbox" name="style_show_label" id="style_show_label"
+               {% if style_values.style_show_label %}checked{% endif %}>
+        <label for="style_show_label">Draw labels</label>
+      </div>
+      <div class="mk-field" data-when="style_show_label=on">
+        <label for="style_label_text">Text</label>
+        <select name="style_label_text" id="style_label_text">
+          {% for value, label in label_text_choices %}
+            <option value="{{ value }}"
+              {% if style_values.style_label_text == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="mk-field" data-when="style_show_label=on">
+        <label for="style_label_style">Chip</label>
+        <select name="style_label_style" id="style_label_style">
+          {% for value, label in label_style_choices %}
+            <option value="{{ value }}"
+              {% if style_values.style_label_style == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="mk-field" data-when="style_show_label=on">
+        <label for="style_label_position">Position</label>
+        <select name="style_label_position" id="style_label_position">
+          {% for value, label in label_position_choices %}
+            <option value="{{ value }}"
+              {% if style_values.style_label_position == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+        <p class="help">Falls back to inside the box wherever the chosen side would leave
+        the frame.</p>
+      </div>
+      <div class="mk-field" data-when="style_show_label=on">
+        <label for="style_label_color">Text colour</label>
+        <select name="style_label_color" id="style_label_color">
+          {% for value, label in label_color_choices %}
+            <option value="{{ value }}"
+              {% if style_values.style_label_color == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="mk-field" data-when="style_show_label=on">
+        <label for="style_font">Font</label>
+        <select name="style_font" id="style_font">
+          {% for value, label in font_choices %}
+            <option value="{{ value }}"
+              {% if style_values.style_font == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="mk-field" data-when="style_show_label=on">
+        <label for="style_label_scale">Text size</label>
+        <input type="number" name="style_label_scale" id="style_label_scale"
+               min="0.2" max="5" step="0.05" value="{{ style_values.style_label_scale }}">
+        <p class="help">Multiplier — 1.0 is sized for a 1080p frame.</p>
+      </div>
+      <div class="mk-field" data-when="style_show_label=on">
+        <label for="style_label_opacity">Chip opacity</label>
+        <input type="range" name="style_label_opacity" id="style_label_opacity"
+               min="0" max="1" step="0.05" value="{{ style_values.style_label_opacity }}"
+               class="mk-range"><output></output>
+      </div>
+      <div class="mk-field" data-when="style_show_label=on">
+        <label for="style_confidence_decimals">Confidence decimals</label>
+        <input type="number" name="style_confidence_decimals" id="style_confidence_decimals"
+               min="0" max="3" step="1" value="{{ style_values.style_confidence_decimals }}">
+      </div>
+      <div class="mk-field mk-check" data-when="style_show_label=on">
+        <input type="hidden" name="style_has_label_uppercase" value="1">
+        <input type="checkbox" name="style_label_uppercase" id="style_label_uppercase"
+               {% if style_values.style_label_uppercase %}checked{% endif %}>
+        <label for="style_label_uppercase">UPPERCASE</label>
+      </div>
+    </div>
+  </div>
+
+  {# ------------------------------------------------------------ what to show #}
+  <div class="module">
+    <h2>What to show</h2>
+    <div class="mk-grid">
+      <div class="mk-field mk-wide">
+        <label for="style_class_filter">Only these classes</label>
+        <input type="text" name="style_class_filter" id="style_class_filter"
+               placeholder="helmet, vest" value="{{ style_values.style_class_filter }}">
+        <p class="help">Comma-separated. Blank draws every class the model returned. This
+        hides boxes from the <em>picture</em> — it does not change what the model was asked
+        or what it found.</p>
+      </div>
+      <div class="mk-field mk-wide">
+        <label for="style_force_class">Label every box as</label>
+        <select name="style_force_class" id="style_force_class">
+          <option value="">— every box keeps the class the model gave it —</option>
+          {% for name in class_choices %}
+            <option value="{{ name }}"
+              {% if style_values.style_force_class == name %}selected{% endif %}>{{ name }}</option>
+          {% endfor %}
+        </select>
+        <p class="help">The classes the selected model predicts. Pick one and every box
+        drawn is labelled and coloured as that class, whatever the model actually said —
+        each box keeps its own position and confidence. For a clip whose class names are
+        not the ones to show an audience. This is <em>only</em> the picture: the job's
+        recorded detections, the counts on the Inferred videos tab and
+        <em>Only these classes</em> above all still go by what the model returned.
+        {% if not class_choices %}Nothing to pick: no class list is on record for this
+        model here — a bundle carries one in its manifest, a trained model on its row,
+        an exported artifact in the sidecar beside it.{% endif %}</p>
+      </div>
+      <div class="mk-field">
+        <label for="style_min_box_area">Minimum box size</label>
+        <input type="number" name="style_min_box_area" id="style_min_box_area"
+               min="0" max="100" step="0.01" value="{{ style_values.style_min_box_area }}">
+        <p class="help">Percent of the frame's area. Drops the far-background specks that
+        make a wide shot look noisy.</p>
+      </div>
+      <div class="mk-field">
+        <label for="style_max_boxes">Most boxes at once</label>
+        <input type="number" name="style_max_boxes" id="style_max_boxes"
+               min="0" max="500" step="1" value="{{ style_values.style_max_boxes }}">
+        <p class="help">0 = no limit. Otherwise the highest-confidence N survive.</p>
+      </div>
+    </div>
+  </div>
+
+  {# ------------------------------------------------------------------ scene #}
+  <div class="module">
+    <h2>Scene</h2>
+    <div class="mk-grid">
+      <div class="mk-field">
+        <label for="style_dim_background">Spotlight</label>
+        <input type="range" name="style_dim_background" id="style_dim_background"
+               min="0" max="0.95" step="0.05" value="{{ style_values.style_dim_background }}"
+               class="mk-range"><output></output>
+        <p class="help">Darkens everything outside the boxes by this much. Pushes the eye
+        onto the detections; heavy-handed above ~0.5.</p>
+      </div>
+      <div class="mk-field">
+        <label for="style_counter">Detection counter</label>
+        <select name="style_counter" id="style_counter">
+          {% for value, label in counter_choices %}
+            <option value="{{ value }}"
+              {% if style_values.style_counter == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+        <p class="help">A live "class × N" tally in one corner.</p>
+      </div>
+      <div class="mk-field" data-when="style_counter=top_left top_right bottom_left bottom_right">
+        <label for="style_counter_scale">Counter size</label>
+        <input type="number" name="style_counter_scale" id="style_counter_scale"
+               min="0.2" max="5" step="0.05" value="{{ style_values.style_counter_scale }}">
+      </div>
+      <div class="mk-field mk-wide">
+        <label for="style_watermark_text">Watermark</label>
+        <input type="text" name="style_watermark_text" id="style_watermark_text"
+               maxlength="200" placeholder="e.g. Mercury · PPE detection"
+               value="{{ style_values.style_watermark_text }}">
+      </div>
+      <div class="mk-field" data-when="style_watermark_text=*">
+        <label for="style_watermark_position">Watermark corner</label>
+        <select name="style_watermark_position" id="style_watermark_position">
+          {% for value, label in watermark_position_choices %}
+            <option value="{{ value }}"
+              {% if style_values.style_watermark_position == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="mk-field" data-when="style_watermark_text=*">
+        <label for="style_watermark_color">Watermark colour</label>
+        <input type="color" name="style_watermark_color" id="style_watermark_color"
+               value="{{ style_values.style_watermark_color }}">
+      </div>
+      <div class="mk-field" data-when="style_watermark_text=*">
+        <label for="style_watermark_opacity">Watermark opacity</label>
+        <input type="range" name="style_watermark_opacity" id="style_watermark_opacity"
+               min="0" max="1" step="0.05" value="{{ style_values.style_watermark_opacity }}"
+               class="mk-range"><output></output>
+      </div>
+      <div class="mk-field" data-when="style_watermark_text=*">
+        <label for="style_watermark_scale">Watermark size</label>
+        <input type="number" name="style_watermark_scale" id="style_watermark_scale"
+               min="0.2" max="5" step="0.05" value="{{ style_values.style_watermark_scale }}">
+      </div>
+    </div>
+  </div>
+
+  {# ----------------------------------------------------------------- motion #}
+  <div class="module">
+    <h2>Motion</h2>
+    <div class="mk-grid">
+      <div class="mk-field">
+        <label for="style_smoothing">Smoothing</label>
+        <input type="range" name="style_smoothing" id="style_smoothing"
+               min="0" max="0.95" step="0.05" value="{{ style_values.style_smoothing }}"
+               class="mk-range"><output></output>
+        <p class="help">Eases each box toward its new position instead of snapping. Also
+        what makes a frame stride above 1 look deliberate rather than choppy. Too high and
+        the boxes lag behind the subject.</p>
+      </div>
+      <div class="mk-field">
+        <label for="style_fade_frames">Fade in / out</label>
+        <input type="number" name="style_fade_frames" id="style_fade_frames"
+               min="0" max="120" step="1" value="{{ style_values.style_fade_frames }}">
+        <p class="help">Frames a box takes to appear, and to stay on screen fading after
+        the model stops returning it. Removes the single-frame flicker that makes a
+        detection reel look broken; 0 draws exactly what each frame's model output says.</p>
+      </div>
+      <div class="mk-field">
+        <label for="style_animation">Outline animation</label>
+        <select name="style_animation" id="style_animation">
+          {% for value, label in animation_choices %}
+            <option value="{{ value }}"
+              {% if style_values.style_animation == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+        <p class="help"><em>Marching</em> crawls the dashes or dots around the box
+        (pick the dashed or dotted outline for it); <em>pulse</em> breathes the
+        line thickness on any outline.</p>
+      </div>
+      <div class="mk-field" data-when="style_animation=march pulse">
+        <label for="style_animation_period">Animation period</label>
+        <input type="number" name="style_animation_period" id="style_animation_period"
+               min="2" max="600" step="1" value="{{ style_values.style_animation_period }}">
+        <p class="help">Frames per cycle — at 25 fps, 25 is one cycle a second.
+        Counted in rendered frames, so a re-render animates identically.</p>
+      </div>
+      <div class="mk-field mk-wide">
+        <p class="help">Neither knob invents a detection: smoothing moves boxes the model
+        did return, and a fade-out is bounded by the frames set here. The
+        <em>Score threshold</em> above is still what decides whether something is a
+        detection at all. None of the three shows in the preview — a still has no
+        motion to smooth, fade or animate — so set them by eye on the finished clip.</p>
+      </div>
+    </div>
+  </div>
+
+  {# ----------------------------------------------------------------- output #}
+  <div class="module">
+    <h2>Output file</h2>
+    <div class="mk-grid">
+      <div class="mk-field">
+        <label for="style_output_height">Delivery height</label>
+        <input type="number" name="style_output_height" id="style_output_height"
+               min="0" max="4320" step="2" value="{{ style_values.style_output_height }}">
+        <p class="help">0 keeps the source resolution. 1080 turns a 4K clip into something
+        that can actually be sent to someone — the model still sees the full-resolution
+        frame, only the rendered output shrinks.</p>
+      </div>
+      <div class="mk-field">
+        <label for="style_crf">Encode quality (CRF)</label>
+        <input type="number" name="style_crf" id="style_crf" min="0" max="51" step="1"
+               value="{{ style_values.style_crf }}">
+        <p class="help">x264 constant rate factor: lower is better and bigger. 18 is
+        visually lossless, 20–23 is fine for sharing, above 28 shows on flat surfaces.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="module">
+    <h2>Save this look</h2>
+    <div style="padding: 8px 12px 12px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input type="text" id="mk-preset-name" maxlength="120" size="30"
+               placeholder="e.g. Deck — teal brackets">
+        <input type="button" class="button" id="mk-preset-save" value="Save as preset">
+        <span id="mk-preset-message" style="font-size:12px;color:#666"></span>
+      </div>
+      <p class="help" style="font-size:11px">Stores everything above (not the model
+      or the pipeline) under that name, ready to pick from the Preset dropdown on
+      the next clip. Saving over an existing name updates it — which is how you
+      amend a preset after tweaking it.</p>
+    </div>
+  </div>
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Render marketing video">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+
+{# --------------------------------------------------------------- preview pane #}
+<div class="module mk-preview">
+  <h2>Preview</h2>
+  <div style="padding: 8px 12px 12px">
+    <div class="mk-shot" id="mk-shot">Press <strong>&nbsp;Preview frame&nbsp;</strong> to
+      render one frame through this exact style.</div>
+    <p class="mk-meta" id="mk-meta"></p>
+    <p class="mk-error" id="mk-error"></p>
+    <div style="margin-top:10px">
+      <label for="mk-position" style="font-size:11px;color:#666">Position in clip</label>
+      <input type="range" id="mk-position" min="0" max="1" step="0.01" value="0.5"
+             style="width:100%">
+    </div>
+    <p style="margin-top:8px">
+      <input type="button" class="button default" id="mk-preview-button" value="Preview frame">
+      <input type="button" class="button" id="mk-rerun-button" value="Re-run the model"
+             title="Ignore the cached detections for this frame and ask the model again">
+    </p>
+    <p class="help" style="font-size:11px">The frame is drawn by the renderer that will
+    draw the video, at up to 1080p. Style changes re-draw from the detections already
+    fetched for that frame, so only moving the slider (or pressing
+    <em>Re-run the model</em>) costs GPU time.</p>
+  </div>
+</div>
+</div>
+
+{% include "admin/videos/_inference_scripts.html" %}
+{# json_script rather than a raw dump: preset names are operator-typed and would
+   otherwise be able to close this script element early. #}
+{{ presets|json_script:"mk-preset-data" }}
+{# Class names reach the page the same way, and for the same reason: they come
+   from manifests and sidecars an operator wrote. #}
+{{ classes_by_model|json_script:"mk-classes-by-model" }}
+<script src="{% static 'videos/marketing_style.js' %}"></script>
+{% endblock %}

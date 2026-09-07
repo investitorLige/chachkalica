@@ -1,0 +1,67 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Sample <strong>{{ video.name }}</strong> at a fixed rate and ask a vision-language model
+about every sampled frame. Each answer becomes an alert.</p>
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action_name }}">
+
+  <div class="form-row">
+    <label for="id_vlm_model">VLM:</label>
+    <select name="vlm_model" id="id_vlm_model">
+      {% for model in models %}
+        <option value="{{ model.pk }}"
+                {% if model.pk == selected_model_id %}selected{% endif %}
+                data-prompt="{{ model.prompt }}">
+          {{ model.name }} — {{ model.get_family_display }}{% if model.variant %} {{ model.variant }}{% endif %}
+        </option>
+      {% endfor %}
+    </select>
+    <p class="help">The prompt below travels with the model. Edit it on the model's own page
+      if it needs changing — a run records the prompt it actually used.</p>
+  </div>
+
+  <div class="form-row">
+    <label>Prompt:</label>
+    <pre id="vlm-prompt-preview"
+         style="white-space:pre-wrap;background:#f8f8f8;border:1px solid #ddd;
+                border-radius:4px;padding:8px;max-width:640px;margin:0"></pre>
+  </div>
+
+  <div class="form-row">
+    <label for="id_fps">Frames per second:</label>
+    <input type="number" name="fps" id="id_fps" value="{{ fps }}"
+           step="0.1" min="0.1" style="width:8em">
+    <p class="help">
+      How many frames a second to hand to the model{% if video.source_fps %} — this video runs
+      at {{ video.source_fps|floatformat:3 }} fps{% endif %}. A VLM answer typically takes
+      about a second, so anything much above 1 fps means the alerts will trail the video by a
+      growing margin. Every sampled frame produces an alert, so this also sets how chatty the
+      feed is.
+    </p>
+  </div>
+
+  <div class="submit-row">
+    <input type="submit" name="apply" class="default" value="Run and watch">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+
+<script>
+  (function () {
+    var select = document.getElementById("id_vlm_model");
+    var preview = document.getElementById("vlm-prompt-preview");
+    function sync() {
+      var option = select.options[select.selectedIndex];
+      preview.textContent = option ? (option.dataset.prompt || "—") : "—";
+    }
+    select.addEventListener("change", sync);
+    sync();
+  })();
+</script>
+{% endblock %}

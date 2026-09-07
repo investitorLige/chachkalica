@@ -46,6 +46,12 @@ class FleetSettings(models.Model):
         max_length=512, default="data/videos",
         help_text="Directory holding raw video files (imported or downloaded).",
     )
+    vlm_videos_dir = models.CharField(
+        max_length=512, default="data/vlm_videos",
+        help_text="Directory holding VLM video files (uploaded, imported, or downloaded). "
+                  "Deliberately separate from videos_dir: the VLM section owns its own "
+                  "library, so adding a clip there never disturbs the detection Videos tab.",
+    )
     webhook_url = models.CharField(
         max_length=512, default="http://host.docker.internal:9000",
         help_text="Base URL each container POSTs annotation events to (the /hook receiver).",

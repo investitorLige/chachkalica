@@ -234,3 +234,57 @@ def teardown_dataset_projects(dataset: Dataset) -> list[dict]:
                 entry["status"] = f"failed ({exc})"
         results.append(entry)
     return results
+
+
+def label_shapes(labels_dir: Path, image_filename: str, class_names) -> list[dict]:
+    """Parse one image's label file into normalized, named draw shapes.
+
+    Each shape is ``{class_id, class_name, kind, bbox, polygon}`` with a
+    normalized centre-xywh ``bbox`` and, for polygons, a flat normalized
+    ``polygon`` list — the format both label overlays consume: the dataset
+    preview viewer's canvas, and the VLM dataset report's burned-in boxes.
+    An unknown class id keeps its number as its name rather than being dropped,
+    since the point here is to *show* the annotation, warts and all.
+
+    Returns an empty list when the image has no label file.
+    """
+    from fleet.reconcile import txt_format
+
+    label_file = find_label_file(Path(labels_dir), image_filename)
+    if label_file is None:
+        return []
+    _w, _h, objects = txt_format.parse_label_text(label_file.read_text(encoding="utf-8"))
+
+    shapes = []
+    for obj in objects:
+        class_id = obj["class_id"]
+        name = (class_names[class_id] if 0 <= class_id < len(class_names)
+                else str(class_id))
+        cx, cy, w, h = obj["bbox"]
+        polygon = obj.get("polygon")
+        shapes.append({
+            "class_id": class_id,
+            "class_name": name,
+            "kind": "polygon" if polygon else "box",
+            "bbox": {"cx": cx, "cy": cy, "w": w, "h": h},
+            "polygon": polygon or [],
+        })
+    return shapes
+
+
+def find_label_file(labels_dir: Path, image_filename: str) -> Path | None:
+    """Locate one image's YOLO label file inside ``labels_dir``.
+
+    Two names are tried, because both are in use: ``<image_filename>.txt``
+    (``img.jpg.txt`` — what this app's own sync writes) and ``<stem>.txt``
+    (``img.txt`` — standard YOLO, and what :func:`promote_annotator_labels`
+    normalizes to). Returns None when neither exists, which means *unlabeled*
+    and is not the same as an existing but empty file.
+    """
+    for candidate in (
+        labels_dir / f"{image_filename}.txt",
+        labels_dir / f"{Path(image_filename).stem}.txt",
+    ):
+        if candidate.exists():
+            return candidate
+    return None

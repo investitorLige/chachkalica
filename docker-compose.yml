@@ -45,6 +45,8 @@ x-app: &app
     TRAINING_SERVICE_URL: http://trainer:8200
     # Reach the Grounding SAM ML backend the same way.
     SAM_BACKEND_URL: http://sam-backend:9090
+    # And the vision-language model backend the VLM tab's runs call per frame.
+    VLM_BACKEND_URL: http://vlm-backend:9091
     # bgutil-ytdlp-pot-provider (installed via requirements.txt) reads this to
     # find its companion BotGuard-solving server — see videos/services/downloader.py.
     YT_POT_SERVER_URL: http://yt-pot-server:4416
@@ -317,6 +319,39 @@ services:
     # Shares the box's GPU with `trainer` — fine unless both run heavy work at
     # the same time. Falls back to CPU automatically if no GPU is present
     # (sam_ml_backend.py checks torch.cuda.is_available()).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  vlm-backend:
+    # Vision-language model backend for the VLM tab. One model warm at a time
+    # (see ml_backends/vlm/service.py); the worker hands it frame PATHS on the
+    # shared data mount, so it needs that mount and nothing else — no RTSP, no
+    # docker socket, no database.
+    build:
+      context: ./chachkalica
+      dockerfile: ml_backends/vlm/Dockerfile
+    environment:
+      # huggingface.co answers from this network but does not VERIFY: a TLS
+      # proxy re-signs it with an internal CA absent from this image's trust
+      # store. So every VLM must already be in data/hf_cache/hub, and
+      # HF_HUB_OFFLINE stops from_pretrained paying for a handshake that cannot
+      # succeed — the same pair the trainer sets. `manage.py fetch_vlm_weights`
+      # lists what is missing and how to copy it in.
+      HF_HOME: /app/data/hf_cache
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
+    ports:
+      - "${VLM_HOST_PORT:-9091}:9091"
+    volumes:
+      - ./chachkalica/data:/app/data
+    restart: unless-stopped
+    # ───────────────────────────────── GPU ─────────────────────────────────
+    # Now a THREE-way share with `trainer` and `sam-backend`. A resident 7B VLM
+    # alongside an active training run will OOM — run them one at a time.
     deploy:
       resources:
         reservations:

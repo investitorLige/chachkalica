@@ -1,0 +1,89 @@
+{% load static %}
+{% comment %}
+The scripts behind _inference_fields.html: the "Sync bundle" button, the
+show-only-the-relevant-rows behaviour, and re-applying a model's own pipeline
+metadata when a different model is picked. Included by both inference forms,
+after the closing </form>.
+{% endcomment %}
+{# Drives the "Sync bundle" button above; shared with the camera live-inference
+   inline. Loaded before the inline script below, which does not depend on it. #}
+<script src="{% static 'training/bundle_sync.js' %}"></script>
+
+{# json_script, not a raw dump into the <script> below: these maps are keyed by
+   artifact filename / model pk and carry operator-set paths, and json.dumps escapes
+   JSON syntax but not HTML — a "</script>" in any value would end the script early.
+   Only one of the two is populated on a given render (see is_exported in the view). #}
+{{ trained_defaults|json_script:"trained-defaults" }}
+{{ artifact_defaults|json_script:"artifact-defaults" }}
+<script>
+  // Two behaviours: (1) show only the rows the selected pipeline uses — rows opt in
+  // via data-pipelines, same convention as the model-preview page; (2) when a
+  // *different* model is picked, reapply that model's pipeline metadata, so the
+  // default stays "serve it the way it was trained".
+  //
+  // The initially-selected model's values are rendered server-side (see
+  // videos.admin._form_values), so this script only handles changes — which also
+  // means a form re-rendered after a validation warning keeps whatever the operator
+  // typed rather than being reset.
+  (function () {
+    var pipelineSel = document.getElementById("pipeline");
+    var rows = document.querySelectorAll("[data-pipelines]");
+    function syncRows() {
+      var current = pipelineSel.value;
+      rows.forEach(function (row) {
+        var allowed = row.getAttribute("data-pipelines").split(/\s+/);
+        row.style.display = allowed.indexOf(current) !== -1 ? "" : "none";
+      });
+    }
+    pipelineSel.addEventListener("change", syncRows);
+    syncRows();
+
+    var FIELDS = ["detector_checkpoint", "detector_expand_ratio", "detector_min_box_size",
+                  "tile_size_px", "tile_width_pct", "tile_height_pct", "overlap",
+                  "merge_nms_iou", "score_threshold"];
+    // Falls back to the form's own default only for score_threshold: a blank
+    // geometry field means "chachak's default", but a blank threshold would fail
+    // the required input, and a model with no recorded operating point still needs
+    // one to run at.
+    var FALLBACKS = { score_threshold: "{{ default_score_threshold }}" };
+    function applyDefaults(d) {
+      if (!d) { return; }
+      pipelineSel.value = d.pipeline;
+      FIELDS.forEach(function (name) {
+        var input = document.getElementById(name);
+        if (!input) { return; }
+        var value = d[name];
+        input.value = (value === null || value === undefined)
+          ? (FALLBACKS[name] || "") : value;
+      });
+      var chain = document.getElementById("chain");
+      if (chain) { chain.value = (d.chain || []).join(", "); }
+      syncRows();
+    }
+
+    // Both maps hold the same schema (training.services.pipeline_meta): trained
+    // models carry it frozen on the row, exported artifacts in the ".pipeline.json"
+    // sidecar written beside them. Only one of the two selects exists on a given
+    // render of this page (see is_exported in the view).
+    function defaultsMap(id) {
+      var node = document.getElementById(id);
+      return node ? JSON.parse(node.textContent) : {};
+    }
+
+    var modelSel = document.getElementById("trained_model");
+    if (modelSel) {
+      var trainedDefaults = defaultsMap("trained-defaults");
+      modelSel.addEventListener("change", function () {
+        applyDefaults(trainedDefaults[modelSel.value]);
+      });
+    }
+
+    var artifactSel = document.getElementById("artifact_path");
+    if (artifactSel) {
+      var artifactDefaults = defaultsMap("artifact-defaults");
+      artifactSel.addEventListener("change", function () {
+        applyDefaults(artifactDefaults[artifactSel.value]);
+      });
+    }
+  })();
+</script>

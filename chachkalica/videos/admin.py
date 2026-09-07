@@ -8,14 +8,14 @@ A "Play selected video…" action (and per-row ▶ play link) opens an HTML5 pla
 backed by a Range-aware streaming endpoint so seeking works.
 """
 
-import re
+import base64
 from pathlib import Path
 
 import django_rq
 from django import forms
 from django.contrib import admin, messages
 from django.contrib.admin.helpers import ACTION_CHECKBOX_NAME
-from django.http import FileResponse, Http404, StreamingHttpResponse
+from django.http import Http404, JsonResponse
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
@@ -26,8 +26,10 @@ from training import pipelines
 from training.models import TrainedModel
 from training.services import bundles, exports, pipeline_meta
 from videos import jobs
-from videos.models import FrameExtractionJob, InferenceJob, Video
-from videos.services import downloader, frame_extraction, inference
+from videos.models import FrameExtractionJob, InferenceJob, RenderPreset, Video
+from videos.services import (
+    downloader, frame_extraction, inference, render_style, streaming,
+)
 from videos.services.videos import list_video_files
 
 _STATUS_COLORS = {
@@ -211,7 +213,8 @@ class VideoAdmin(admin.ModelAdmin):
     list_filter = ["status"]
     search_fields = ["name", "filename", "source_url"]
     readonly_fields = ["status", "filename", "player", "last_error", "created_at", "updated_at"]
-    actions = ["play_video", "extract_frames", "run_inference", "import_all_new", "redownload"]
+    actions = ["play_video", "extract_frames", "run_inference",
+               "run_inference_marketing", "import_all_new", "redownload"]
 
     def get_actions(self, request):
         """Relabel the stock ``delete_selected`` — deleting a video also deletes
@@ -415,6 +418,37 @@ class VideoAdmin(admin.ModelAdmin):
         ``training.services.bundles``). A bundle carries the geometry its weights
         were tuned with, so the bundle is the record of what runs.
         """
+        return self._inference_wizard(request, queryset, marketing=False)
+
+    @admin.action(description="Run model inference for marketing…")
+    def run_inference_marketing(self, request, queryset):
+        """The same run, configured to be *watched* rather than inspected.
+
+        Identical machinery to "Run model inference…" — same model sources, same
+        pipeline, same job row, same queue — with one addition: a Look section
+        whose thirty-odd knobs are stored on the job as
+        ``InferenceJob.render_style`` and drive
+        :class:`videos.services.render_style.MarketingRenderer` instead of the
+        plain ``draw_boxes`` overlay. Rounded or bracketed boxes, translucent
+        fills, pill labels, a spotlit background, a per-class counter, a
+        watermark, temporal easing so boxes glide instead of flickering, and a
+        delivery resolution / encode quality for the file that comes out.
+
+        A separate action rather than a checkbox on the existing one, because the
+        two have different jobs: the plain action answers "what did the model
+        do?", where a stable, boring overlay is a feature and re-tuning its looks
+        would be noise. This one answers "can we show this to someone?".
+
+        It also carries a preview: styling is iterative and re-encoding a clip per
+        iteration is not, so the form renders one frame through the very same
+        renderer (see :meth:`marketing_preview_view`) and re-uses the model's
+        answer for that frame across style changes.
+        """
+        return self._inference_wizard(request, queryset, marketing=True)
+
+    def _inference_wizard(self, request, queryset, *, marketing: bool):
+        """The shared body of both inference actions; ``marketing`` picks the
+        step-2 template, the Look section and the message wording."""
         if queryset.count() != 1:
             self.message_user(request, "Select exactly one video to run inference on.",
                               level=messages.WARNING)
@@ -425,10 +459,13 @@ class VideoAdmin(admin.ModelAdmin):
                               level=messages.WARNING)
             return None
 
+        action = "run_inference_marketing" if marketing else "run_inference"
+        heading = "Run model inference for marketing" if marketing else "Run model inference"
         base_context = {
             **self.admin_site.each_context(request),
             "video": video,
-            "action": "run_inference",
+            "action": action,
+            "marketing": marketing,
             "selected": [str(video.pk)],
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
         }
@@ -441,7 +478,7 @@ class VideoAdmin(admin.ModelAdmin):
                                   level=messages.WARNING)
             return TemplateResponse(request, "admin/videos/run_inference_source.html", {
                 **base_context,
-                "title": f"Run model inference — {video.name}",
+                "title": f"{heading} — {video.name}",
                 "model_source_choices": InferenceJob.MODEL_SOURCE_CHOICES,
                 "default_model_source": InferenceJob.TRAINED,
                 "artifact_count": len(exports.list_artifacts()),
@@ -452,7 +489,8 @@ class VideoAdmin(admin.ModelAdmin):
 
         # ------------------------------------------------------- step 2: submit
         if request.POST.get("apply"):
-            job, error = self._build_inference_job(request, video, model_source)
+            job, error = self._build_inference_job(request, video, model_source,
+                                                   marketing=marketing)
             if error:
                 self.message_user(request, error, level=messages.WARNING)
             else:
@@ -461,8 +499,9 @@ class VideoAdmin(admin.ModelAdmin):
                                  job_timeout=jobs.INFERENCE_JOB_TIMEOUT)
                 self.message_user(
                     request,
-                    f"Inference queued for {video.name} with {job.model_label()} "
-                    f"[{job.pipeline}] — see the Inferred videos tab for progress.",
+                    f"{'Marketing render' if marketing else 'Inference'} queued for "
+                    f"{video.name} with {job.model_label()} [{job.pipeline}] — see the "
+                    "Inferred videos tab for progress.",
                 )
                 return None
 
@@ -512,7 +551,7 @@ class VideoAdmin(admin.ModelAdmin):
 
         context = {
             **base_context,
-            "title": f"Run model inference — {video.name}",
+            "title": f"{heading} — {video.name}",
             "model_source": model_source,
             "is_exported": is_exported,
             "is_bundle": is_bundle,
@@ -542,13 +581,102 @@ class VideoAdmin(admin.ModelAdmin):
             "merging_pipelines": " ".join(
                 value for value, _label in pipelines.PIPELINE_CHOICES),
         }
-        return TemplateResponse(request, "admin/videos/run_inference.html", context)
+        if not marketing:
+            return TemplateResponse(request, "admin/videos/run_inference.html", context)
 
-    def _build_inference_job(self, request, video, model_source):
+        classes = self._class_names_by_model(model_source, trained_models, artifacts,
+                                             bundle_list)
+        context.update(self._style_context(request, classes.get(selected) or []))
+        # Keyed by the same string the model <select> posts, so the Look section's
+        # "label every box as" dropdown can refill itself when a different model
+        # is picked — same trick as the pipeline prefills above.
+        context["classes_by_model"] = classes
+        return TemplateResponse(request, "admin/videos/run_inference_marketing.html",
+                                context)
+
+    @staticmethod
+    def _class_names_by_model(model_source, trained_models, artifacts, bundle_list):
+        """``{<model select value>: [class name, …]}`` for the model list this
+        render is showing — the vocabulary the relabel dropdown offers.
+
+        Three sources for the three kinds of model, and any of them may come back
+        empty: a bundle carries its class map in its manifest, a catalogued model
+        on its row, and an exported artifact in the sidecars beside it (or in the
+        catalogue entry it was exported from). Only the marketing form asks for
+        this, because building it for the exported case reads a sidecar per
+        artifact.
+        """
+        if model_source == InferenceJob.BUNDLE:
+            return {b["relpath"]: list(b["classes"]) for b in bundle_list}
+        if model_source == InferenceJob.EXPORTED:
+            return {a["relpath"]: exports.read_class_names(a["relpath"])
+                    for a in artifacts}
+        return {str(tm.pk): list(tm.classes or []) for tm in trained_models}
+
+    def _style_context(self, request, class_names=()):
+        """Everything the Look section needs: the values to render it with, and
+        the vocabularies its selects are built from — including ``class_names``,
+        the selected model's class space, which the relabel dropdown offers.
+
+        The starting values are the *last* marketing style used on this instance
+        rather than the module defaults, so a house look, once dialled in, is one
+        press away on the next clip — and a form re-rendered after a validation
+        warning keeps what was typed, same rule as the pipeline fields above.
+        """
+        if request.POST.get("apply"):
+            style, _error = render_style.parse_form(request.POST)
+        else:
+            previous = (
+                InferenceJob.objects
+                .exclude(render_style={})
+                .order_by("-created_at")
+                .values_list("render_style", flat=True)
+                .first()
+            )
+            style = render_style.normalize(previous or {})
+        # A relabel carried over from the last render (or loaded from a preset)
+        # can name a class the selected model does not have — it is only ever
+        # drawn, never matched — so it stays in the list rather than silently
+        # reverting to "off" the moment the form re-renders.
+        forced = style["force_class"]
+        class_choices = list(class_names)
+        if forced and forced not in class_choices:
+            class_choices.append(forced)
+        return {
+            "style_values": render_style.form_values(style),
+            "class_choices": class_choices,
+            # Passed as form-shaped values (``style_<knob>`` keys), not raw style
+            # dicts: loading a preset is then "assign each value to the input of
+            # that name" and the page needs to know nothing about what a knob is.
+            "presets": [
+                {"pk": preset.pk, "name": preset.name,
+                 "values": render_style.form_values(
+                     render_style.normalize(preset.style))}
+                for preset in RenderPreset.objects.all()
+            ],
+            "preset_save_url": reverse("admin:videos_video_render_preset_save"),
+            "palette_choices": render_style.PALETTE_CHOICES,
+            "color_mode_choices": render_style.COLOR_MODE_CHOICES,
+            "box_style_choices": render_style.BOX_STYLE_CHOICES,
+            "label_text_choices": render_style.LABEL_TEXT_CHOICES,
+            "label_style_choices": render_style.LABEL_STYLE_CHOICES,
+            "label_position_choices": render_style.LABEL_POSITION_CHOICES,
+            "label_color_choices": render_style.LABEL_COLOR_CHOICES,
+            "font_choices": render_style.FONT_CHOICES,
+            "animation_choices": render_style.ANIMATION_CHOICES,
+            "counter_choices": render_style.CORNER_CHOICES,
+            "watermark_position_choices": [
+                c for c in render_style.CORNER_CHOICES if c[0] != "none"],
+            "preview_url": reverse("admin:videos_video_marketing_preview"),
+        }
+
+    def _build_inference_job(self, request, video, model_source, *, marketing=False):
         """Validate the step-2 POST into an unsaved :class:`InferenceJob`.
 
         Returns ``(job, None)`` on success or ``(None, message)`` on the first
-        problem found, so the caller can re-render the form with a warning.
+        problem found, so the caller can re-render the form with a warning. With
+        ``marketing`` the Look section is parsed too, onto ``render_style`` — the
+        one field that separates the two actions' output.
         """
         trained_model = None
         artifact_path = ""
@@ -620,6 +748,12 @@ class VideoAdmin(admin.ModelAdmin):
             if part.strip()
         ]
 
+        style = {}
+        if marketing:
+            style, style_error = render_style.parse_form(request.POST)
+            if style_error:
+                return None, style_error
+
         # The form hides irrelevant rows with CSS, which still submits them — drop
         # the ones the chosen pipeline can't use so the saved row is an honest
         # record of what actually ran. 'chain' can contain anything, so it keeps
@@ -657,6 +791,7 @@ class VideoAdmin(admin.ModelAdmin):
             detector_checkpoint=detector_checkpoint,
             tile_size_px=tile_size_px,
             chain=chain,
+            render_style=style,
             output_filename=inference.unique_output_filename(video.name),
             **numbers,
         )
@@ -717,8 +852,105 @@ class VideoAdmin(admin.ModelAdmin):
                  name="videos_video_play"),
             path("stream/", self.admin_site.admin_view(self.stream_view),
                  name="videos_video_stream"),
+            path("marketing-preview/",
+                 self.admin_site.admin_view(self.marketing_preview_view),
+                 name="videos_video_marketing_preview"),
+            path("render-preset/save/",
+                 self.admin_site.admin_view(self.render_preset_save_view),
+                 name="videos_video_render_preset_save"),
         ]
         return custom + super().get_urls()
+
+    def marketing_preview_view(self, request):
+        """Render one frame the way the finished marketing video will look.
+
+        POSTs the whole step-2 form (the marketing template's preview button
+        submits the same field names, so nothing has to be kept in sync) plus
+        ``video``, ``position`` (0–1 along the clip) and optionally ``refresh=1``
+        to re-run the model rather than re-use its cached answer for that frame.
+        Returns the frame as a data URI.
+
+        POST-only and staff-only for the same reason as the bundle-sync endpoint:
+        a cache miss runs the model, which takes the trainer's GPU. The base64
+        round-trip costs ~33% over serving bytes, and buys a reply that carries
+        the box count and the cache flag alongside the image, and a page that
+        needs no second request to show it.
+        """
+        if request.method != "POST":
+            return JsonResponse({"error": "POST required."}, status=405)
+
+        video = Video.objects.filter(pk=request.POST.get("video")).first()
+        if video is None or not video.exists():
+            return JsonResponse({"error": "No such video on disk."}, status=404)
+
+        model_source = request.POST.get("model_source") or ""
+        if model_source not in dict(InferenceJob.MODEL_SOURCE_CHOICES):
+            return JsonResponse({"error": "Choose which kind of model to run."}, status=400)
+
+        job, error = self._build_inference_job(request, video, model_source, marketing=True)
+        if error:
+            return JsonResponse({"error": error}, status=400)
+
+        try:
+            position = float(request.POST.get("position") or 0.5)
+        except ValueError:
+            position = 0.5
+
+        # The model is remote (the trainer container) and the video is a file
+        # someone else's tooling wrote: every failure here belongs in the preview
+        # panel as text, not as an opaque 500 behind a fetch.
+        try:
+            result = inference.preview_frame(
+                job, position, use_cache=not request.POST.get("refresh"))
+        except Exception as exc:  # noqa: BLE001 - reported in the preview panel
+            return JsonResponse({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+
+        encoded = base64.b64encode(result["jpeg"]).decode()
+        return JsonResponse({
+            "image": f"data:image/jpeg;base64,{encoded}",
+            "width": result["width"],
+            "height": result["height"],
+            "boxes": result["boxes"],
+            "detections": result["detections"],
+            "frame_index": result["frame_index"],
+            "frames_total": result["frames_total"],
+            "cached": result["cached"],
+        })
+
+    def render_preset_save_view(self, request):
+        """Save the Look section of the marketing form as a named preset.
+
+        POSTs the whole form plus ``preset_name`` — same "the form is the
+        payload" contract as the preview endpoint, so this knows nothing about
+        individual knobs either. Saving by name is an **upsert**: pressing save
+        again with a preset's own name is how you amend it, which is what
+        someone who has just tweaked a loaded preset means by "save".
+
+        The reply is the preset in the form's own shape, so the page can add it
+        to the dropdown and select it without a reload.
+        """
+        if request.method != "POST":
+            return JsonResponse({"error": "POST required."}, status=405)
+
+        name = (request.POST.get("preset_name") or "").strip()
+        if not name:
+            return JsonResponse({"error": "Name the preset first."}, status=400)
+        if len(name) > 120:
+            return JsonResponse({"error": "That name is too long (120 max)."},
+                                status=400)
+
+        style, error = render_style.parse_form(request.POST)
+        if error:
+            return JsonResponse({"error": error}, status=400)
+
+        preset, created = RenderPreset.objects.update_or_create(
+            name=name, defaults={"style": style})
+        return JsonResponse({
+            "pk": preset.pk,
+            "name": preset.name,
+            "created": created,
+            "values": render_style.form_values(style),
+        })
 
     def play_view(self, request):
         video = Video.objects.filter(pk=request.GET.get("video")).first()
@@ -734,50 +966,26 @@ class VideoAdmin(admin.ModelAdmin):
         return TemplateResponse(request, "admin/videos/video_player.html", context)
 
     def stream_view(self, request):
-        """Stream the mp4 bytes, honouring HTTP Range so the player can seek.
-
-        Django's ``FileResponse`` does not implement Range on its own, so a
-        ``Range`` request is served as a bounded ``206`` here.
-        """
+        """Stream the mp4 bytes, honouring HTTP Range so the player can seek."""
         video = Video.objects.filter(pk=request.GET.get("video")).first()
         if video is None or not video.exists():
             raise Http404("video file not found")
-        path = video.path()
-        size = path.stat().st_size
-        content_type = "video/mp4"
-
-        range_header = request.headers.get("Range", "")
-        match = re.match(r"bytes=(\d+)-(\d*)", range_header.strip())
-        if not match:
-            resp = FileResponse(open(path, "rb"), content_type=content_type)
-            resp["Accept-Ranges"] = "bytes"
-            return resp
-
-        start = int(match.group(1))
-        end = int(match.group(2)) if match.group(2) else size - 1
-        end = min(end, size - 1)
-        start = min(start, end)
-        length = end - start + 1
-
-        resp = StreamingHttpResponse(
-            _file_chunks(path, start, length), status=206, content_type=content_type
-        )
-        resp["Content-Length"] = str(length)
-        resp["Content-Range"] = f"bytes {start}-{end}/{size}"
-        resp["Accept-Ranges"] = "bytes"
-        return resp
+        return streaming.serve(request, video.path())
 
 
-def _file_chunks(path, start, length, chunk_size=8192):
-    with open(path, "rb") as fh:
-        fh.seek(start)
-        remaining = length
-        while remaining > 0:
-            data = fh.read(min(chunk_size, remaining))
-            if not data:
-                break
-            remaining -= len(data)
-            yield data
+@admin.register(RenderPreset)
+class RenderPresetAdmin(admin.ModelAdmin):
+    """Presets are created by the marketing form's "Save as preset" button; this
+    page is for renaming, deleting, and reading back exactly what a look is."""
+
+    list_display = ["name", "summary", "updated_at"]
+    search_fields = ["name"]
+    readonly_fields = ["created_at", "updated_at"]
+    ordering = ["name"]
+
+    @admin.display(description="look")
+    def summary(self, obj):
+        return obj.summary()
 
 
 @admin.register(FrameExtractionJob)
@@ -810,7 +1018,7 @@ class FrameExtractionJobAdmin(admin.ModelAdmin):
 class InferenceJobAdmin(admin.ModelAdmin):
     """Read-only log of "Run model inference…" runs — rows are only created by the action."""
 
-    list_display = ["video", "model_display", "pipeline", "status_badge",
+    list_display = ["video", "model_display", "pipeline", "look", "status_badge",
                      "frames_processed", "play_link", "created_at"]
     list_filter = ["status", "model_source", "pipeline", "trained_model"]
     search_fields = ["video__name", "trained_model__name", "artifact_path",
@@ -857,6 +1065,25 @@ class InferenceJobAdmin(admin.ModelAdmin):
         url = reverse("admin:training_trainedmodel_change", args=[obj.trained_model_id])
         return format_html('<a href="{}">{}</a>', url, obj.trained_model.name)
 
+    @admin.display(description="look")
+    def look(self, obj):
+        """Which of the two overlays this row was rendered with, and the couple of
+        style choices that actually change what the clip looks like from across
+        the room — enough to tell two marketing renders of the same clip apart in
+        the list, with the full style dict on the row's own page."""
+        if not obj.render_style:
+            return format_html('<span style="color:#9ca3af">plain</span>')
+        style = render_style.normalize(obj.render_style)
+        # The relabel earns its place here: it is the one style choice that changes
+        # what the clip *says* rather than how it looks, so a row rendered with one
+        # should never be mistaken for the model's own labels.
+        forced = style["force_class"]
+        return format_html(
+            '<span title="{}">🎬 {} · {}{}</span>',
+            "marketing render", style["box_style"], style["palette"],
+            f" · all “{forced}”" if forced else "",
+        )
+
     @admin.display(description="")
     def play_link(self, obj):
         if not obj.output_exists():
@@ -892,27 +1119,4 @@ class InferenceJobAdmin(admin.ModelAdmin):
         job = InferenceJob.objects.filter(pk=request.GET.get("job")).first()
         if job is None or not job.output_exists():
             raise Http404("inference output not found")
-        path = job.output_path()
-        size = path.stat().st_size
-        content_type = "video/mp4"
-
-        range_header = request.headers.get("Range", "")
-        match = re.match(r"bytes=(\d+)-(\d*)", range_header.strip())
-        if not match:
-            resp = FileResponse(open(path, "rb"), content_type=content_type)
-            resp["Accept-Ranges"] = "bytes"
-            return resp
-
-        start = int(match.group(1))
-        end = int(match.group(2)) if match.group(2) else size - 1
-        end = min(end, size - 1)
-        start = min(start, end)
-        length = end - start + 1
-
-        resp = StreamingHttpResponse(
-            _file_chunks(path, start, length), status=206, content_type=content_type
-        )
-        resp["Content-Length"] = str(length)
-        resp["Content-Range"] = f"bytes {start}-{end}/{size}"
-        resp["Accept-Ranges"] = "bytes"
-        return resp
+        return streaming.serve(request, job.output_path())

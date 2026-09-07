@@ -110,7 +110,18 @@ def test_signatures_stay_in_step():
     ] == [(p.name, p.kind, p.default) for p in torch_sig.parameters.values()]
 
 
-@pytest.mark.parametrize("arch", sorted(ARCH_REGISTRY))
+# Archs deliberately left on the numpy fallback, with the reason. Everything else
+# must have a torch twin — see the test below.
+#
+#   rtmo — its handler turns each person's 17 keypoints into ONE posture label
+#   through a chain of python-level angle comparisons, per detection. That is a
+#   loop over a handful of scalars: on the GPU every comparison is a separate
+#   sync, so a torch twin would be slower than the ``.cpu()`` copy of the two
+#   already-NMS'd output tensors (a few KB) that the fallback pays once.
+NUMPY_PATH_ARCHS = {"rtmo"}
+
+
+@pytest.mark.parametrize("arch", sorted(set(ARCH_REGISTRY) - NUMPY_PATH_ARCHS))
 def test_every_registered_arch_has_a_torch_twin(arch):
     """Adding a non-passthrough arch should fail here, not silently take the slow path."""
     adapted = adapt_outputs_torch(
@@ -121,6 +132,13 @@ def test_every_registered_arch_has_a_torch_twin(arch):
     boxes, scores, labels = adapted
     assert boxes.shape == (4, 4) and scores.shape == (4,) and labels.shape == (4,)
     assert labels.dtype == torch.int64
+
+
+@pytest.mark.parametrize("arch", sorted(NUMPY_PATH_ARCHS))
+def test_numpy_path_archs_actually_decline(arch):
+    """The exemptions above must be real: a handler that *does* have a twin must
+    not sit in :data:`NUMPY_PATH_ARCHS` collecting a slow path it doesn't need."""
+    assert adapt_outputs_torch(get_handler(arch), [None, None]) is None
 
 
 def test_declines_a_handler_that_overrides_adapt_outputs():

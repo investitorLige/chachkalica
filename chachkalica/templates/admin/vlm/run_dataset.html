@@ -1,0 +1,107 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>Ask <strong>{{ model.name }}</strong> its prompt about every image of a dataset.
+  Nothing is written to the dataset — the answers land on a run of their own.</p>
+
+{% if not weights_cached %}
+  <p class="errornote">{{ model.weights }} is not in <code>data/hf_cache</code>, so this
+    model cannot load on this network. Copy its snapshot in first (see
+    <code>manage.py fetch_vlm_weights</code>).</p>
+{% endif %}
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action_name }}">
+
+  <div class="form-row">
+    <label>Prompt:</label>
+    <pre style="white-space:pre-wrap;background:#f8f8f8;border:1px solid #ddd;
+                border-radius:4px;padding:8px;max-width:640px;margin:0">{{ model.prompt }}</pre>
+    <p class="help">The prompt travels with the model — edit it on the model's own page.
+      A run records the prompt it actually used.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="id_dataset">Dataset:</label>
+    <select name="dataset" id="id_dataset">
+      {% for option in options %}
+        <option value="{{ option.dataset.pk }}"
+                {% if option.dataset.pk == selected_dataset_id %}selected{% endif %}
+                data-has-labels="{% if option.has_labels %}1{% else %}0{% endif %}">
+          {{ option.dataset.name }}{% if not option.has_labels %} — no labels/ folder{% endif %}
+        </option>
+      {% endfor %}
+    </select>
+    <p class="help">Images come from <code>source/&lt;name&gt;/</code> (or its
+      <code>images/</code> subfolder), labels from <code>source/&lt;name&gt;/labels/</code>.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="id_image_limit">Images:</label>
+    <input type="number" name="image_limit" id="id_image_limit"
+           value="{{ image_limit }}" min="0" step="1" style="width:8em">
+    <p class="help">0 runs the whole dataset. A cap takes an evenly spaced subset, so a
+      small number still spans the dataset instead of grabbing its first N files.
+      One answer costs about a second of GPU, so 10 000 images is hours.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="id_grade" style="display:inline">
+      <input type="checkbox" name="grade" id="id_grade" {% if grade %}checked{% endif %}>
+      Grade against the dataset's labels
+    </label>
+    <p class="help">Compares every answer against that image's YOLO label file: the
+      classes the file annotates are looked for in the answer, and an image counts as a
+      success when the answer names exactly those classes and no others. Needs a
+      <code>labels/</code> folder and a <code>classes.txt</code>.</p>
+    <p class="help" id="grade-warning" hidden style="color:#ba2121">
+      The selected dataset has no <code>labels/</code> folder — there is nothing to grade
+      against. Run it ungraded, or label it first.
+    </p>
+  </div>
+
+  <div class="form-row" id="negation-row">
+    <label for="id_negation_aware" style="display:inline">
+      <input type="checkbox" name="negation_aware" id="id_negation_aware"
+             {% if negation_aware %}checked{% endif %}>
+      Read negated mentions as absent
+    </label>
+    <p class="help">“No helmet is being worn” contains the word <em>helmet</em>. With this
+      on, a mention preceded by a negation in the same clause counts as the model saying
+      the class is <em>not</em> there — without it, question-shaped prompts score
+      inverted. It is a heuristic; the report can re-grade with it off to see what it
+      changed.</p>
+  </div>
+
+  <div class="submit-row">
+    <input type="submit" name="apply" class="default" value="Run">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+
+<script>
+  (function () {
+    var select = document.getElementById("id_dataset");
+    var grade = document.getElementById("id_grade");
+    var warning = document.getElementById("grade-warning");
+    var negationRow = document.getElementById("negation-row");
+
+    function sync() {
+      var option = select.options[select.selectedIndex];
+      var hasLabels = option && option.dataset.hasLabels === "1";
+      // Left enabled deliberately: the server re-checks disk, and a disabled
+      // control that silently drops the operator's intent is worse than an
+      // error that says why.
+      warning.hidden = !(grade.checked && !hasLabels);
+      negationRow.hidden = !grade.checked;
+    }
+    select.addEventListener("change", sync);
+    grade.addEventListener("change", sync);
+    sync();
+  })();
+</script>
+{% endblock %}
