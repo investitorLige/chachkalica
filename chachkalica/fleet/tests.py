@@ -1,11 +1,16 @@
+import json
 import tempfile
 from pathlib import Path
 from unittest import mock
+
+import cv2
+import numpy as np
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
 
+from fleet import jobs
 from fleet.models import Annotator, Dataset, FleetSettings, Project
 from fleet.reconcile import txt_format
 from fleet.services import analytics as analytics_svc
@@ -633,6 +638,438 @@ class IntraDatasetDuplicatesTests(TestCase):
         self.assertEqual(result["backup_dir"], "")
         self.assertTrue((self.src / "clean" / "a.jpg").exists())
         self.assertTrue((self.src / "clean" / "b.jpg").exists())
+
+
+class CrossDatasetOverlapsTests(TestCase):
+    """The overlap report's grouping + the per-copy prune it feeds."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = Path(self.tmp.name)
+        fs = FleetSettings.load()
+        fs.source_dir = str(self.src)
+        fs.save()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _dataset(self, name: str) -> Dataset:
+        (self.src / name).mkdir(parents=True)
+        return Dataset.objects.create(name=name, storage_type=Dataset.LOCAL)
+
+    @staticmethod
+    def _photo(seed: int):
+        """A textured image, so its dhash has real structure to compare.
+
+        A flat or purely linear gradient hashes to a degenerate value that
+        collides with any other such image, which would make a near-duplicate
+        test pass for the wrong reason.
+        """
+        rng = np.random.default_rng(seed)
+        noise = rng.integers(0, 255, size=(40, 40), dtype=np.uint8)
+        big = cv2.resize(noise, (320, 320), interpolation=cv2.INTER_CUBIC)
+        return cv2.GaussianBlur(big, (9, 9), 0)
+
+    def _write(self, dataset: Dataset, filename: str, image, *, size=None, quality=95) -> Path:
+        """Write ``image`` into a dataset, optionally resized/re-compressed."""
+        if size is not None:
+            image = cv2.resize(image, size, interpolation=cv2.INTER_AREA)
+        path = self.src / dataset.name / filename
+        cv2.imwrite(str(path), image, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        return path
+
+    def _label(self, dataset: Dataset, stem: str, content: str = "0 0.5 0.5 0.2 0.2\n") -> Path:
+        labels_dir = self.src / dataset.name / "labels"
+        labels_dir.mkdir(exist_ok=True)
+        path = labels_dir / f"{stem}.txt"
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    # ------------------------------------------------------------- grouping
+    def test_byte_identical_copies_become_one_group(self):
+        left, right = self._dataset("left"), self._dataset("right")
+        shared = self._photo(1)
+        self._write(left, "a.jpg", shared)
+        (self.src / "right" / "b.jpg").write_bytes((self.src / "left" / "a.jpg").read_bytes())
+        self._write(left, "only_left.jpg", self._photo(2))
+        self._write(right, "only_right.jpg", self._photo(3))
+
+        grouped = overlap_svc.group_overlaps([left, right])
+
+        self.assertEqual(grouped["group_count"], 1)
+        self.assertEqual(grouped["exact_group_count"], 1)
+        group = grouped["groups"][0]
+        self.assertEqual(group["kind"], "exact")
+        self.assertEqual([item["name"] for item in group["items"]], ["a.jpg", "b.jpg"])
+        self.assertEqual([item["dataset"].name for item in group["items"]], ["left", "right"])
+        # One survivor per group, so one copy would be deleted.
+        self.assertEqual(grouped["extra_count"], 1)
+        self.assertEqual(
+            [(row["dataset"].name, row["image_count"], row["overlapping"])
+             for row in grouped["per_dataset"]],
+            [("left", 2, 1), ("right", 2, 1)],
+        )
+
+    def test_tokens_identify_a_copy_by_dataset_and_filename(self):
+        left, right = self._dataset("left"), self._dataset("right")
+        self._write(left, "a.jpg", self._photo(4))
+        (self.src / "right" / "a.jpg").write_bytes((self.src / "left" / "a.jpg").read_bytes())
+
+        group = overlap_svc.group_overlaps([left, right])["groups"][0]
+
+        self.assertEqual([item["token"] for item in group["items"]],
+                         [f"{left.pk}:a.jpg", f"{right.pk}:a.jpg"])
+
+    def test_re_encoded_copy_groups_as_near_not_exact(self):
+        left, right = self._dataset("left"), self._dataset("right")
+        photo = self._photo(5)
+        self._write(left, "original.jpg", photo)
+        self._write(right, "resized.jpg", photo, size=(160, 160), quality=60)
+
+        grouped = overlap_svc.group_overlaps([left, right])
+
+        self.assertEqual(grouped["group_count"], 1)
+        self.assertEqual(grouped["near_group_count"], 1)
+        self.assertEqual(grouped["groups"][0]["kind"], "near")
+        self.assertEqual([item["name"] for item in grouped["groups"][0]["items"]],
+                         ["original.jpg", "resized.jpg"])
+
+    def test_duplicates_inside_one_dataset_are_not_an_overlap(self):
+        left, right = self._dataset("left"), self._dataset("right")
+        self._write(left, "a.jpg", self._photo(6))
+        (self.src / "left" / "a_copy.jpg").write_bytes((self.src / "left" / "a.jpg").read_bytes())
+        self._write(right, "unrelated.jpg", self._photo(7))
+
+        grouped = overlap_svc.group_overlaps([left, right])
+
+        # That pair is check_duplicate_images' business, not this action's.
+        self.assertEqual(grouped["groups"], [])
+
+    def test_an_intra_copy_joins_the_group_when_it_also_matches_across(self):
+        left, right = self._dataset("left"), self._dataset("right")
+        shared = self._photo(8)
+        self._write(left, "a.jpg", shared)
+        (self.src / "left" / "a_copy.jpg").write_bytes((self.src / "left" / "a.jpg").read_bytes())
+        (self.src / "right" / "b.jpg").write_bytes((self.src / "left" / "a.jpg").read_bytes())
+
+        grouped = overlap_svc.group_overlaps([left, right])
+
+        self.assertEqual(grouped["group_count"], 1)
+        self.assertEqual([item["name"] for item in grouped["groups"][0]["items"]],
+                         ["a.jpg", "a_copy.jpg", "b.jpg"])
+
+    def test_one_picture_matching_several_copies_is_a_single_group(self):
+        # The reason the prune UI groups instead of listing pairs: this is three
+        # pair rows but one decision.
+        left, right = self._dataset("left"), self._dataset("right")
+        photo = self._photo(9)
+        self._write(left, "a.jpg", photo)
+        self._write(right, "b1.jpg", photo, size=(200, 200), quality=70)
+        self._write(right, "b2.jpg", photo, size=(240, 240), quality=55)
+
+        pairs = overlap_svc.find_overlaps([left, right])
+        grouped = overlap_svc.group_overlaps([left, right])
+
+        self.assertEqual(len(pairs[0]["matches"]), 2)
+        self.assertEqual(grouped["group_count"], 1)
+        self.assertEqual(len(grouped["groups"][0]["items"]), 3)
+
+    def test_grouping_spans_three_datasets(self):
+        one, two, three = self._dataset("one"), self._dataset("two"), self._dataset("three")
+        shared = self._photo(10)
+        self._write(one, "x.jpg", shared)
+        for dataset in (two, three):
+            (self.src / dataset.name / "x.jpg").write_bytes((self.src / "one" / "x.jpg").read_bytes())
+
+        grouped = overlap_svc.group_overlaps([one, three, two])  # admin order: by name
+
+        self.assertEqual(grouped["group_count"], 1)
+        self.assertEqual([item["dataset"].name for item in grouped["groups"][0]["items"]],
+                         ["one", "three", "two"])
+
+    def test_shared_fingerprints_are_hashed_once_for_both_views(self):
+        left, right = self._dataset("left"), self._dataset("right")
+        self._write(left, "a.jpg", self._photo(11))
+        self._write(right, "b.jpg", self._photo(12))
+
+        prints = {left.pk: overlap_svc.fingerprint_dataset(left),
+                  right.pk: overlap_svc.fingerprint_dataset(right)}
+        with mock.patch.object(overlap_svc, "fingerprint_dataset") as fingerprint:
+            overlap_svc.find_overlaps([left, right], prints)
+            overlap_svc.group_overlaps([left, right], prints)
+
+        fingerprint.assert_not_called()
+
+    # ---------------------------------------------------------------- prune
+    def test_prune_paths_deletes_named_copies_with_labels_and_backup(self):
+        left, right = self._dataset("left"), self._dataset("right")
+        self._write(left, "keep.jpg", self._photo(13))
+        self._write(right, "drop.jpg", self._photo(14))
+        self._label(right, "drop")
+
+        result = overlap_svc.prune_paths([(right, ["drop.jpg"])])
+
+        self.assertEqual(result["deleted_images"], 1)
+        self.assertEqual(result["deleted_labels"], 1)
+        self.assertEqual(result["skipped"], 0)
+        self.assertFalse((self.src / "right" / "drop.jpg").exists())
+        self.assertFalse((self.src / "right" / "labels" / "drop.txt").exists())
+        self.assertTrue((self.src / "left" / "keep.jpg").exists())
+        backup = Path(result["backup_dir"])
+        self.assertTrue((backup / "right" / "drop.jpg").exists())
+        self.assertTrue((backup / "right" / "labels" / "drop.txt").exists())
+
+    def test_prune_paths_skips_names_it_cannot_resolve(self):
+        left = self._dataset("left")
+        self._write(left, "a.jpg", self._photo(15))
+        outside = self.src / "secret.jpg"
+        outside.write_bytes(b"not part of any dataset")
+
+        result = overlap_svc.prune_paths([(left, [
+            "missing.jpg",          # never existed
+            "../secret.jpg",        # traversal
+            "/etc/passwd",          # absolute
+            "labels",               # not an image file
+        ])])
+
+        self.assertEqual(result["deleted_images"], 0)
+        self.assertEqual(result["skipped"], 4)
+        self.assertEqual(result["backup_dir"], "")
+        self.assertTrue(outside.exists())
+        self.assertTrue((self.src / "left" / "a.jpg").exists())
+
+    def test_prune_paths_deletes_a_repeated_name_once(self):
+        left = self._dataset("left")
+        self._write(left, "a.jpg", self._photo(16))
+
+        result = overlap_svc.prune_paths([(left, ["a.jpg", "a.jpg"])])
+
+        self.assertEqual(result["deleted_images"], 1)
+        self.assertEqual(result["skipped"], 0)
+
+    # ---------------------------------------------------------------- admin
+    def _login_admin(self):
+        User = get_user_model()
+        User.objects.create_superuser(username="admin", email="admin@example.com", password="pw")
+        self.client.login(username="admin", password="pw")
+
+    def _overlapping_pair(self, seed=20):
+        left, right = self._dataset("left"), self._dataset("right")
+        self._write(left, "a.jpg", self._photo(seed))
+        (self.src / "right" / "b.jpg").write_bytes((self.src / "left" / "a.jpg").read_bytes())
+        return left, right
+
+    def _check(self, datasets, **extra):
+        return self.client.post(reverse("admin:fleet_dataset_changelist"), {
+            "action": "check_overlapping_images",
+            "index": "0",
+            "_selected_action": [str(d.pk) for d in datasets],
+            **extra,
+        })
+
+    @staticmethod
+    def _selection(*groups):
+        """The single field the resolve form's script posts back."""
+        return json.dumps({"groups": [
+            {"kind": kind, "tokens": tokens, "delete": deleting}
+            for kind, tokens, deleting in groups
+        ]})
+
+    def test_action_reports_pairs_and_groups(self):
+        left, right = self._overlapping_pair()
+        self._login_admin()
+
+        response = self._check([left, right])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.context["reports"]), 1)
+        grouped = response.context["grouped"]
+        self.assertEqual(grouped["group_count"], 1)
+        resolve = response.context["resolve_groups"]
+        self.assertEqual(resolve[0]["number"], 1)
+        self.assertEqual([item["token"] for item in resolve[0]["items"]],
+                         [f"{left.pk}:a.jpg", f"{right.pk}:b.jpg"])
+        self.assertEqual(response.context["hidden_group_count"], 0)
+
+    def test_report_page_renders_every_template_tag(self):
+        # Django strips a {# #} comment only when it is on one line; a multi-line
+        # one renders verbatim into the page, which is how two of them shipped
+        # into this template's first draft.
+        left, right = self._overlapping_pair()
+        self._login_admin()
+
+        html = self._check([left, right]).content.decode()
+
+        self.assertNotIn("{#", html)
+        self.assertNotIn("{%", html)
+
+    def test_action_offers_groups_for_three_datasets(self):
+        # Used to hide the prune form entirely past two selections.
+        left, right = self._overlapping_pair()
+        third = self._dataset("third")
+        (self.src / "third" / "c.jpg").write_bytes((self.src / "left" / "a.jpg").read_bytes())
+        self._login_admin()
+
+        response = self._check([left, right, third])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.context["reports"]), 3)  # every pair
+        self.assertEqual(response.context["grouped"]["group_count"], 1)
+        self.assertEqual(len(response.context["resolve_groups"][0]["items"]), 3)
+
+    def test_apply_enqueues_only_the_copies_marked_delete(self):
+        left, right = self._overlapping_pair()
+        self._login_admin()
+        selection = self._selection(
+            ("exact", [f"{left.pk}:a.jpg", f"{right.pk}:b.jpg"], [f"{right.pk}:b.jpg"]))
+
+        with mock.patch("fleet.admin._queue") as queue:
+            response = self._check([left, right], **{"apply": "1", "selection": selection})
+
+        self.assertEqual(response.status_code, 302)
+        enqueued = queue.return_value.enqueue.call_args_list
+        self.assertEqual(len(enqueued), 1)
+        self.assertEqual(enqueued[0].args[1], {right.pk: ["b.jpg"]})
+
+    def test_apply_refuses_a_group_with_no_copy_kept(self):
+        left, right = self._overlapping_pair()
+        self._login_admin()
+        tokens = [f"{left.pk}:a.jpg", f"{right.pk}:b.jpg"]
+        selection = self._selection(("exact", tokens, tokens))
+
+        with mock.patch("fleet.admin._queue") as queue:
+            self._check([left, right], **{"apply": "1", "selection": selection})
+
+        queue.return_value.enqueue.assert_not_called()
+        self.assertTrue((self.src / "left" / "a.jpg").exists())
+        self.assertTrue((self.src / "right" / "b.jpg").exists())
+
+    def test_apply_with_nothing_marked_enqueues_nothing(self):
+        left, right = self._overlapping_pair()
+        self._login_admin()
+        selection = self._selection(
+            ("exact", [f"{left.pk}:a.jpg", f"{right.pk}:b.jpg"], []))
+
+        with mock.patch("fleet.admin._queue") as queue:
+            self._check([left, right], **{"apply": "1", "selection": selection})
+
+        queue.return_value.enqueue.assert_not_called()
+
+    def test_apply_ignores_a_token_that_is_not_in_its_own_group(self):
+        # The delete list is intersected with the group's own tokens, so a
+        # tampered field can't smuggle in a copy that was never on screen.
+        left, right = self._overlapping_pair()
+        self._login_admin()
+        selection = self._selection(
+            ("exact", [f"{left.pk}:a.jpg", f"{right.pk}:b.jpg"],
+             [f"{right.pk}:b.jpg", f"{left.pk}:elsewhere.jpg"]))
+
+        with mock.patch("fleet.admin._queue") as queue:
+            self._check([left, right], **{"apply": "1", "selection": selection})
+
+        self.assertEqual(queue.return_value.enqueue.call_args_list[0].args[1],
+                         {right.pk: ["b.jpg"]})
+
+    def test_apply_with_a_malformed_selection_prunes_nothing(self):
+        left, right = self._overlapping_pair()
+        self._login_admin()
+
+        with mock.patch("fleet.admin._queue") as queue:
+            self._check([left, right], **{"apply": "1", "selection": "not json"})
+
+        queue.return_value.enqueue.assert_not_called()
+
+    def test_action_refuses_two_rows_sharing_one_folder(self):
+        # Dataset.name isn't unique across admin sections; two such rows are the
+        # same files, so pruning "one of them" would gut the other.
+        left = self._dataset("shared")
+        twin = Dataset.objects.create(name="shared", storage_type=Dataset.LOCAL)
+        self._write(left, "a.jpg", self._photo(21))
+        self._login_admin()
+
+        response = self._check([left, twin])
+
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue((self.src / "shared" / "a.jpg").exists())
+
+    def test_action_reports_a_missing_dataset_folder_instead_of_erroring(self):
+        left, right = self._overlapping_pair()
+        (self.src / "right" / "b.jpg").unlink()
+        (self.src / "right").rmdir()
+        self._login_admin()
+
+        response = self._check([left, right])
+
+        self.assertEqual(response.status_code, 302)  # message + back to changelist
+
+    def test_prune_job_deletes_the_selected_copies(self):
+        left, right = self._overlapping_pair()
+
+        result = jobs.prune_overlap_selection({right.pk: ["b.jpg"]})
+
+        self.assertEqual(result["deleted_images"], 1)
+        self.assertFalse((self.src / "right" / "b.jpg").exists())
+        self.assertTrue((self.src / "left" / "a.jpg").exists())
+
+    def test_prune_job_ignores_a_dataset_deleted_since_the_report(self):
+        left, right = self._overlapping_pair()
+        stale_pk = right.pk
+        right.delete()
+
+        result = jobs.prune_overlap_selection({stale_pk: ["b.jpg"]})
+
+        self.assertEqual(result["deleted_images"], 0)
+        self.assertTrue((self.src / "right" / "b.jpg").exists())
+
+    # ------------------------------------------------------ preview + images
+    def test_overlap_image_serves_the_file_and_a_thumbnail(self):
+        left, _ = self._overlapping_pair()
+        self._login_admin()
+        url = reverse("admin:fleet_dataset_overlap_image")
+
+        full = self.client.get(url, {"dataset": left.pk, "name": "a.jpg"})
+        thumb = self.client.get(url, {"dataset": left.pk, "name": "a.jpg", "w": "64"})
+
+        self.assertEqual(full.status_code, 200)
+        self.assertEqual(thumb.status_code, 200)
+        self.assertEqual(thumb["Content-Type"], "image/jpeg")
+        decoded = cv2.imdecode(np.frombuffer(thumb.content, np.uint8), cv2.IMREAD_COLOR)
+        self.assertEqual(decoded.shape[1], 64)
+
+    def test_overlap_image_rejects_a_name_outside_the_dataset(self):
+        left, _ = self._overlapping_pair()
+        (self.src / "secret.jpg").write_bytes(b"not part of any dataset")
+        self._login_admin()
+        url = reverse("admin:fleet_dataset_overlap_image")
+
+        for name in ("../secret.jpg", "/etc/passwd", "nope.jpg", ""):
+            self.assertEqual(
+                self.client.get(url, {"dataset": left.pk, "name": name}).status_code, 404,
+                msg=name)
+
+    def test_preview_renders_the_groups_it_is_posted(self):
+        left, right = self._overlapping_pair()
+        self._login_admin()
+        selection = self._selection(
+            ("exact", [f"{left.pk}:a.jpg", f"{right.pk}:b.jpg"], [f"{right.pk}:b.jpg"]))
+
+        response = self.client.post(reverse("admin:fleet_dataset_overlap_preview"),
+                                    {"selection": selection})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["group_count"], 1)
+        self.assertEqual(
+            response.context["groups_payload"][0]["copies"],
+            [{"dataset": left.pk, "dataset_name": "left", "name": "a.jpg"},
+             {"dataset": right.pk, "dataset_name": "right", "name": "b.jpg"}],
+        )
+
+    def test_preview_is_not_reachable_by_get(self):
+        self._login_admin()
+
+        response = self.client.get(reverse("admin:fleet_dataset_overlap_preview"))
+
+        self.assertEqual(response.status_code, 404)
 
 
 class DataQualitySolveTests(TestCase):

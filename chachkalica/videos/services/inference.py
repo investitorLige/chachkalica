@@ -81,20 +81,29 @@ def _color_for_class(class_name: str):
     return _CLASS_COLOR_PALETTE[digest[0] % len(_CLASS_COLOR_PALETTE)]
 
 
-def output_dir() -> Path:
-    d = videos_root() / "inferred"
+def output_dir(root: Path | None = None) -> Path:
+    """Where a job's rendered artifacts go: ``<root>/inferred``.
+
+    ``root`` defaults to the videos root, which is every caller in this app. It
+    is a parameter because the Marketing Studio section keeps its own video
+    library and reuses this whole module over its own directory — and the two
+    must not share one output folder: :func:`unique_output_filename` only sees
+    the directory it is given, and :func:`run_inference_on_video`'s scratch frame
+    is named after the job's pk, which collides across two tables.
+    """
+    d = (root or videos_root()) / "inferred"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def unique_output_filename(video_name: str) -> str:
+def unique_output_filename(video_name: str, root: Path | None = None) -> str:
     """An ``<stem>_inferred.mp4`` filename under :func:`output_dir` that collides
     with nothing already there — used to prefill/compute the output path up
     front, before the job runs."""
     stem = re.sub(r"[^A-Za-z0-9._-]", "_", (video_name or "").strip()) or "video"
     if not _NAME_RE.match(stem):
         stem = "video"
-    d = output_dir()
+    d = output_dir(root)
     candidate = f"{stem}_inferred.mp4"
     n = 2
     while (d / candidate).exists():
@@ -188,7 +197,7 @@ def build_predict_payload(job) -> dict:
         raise RuntimeError(str(exc)) from exc
 
 
-def run_inference_on_video(job) -> dict:
+def run_inference_on_video(job, *, root: Path | None = None) -> dict:
     """Run ``job``'s model over ``job.video`` frame-by-frame, writing the annotated
     result to ``output_dir() / job.output_filename``.
 
@@ -209,8 +218,9 @@ def run_inference_on_video(job) -> dict:
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
 
-    output_path = output_dir() / job.output_filename
-    tmp_frame_path = output_dir() / f".{job.pk}_frame.jpg"
+    out = output_dir(root)
+    output_path = out / job.output_filename
+    tmp_frame_path = out / f".{job.pk}_frame.jpg"
 
     fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -321,8 +331,8 @@ _PREVIEW_CACHE_ENTRIES = 200
 _PREVIEW_MAX_HEIGHT = 1080
 
 
-def _preview_cache_dir() -> Path:
-    d = output_dir() / ".preview_cache"
+def _preview_cache_dir(root: Path | None = None) -> Path:
+    d = output_dir(root) / ".preview_cache"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -343,13 +353,14 @@ def _preview_cache_key(payload: dict, video_path: Path, frame_index: int) -> str
     return hashlib.sha256(material.encode()).hexdigest()[:32]
 
 
-def _prune_preview_cache() -> None:
-    entries = sorted(_preview_cache_dir().glob("*.json"), key=lambda p: p.stat().st_mtime)
+def _prune_preview_cache(root: Path | None = None) -> None:
+    entries = sorted(_preview_cache_dir(root).glob("*.json"), key=lambda p: p.stat().st_mtime)
     for path in entries[:-_PREVIEW_CACHE_ENTRIES]:
         path.unlink(missing_ok=True)
 
 
-def preview_frame(job, position: float = 0.5, *, use_cache: bool = True) -> dict:
+def preview_frame(job, position: float = 0.5, *, use_cache: bool = True,
+                  root: Path | None = None) -> dict:
     """Render one frame of ``job``'s video the way the finished video will look.
 
     The feedback loop the marketing action is built around: thirty style knobs
@@ -400,7 +411,7 @@ def preview_frame(job, position: float = 0.5, *, use_cache: bool = True) -> dict
     finally:
         capture.release()
 
-    cache_path = _preview_cache_dir() / f"{_preview_cache_key(payload, video_path, frame_index)}.json"
+    cache_path = _preview_cache_dir(root) / f"{_preview_cache_key(payload, video_path, frame_index)}.json"
     boxes, cached = None, False
     if use_cache and cache_path.is_file():
         try:
@@ -409,7 +420,7 @@ def preview_frame(job, position: float = 0.5, *, use_cache: bool = True) -> dict
         except (OSError, json.JSONDecodeError):
             boxes = None
     if boxes is None:
-        tmp_frame_path = _preview_cache_dir() / f".preview_{cache_path.stem}.jpg"
+        tmp_frame_path = _preview_cache_dir(root) / f".preview_{cache_path.stem}.jpg"
         try:
             cv2.imwrite(str(tmp_frame_path), frame)
             response = runner.predict_image({**payload, "image_path": str(tmp_frame_path)})
@@ -417,7 +428,7 @@ def preview_frame(job, position: float = 0.5, *, use_cache: bool = True) -> dict
             tmp_frame_path.unlink(missing_ok=True)
         boxes = response.get("boxes", [])
         cache_path.write_text(json.dumps(boxes))
-        _prune_preview_cache()
+        _prune_preview_cache(root)
 
     height, width = frame.shape[:2]
     encode = render_style.encode_options(job.render_style)

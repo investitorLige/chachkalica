@@ -12,8 +12,27 @@
   .ov-kind-exact { color: #34d399; }
   .ov-kind-near { color: #e6c07a; }
   .ov-note { color: #9bb7a6; font-size: 12px; margin-top: 6px; }
-  .ov-prune { margin-top: 24px; border-top: 1px solid #1d2a20; padding-top: 16px; }
-  .ov-prune label { display: block; margin: 4px 0; }
+  .ov-resolve { margin-top: 28px; border-top: 1px solid #1d2a20; padding-top: 16px; }
+  .ov-bar { position: sticky; top: 0; z-index: 5; background: #0f1a12; border: 1px solid #1d2a20;
+            border-radius: 8px; padding: 10px 14px; margin-bottom: 14px;
+            display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .ov-bar .ov-count { margin-left: auto; color: #9bb7a6; font-size: 13px; }
+  .ov-bar .ov-count strong { color: #34d399; }
+  .ov-bar .ov-count strong.ov-warn { color: #e6c07a; }
+  .ov-card { border: 1px solid #1d2a20; border-radius: 8px; padding: 10px 12px; margin: 10px 0;
+             background: #0f1a12; }
+  .ov-card.ov-card-bad { border-color: #ba2121; }
+  .ov-card > h3 { margin: 0 0 8px; font-size: 12px; font-weight: 600; color: #9bb7a6;
+                  text-transform: uppercase; letter-spacing: .04em; }
+  .ov-copies { display: flex; gap: 14px; flex-wrap: wrap; }
+  .ov-copy { width: 220px; }
+  .ov-copy img { display: block; width: 220px; height: 150px; object-fit: contain;
+                 background: #060b07; border: 1px solid #1d2a20; border-radius: 4px; }
+  .ov-copy.ov-del img { opacity: .35; border-color: #ba2121; }
+  .ov-copy .ov-ds { font-size: 12px; color: #34d399; margin: 4px 0 0; }
+  .ov-copy .ov-file { font-size: 11px; color: #9bb7a6; word-break: break-all; margin: 0 0 4px; }
+  .ov-copy .ov-dec label { display: inline-block; margin-right: 10px; font-size: 12px; }
+  .ov-empty { color: #9bb7a6; font-size: 12px; }
 </style>
 {% endblock %}
 
@@ -62,37 +81,213 @@
   </div>
 {% endfor %}
 
-{% if can_prune %}
-  {% with left=datasets.0 right=datasets.1 report=reports.0 %}
-  <div class="ov-prune">
-    {% if report.matches %}
-    <p>
-      Prune the {{ report.matches|length }} overlapping image{{ report.matches|length|pluralize }} found above.
-      Deleted images and their label files are backed up first (under
-      <code>.overlap_prune_backups/</code> in the source root) before removal.
-    </p>
-    <form action="" method="post">
-      {% csrf_token %}
-      {% for pk in selected %}
-        <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+<div class="ov-resolve">
+  <h1 style="font-size:18px;margin:0 0 6px">Resolve duplicates</h1>
+  <p class="ov-note" style="margin-bottom:12px">
+    The pairs above, regrouped into one card per picture listing every copy of it —
+    a near-duplicate matching several images on the other side is one card, not
+    several rows. Exactly one copy per card survives; everything marked
+    <em>delete</em> is copied into <code>.overlap_prune_backups/</code> under the
+    source root before removal, so a wrong call can be undone by hand.
+  </p>
+
+  {% if grouped.groups %}
+  <form action="" method="post" id="ov-form">
+    {% csrf_token %}
+    {% for pk in selected %}
+      <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+    {% endfor %}
+    <input type="hidden" name="action" value="{{ action }}">
+    <input type="hidden" name="apply" value="1">
+    {% comment %}
+      Every card's membership and keep/delete choice, assembled here on submit.
+      One field, not a radio pair per copy: that shape trips Django's 1000-field
+      DATA_UPLOAD_MAX_NUMBER_FIELDS at a couple of hundred groups.
+    {% endcomment %}
+    <input type="hidden" name="selection" id="ov-selection">
+
+    <div class="ov-bar">
+      {% for row in grouped.per_dataset %}
+        <button type="button" class="button ov-keep-all" data-ds="{{ row.dataset.pk }}">
+          Keep all from {{ row.dataset.name }}
+        </button>
       {% endfor %}
-      <input type="hidden" name="action" value="{{ action }}">
-      <input type="hidden" name="apply" value="1">
-      <p>
-        <label><input type="checkbox" name="prune_left" value="1"> Prune duplicates from <strong>{{ left.name }}</strong></label>
-        <label><input type="checkbox" name="prune_right" value="1"> Prune duplicates from <strong>{{ right.name }}</strong></label>
+      <button type="button" class="button" id="ov-skip-all">Keep everything</button>
+      <button type="submit" class="button" id="ov-preview"
+              formaction="{{ preview_url }}" formtarget="_blank">Preview in viewer ↗</button>
+      <span class="ov-count" id="ov-count"></span>
+    </div>
+
+    <div class="ov-stats" style="margin-bottom:10px">
+      <strong>{{ grouped.group_count }}</strong> duplicate group{{ grouped.group_count|pluralize }}
+      ({{ grouped.exact_group_count }} exact, {{ grouped.near_group_count }} near) ·
+      <strong>{{ grouped.copy_count }}</strong> copies ·
+      keeping one per group would delete <strong>{{ grouped.extra_count }}</strong>
+      {% for row in grouped.per_dataset %} · {{ row.dataset.name }}:
+        <strong>{{ row.overlapping }}</strong>/{{ row.image_count }} overlapping{% endfor %}
+    </div>
+
+    {% if hidden_group_count %}
+      <p class="ov-note" style="margin-bottom:10px">
+        Showing the first {{ max_cards }} groups. Prune these, then run the action
+        again for the remaining {{ hidden_group_count }}.
       </p>
-      <div class="submit-row">
-        <input type="submit" class="default" value="Prune overlapping images">
-        <a href="../" class="button cancel-link">Cancel</a>
-      </div>
-    </form>
-    {% else %}
-      <p class="ov-note">No overlaps found — nothing to prune.</p>
     {% endif %}
-  </div>
-  {% endwith %}
-{% endif %}
+
+    {% for group in resolve_groups %}
+      <div class="ov-card" data-kind="{{ group.kind }}">
+        <h3>Group {{ group.number }} · {{ group.kind }} · {{ group.items|length }} copies</h3>
+        <div class="ov-copies">
+          {% for item in group.items %}
+            <div class="ov-copy" data-ds="{{ item.dataset.pk }}" data-token="{{ item.token }}">
+              <img loading="lazy" alt="{{ item.name }}"
+                   src="{{ thumb_url }}?dataset={{ item.dataset.pk }}&amp;name={{ item.name|urlencode }}&amp;w={{ thumb_width }}">
+              <p class="ov-ds">{{ item.dataset.name }}</p>
+              <p class="ov-file">{{ item.name }}</p>
+              {% comment %}
+                Deliberately nameless, so the browser serializes none of these:
+                the hidden "selection" field above is what gets posted. Being
+                nameless also means they don't group, so the script below is
+                what makes them mutually exclusive.
+              {% endcomment %}
+              <p class="ov-dec">
+                <label><input type="radio" data-dec="keep"
+                              {% if forloop.first %}checked{% endif %}> keep</label>
+                <label><input type="radio" data-dec="delete"
+                              {% if not forloop.first %}checked{% endif %}> delete</label>
+              </p>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    {% endfor %}
+
+    <div class="submit-row">
+      <input type="submit" class="default" value="Prune the marked copies" id="ov-submit">
+      <a href="../" class="button cancel-link">Cancel</a>
+    </div>
+  </form>
+  {% else %}
+    <p class="ov-empty">No images overlap between the selected datasets — nothing to resolve.</p>
+  {% endif %}
+</div>
+
+<script>
+(function () {
+  var form = document.getElementById("ov-form");
+  if (!form) return;
+  var countEl = document.getElementById("ov-count");
+  var submitEl = document.getElementById("ov-submit");
+  var selectionEl = document.getElementById("ov-selection");
+
+  // Walked once into a flat model: the bulk buttons and the live counter both
+  // touch every copy on the page, and re-querying the DOM for each of a
+  // thousand-odd cards on every click is enough to feel it.
+  var CARDS = Array.prototype.map.call(form.querySelectorAll(".ov-card"), function (card) {
+    return {
+      kind: card.dataset.kind,
+      el: card,
+      copies: Array.prototype.map.call(card.querySelectorAll(".ov-copy"), function (copy) {
+        return {
+          el: copy,
+          ds: copy.dataset.ds,
+          token: copy.dataset.token,
+          keep: copy.querySelector('input[data-dec="keep"]'),
+          drop: copy.querySelector('input[data-dec="delete"]')
+        };
+      })
+    };
+  });
+  // Back-reference from each radio to its copy, so the delegated click handler
+  // is a property read instead of a DOM walk.
+  CARDS.forEach(function (card) {
+    card.copies.forEach(function (copy) {
+      copy.keep.ovCopy = copy;
+      copy.drop.ovCopy = copy;
+    });
+  });
+
+  function setDecision(copy, which) {
+    copy.keep.checked = which === "keep";
+    copy.drop.checked = which === "delete";
+  }
+
+  // Exactly one survivor per card: keep the *first* copy from the wanted
+  // dataset — a second copy of the same picture sitting in that same dataset is
+  // still a duplicate — and delete every other. A card holding nothing from
+  // that dataset is left however the operator already had it.
+  function keepAllFrom(datasetId) {
+    CARDS.forEach(function (card) {
+      var keeper = null;
+      for (var i = 0; i < card.copies.length; i++) {
+        if (card.copies[i].ds === datasetId) { keeper = card.copies[i]; break; }
+      }
+      if (!keeper) return;
+      card.copies.forEach(function (copy) {
+        setDecision(copy, copy === keeper ? "keep" : "delete");
+      });
+    });
+    refresh();
+  }
+
+  function refresh() {
+    var deleting = 0, unresolved = 0;
+    CARDS.forEach(function (card) {
+      var kept = 0;
+      card.copies.forEach(function (copy) {
+        var drop = copy.drop.checked;
+        copy.el.classList.toggle("ov-del", drop);
+        if (drop) deleting++; else kept++;
+      });
+      card.el.classList.toggle("ov-card-bad", kept === 0);
+      if (kept === 0) unresolved++;
+    });
+    countEl.innerHTML = "<strong>" + deleting + "</strong> to delete"
+      + (unresolved ? ' · <strong class="ov-warn">' + unresolved
+          + " group(s) with no copy kept</strong>" : "");
+    submitEl.disabled = unresolved > 0 || deleting === 0;
+  }
+
+  function serialize() {
+    selectionEl.value = JSON.stringify({
+      groups: CARDS.map(function (card) {
+        var doomed = [];
+        card.copies.forEach(function (copy) {
+          if (copy.drop.checked) doomed.push(copy.token);
+        });
+        return {
+          kind: card.kind,
+          tokens: card.copies.map(function (copy) { return copy.token; }),
+          "delete": doomed
+        };
+      })
+    });
+  }
+
+  Array.prototype.forEach.call(form.querySelectorAll(".ov-keep-all"), function (button) {
+    button.addEventListener("click", function () { keepAllFrom(button.dataset.ds); });
+  });
+  document.getElementById("ov-skip-all").addEventListener("click", function () {
+    CARDS.forEach(function (card) {
+      card.copies.forEach(function (copy) { setDecision(copy, "keep"); });
+    });
+    refresh();
+  });
+  // One delegated listener rather than two per copy. Clicking a label fires a
+  // click on the input it wraps, so both paths land here.
+  form.addEventListener("click", function (e) {
+    var copy = e.target.ovCopy;
+    if (!copy) return;
+    setDecision(copy, e.target.dataset.dec);
+    refresh();
+  });
+  // Both submit buttons (prune here, preview in a new tab) need the field
+  // filled, and submit fires for whichever one was pressed.
+  form.addEventListener("submit", serialize);
+
+  refresh();
+})();
+</script>
 
 <p style="margin-top:2em;"><a href="../" class="button cancel-link">Back</a></p>
 </div>

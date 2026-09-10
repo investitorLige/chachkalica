@@ -18,6 +18,11 @@ that don't flicker, a resolution that can be emailed.
 sources, same pipelines, same job row, same queue — plus a Look section and a
 frame preview.
 
+There is now also a [Marketing Studio](marketing-studio.md) section: the same
+renderer and the same Look section, given its own video library, its own bundle
+root and its own presets, and narrowed to infer bundles only. This action stays
+exactly as documented below; the two share code but no state.
+
 ## What it adds
 
 Everything below is one JSON blob on the job (`InferenceJob.render_style`), read

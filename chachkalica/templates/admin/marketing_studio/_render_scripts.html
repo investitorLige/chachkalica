@@ -1,0 +1,36 @@
+{% load static %}
+{% comment %}
+The scripts behind _bundle_fields.html. The twin of
+admin/videos/_inference_scripts.html, minus the half that reapplies a trained
+model's or an exported artifact's pipeline metadata when a different one is
+picked — this section has neither. A bundle's geometry arrives through the
+"Sync bundle" button instead (bundle_sync.js), which is the only thing that
+also reports whether the bundle loads.
+
+Included after the closing </form>.
+{% endcomment %}
+{# Drives the "Sync bundle" button above; shared with the camera live-inference
+   inline and the videos forms. It reads its endpoint from the data-bundle-sync
+   attribute, so it needs no change to talk to this app's own sync view. #}
+<script src="{% static 'training/bundle_sync.js' %}"></script>
+
+<script>
+  // Show only the rows the selected pipeline uses — rows opt in via
+  // data-pipelines, same convention as the model-preview page. The bundle's own
+  // values are written into the fields by bundle_sync.js on a Sync press (and
+  // re-read server-side on submit), so nothing here touches their contents.
+  (function () {
+    var pipelineSel = document.getElementById("pipeline");
+    if (!pipelineSel) { return; }
+    var rows = document.querySelectorAll("[data-pipelines]");
+    function syncRows() {
+      var current = pipelineSel.value;
+      rows.forEach(function (row) {
+        var allowed = row.getAttribute("data-pipelines").split(/\s+/);
+        row.style.display = allowed.indexOf(current) !== -1 ? "" : "none";
+      });
+    }
+    pipelineSel.addEventListener("change", syncRows);
+    syncRows();
+  })();
+</script>

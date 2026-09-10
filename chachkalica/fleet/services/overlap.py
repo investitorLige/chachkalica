@@ -69,14 +69,21 @@ def _dhash_bands(dhash: int) -> list[tuple[int, int]]:
 
 
 def _near_hits(dhash: int, by_band: dict[tuple[int, int], list[dict]]) -> list[dict]:
-    """Right-side fingerprints within _DHASH_MAX_DISTANCE bits of ``dhash``."""
+    """Fingerprints within _DHASH_MAX_DISTANCE bits of ``dhash``, each returned once.
+
+    Candidates are identified by their ``key`` when they carry one and by their
+    path otherwise: :func:`group_overlaps` joins several datasets at once, where
+    two entries can share a path (two Dataset rows are allowed the same name,
+    hence the same directory) and must still be treated as separate copies.
+    """
     hits = []
-    seen: set[Path] = set()
-    for key in _dhash_bands(dhash):
-        for candidate in by_band.get(key, ()):
-            if candidate["path"] in seen:
+    seen: set = set()
+    for band_key in _dhash_bands(dhash):
+        for candidate in by_band.get(band_key, ()):
+            identity = candidate.get("key", candidate["path"])
+            if identity in seen:
                 continue
-            seen.add(candidate["path"])
+            seen.add(identity)
             if (candidate["dhash"] ^ dhash).bit_count() <= _DHASH_MAX_DISTANCE:
                 hits.append(candidate)
     return hits
@@ -133,14 +140,146 @@ def compare_pair(left: Dataset, right: Dataset, left_prints=None, right_prints=N
     }
 
 
-def find_overlaps(datasets: list[Dataset]) -> list[dict]:
-    """Every pairwise overlap report among the given datasets (order-independent)."""
-    prints = {dataset.pk: fingerprint_dataset(dataset) for dataset in datasets}
+def find_overlaps(datasets: list[Dataset], prints: dict[int, list[dict]] | None = None) -> list[dict]:
+    """Every pairwise overlap report among the given datasets (order-independent).
+
+    ``prints`` lets a caller that needs more than one view of the same datasets
+    (the admin report renders both this pair table and :func:`group_overlaps`)
+    hand in fingerprints it already has. Hashing dominates the cost by orders of
+    magnitude — see ``jobs.PRUNE_INTRA_DUPLICATES_JOB_TIMEOUT`` — so computing
+    it twice for one page is not an option.
+    """
+    if prints is None:
+        prints = {dataset.pk: fingerprint_dataset(dataset) for dataset in datasets}
     reports = []
     for i, left in enumerate(datasets):
         for right in datasets[i + 1:]:
             reports.append(compare_pair(left, right, prints[left.pk], prints[right.pk]))
     return reports
+
+
+def _union_find(keys):
+    """Tiny union-find over hashable keys: returns ``(find, union)``."""
+    parent = {key: key for key in keys}
+
+    def find(key):
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    return find, union
+
+
+def group_overlaps(datasets: list[Dataset], prints: dict[int, list[dict]] | None = None) -> dict:
+    """Cross-dataset duplicates as one group per picture, listing every copy of it.
+
+    Where :func:`find_overlaps` answers "which images match, pair of datasets by
+    pair of datasets", this answers "here is one picture and every copy of it
+    that exists" — the shape a prune UI needs. A pair list can't drive one: a
+    near-duplicate legitimately matches several images on the other side, so the
+    same picture appears in several rows and per-row keep/delete choices can
+    contradict each other. A group has exactly one survivor by construction.
+
+    Only edges *between* datasets are unioned, so every group spans at least two
+    of them — duplicates inside a single dataset are ``find_intra_duplicates``'
+    job. A second copy sitting in the same dataset is still pulled in when it
+    also matches across, since it is the same picture and pruning around it
+    would leave the overlap in place.
+    """
+    if prints is None:
+        prints = {dataset.pk: fingerprint_dataset(dataset) for dataset in datasets}
+
+    order = {dataset.pk: index for index, dataset in enumerate(datasets)}
+    entries = []
+    for dataset in datasets:
+        for fp in prints.get(dataset.pk, ()):
+            entries.append({**fp, "dataset": dataset, "key": (dataset.pk, fp["path"])})
+
+    find, union = _union_find(entry["key"] for entry in entries)
+
+    # Exact edges: an MD5 bucket holding more than one dataset is the same bytes
+    # in each of them, so every copy in the bucket belongs to one group.
+    by_md5: dict[str, list[dict]] = {}
+    for entry in entries:
+        by_md5.setdefault(entry["md5"], []).append(entry)
+    for bucket in by_md5.values():
+        if len({entry["dataset"].pk for entry in bucket}) < 2:
+            continue
+        for entry in bucket[1:]:
+            union(bucket[0]["key"], entry["key"])
+
+    # Near edges: the same band index as compare_pair, except joined over every
+    # dataset at once and only where the two sides come from different ones.
+    by_band: dict[tuple[int, int], list[dict]] = {}
+    for entry in entries:
+        if entry["dhash"] is None:
+            continue
+        for band_key in _dhash_bands(entry["dhash"]):
+            by_band.setdefault(band_key, []).append(entry)
+    for entry in entries:
+        if entry["dhash"] is None:
+            continue
+        for hit in _near_hits(entry["dhash"], by_band):
+            if hit["dataset"].pk != entry["dataset"].pk:
+                union(entry["key"], hit["key"])
+
+    clusters: dict[tuple, list[dict]] = {}
+    for entry in entries:
+        clusters.setdefault(find(entry["key"]), []).append(entry)
+
+    groups = []
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda entry: (order[entry["dataset"].pk], entry["path"].name))
+        groups.append({
+            # "exact" only when every copy is byte-identical; one re-encoded
+            # copy in the group makes the whole thing worth a second look.
+            "kind": "exact" if len({entry["md5"] for entry in members}) == 1 else "near",
+            "items": [
+                {
+                    "dataset": entry["dataset"],
+                    "path": entry["path"],
+                    "name": entry["path"].name,
+                    # What the prune form posts back. Filenames are unique within
+                    # a dataset (list_dataset_images does not recurse), so the pk
+                    # plus the name identifies a copy without a traversable path
+                    # ever reaching the browser.
+                    "token": f"{entry['dataset'].pk}:{entry['path'].name}",
+                }
+                for entry in members
+            ],
+        })
+    groups.sort(key=lambda group: (order[group["items"][0]["dataset"].pk],
+                                   group["items"][0]["name"]))
+
+    per_dataset = []
+    for dataset in datasets:
+        copies = sum(1 for group in groups
+                     for item in group["items"] if item["dataset"].pk == dataset.pk)
+        per_dataset.append({
+            "dataset": dataset,
+            "image_count": len(prints.get(dataset.pk, ())),
+            "overlapping": copies,
+        })
+
+    return {
+        "datasets": datasets,
+        "per_dataset": per_dataset,
+        "groups": groups,
+        "group_count": len(groups),
+        "copy_count": sum(len(group["items"]) for group in groups),
+        # One survivor per group, so this is what a full prune would delete.
+        "extra_count": sum(len(group["items"]) - 1 for group in groups),
+        "exact_group_count": sum(1 for group in groups if group["kind"] == "exact"),
+        "near_group_count": sum(1 for group in groups if group["kind"] == "near"),
+    }
 
 
 def _cluster_by_dhash(prints: list[dict]) -> list[list[dict]]:
@@ -150,18 +289,7 @@ def _cluster_by_dhash(prints: list[dict]) -> list[list[dict]]:
     against the others in the same list, so groups (not left/right pairs) are
     the natural output.
     """
-    parent = {fp["path"]: fp["path"] for fp in prints}
-
-    def find(path):
-        while parent[path] != path:
-            parent[path] = parent[parent[path]]
-            path = parent[path]
-        return path
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
+    find, union = _union_find(fp["path"] for fp in prints)
 
     by_band: dict[tuple[int, int], list[dict]] = {}
     for fp in prints:
@@ -223,9 +351,11 @@ def find_intra_duplicates(dataset: Dataset) -> dict:
 def prune_intra_duplicates(dataset: Dataset) -> dict:
     """Delete extra copies within one dataset's duplicate/near-duplicate clusters.
 
-    Always re-fingerprints (like :func:`prune_overlaps`) rather than trusting
-    a report computed earlier, since the picture on disk is the only thing
-    safe to prune from. Keeps one image per cluster; every deletion is backed
+    Always re-fingerprints rather than trusting a report computed earlier,
+    since the picture on disk is the only thing safe to prune from. (The
+    cross-dataset prune is the deliberate exception — there the operator picked
+    individual copies, so re-deriving the set would discard their decision;
+    see :func:`prune_paths`.) Keeps one image per cluster; every deletion is backed
     up first.
     """
     report = find_intra_duplicates(dataset)
@@ -269,28 +399,46 @@ def _backup_and_delete(image_path: Path, dataset: Dataset, backup_root: Path, re
             result["deleted_labels"] += 1
 
 
-def prune_overlaps(report: dict, *, prune_left: bool, prune_right: bool) -> dict:
-    """Delete the duplicate copies from one or both sides of a pair report.
+def prune_paths(selection: list[tuple[Dataset, list[str]]]) -> dict:
+    """Delete named images (and their label files) from specific datasets.
 
-    Every deleted image and its label file is copied to
-    ``source_root()/.overlap_prune_backups/<timestamp>/<dataset>/...`` first, so
-    a prune can be undone by hand if it turns out to be the wrong call.
+    Takes the operator's per-copy decision from the overlap report rather than a
+    match report, so unlike the detection passes there is nothing to re-derive
+    here: the chosen names *are* the input. Anything already gone is counted as
+    skipped instead of failing the batch, since a report can be minutes old by
+    the time a worker picks the job up.
+
+    Every name is resolved inside the dataset's own image directory and rejected
+    unless it names a file already there, so a hand-edited form post cannot
+    reach a path outside the dataset.
     """
-    result = {"deleted_images": 0, "deleted_labels": 0, "backup_dir": ""}
-    if not prune_left and not prune_right:
-        return result
-
+    result = {"deleted_images": 0, "deleted_labels": 0, "backup_dir": "", "skipped": 0}
     backup_root = source_root() / _PRUNE_BACKUP_DIR / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    seen_left: set[Path] = set()
-    seen_right: set[Path] = set()
-    for match in report["matches"]:
-        if prune_left and match["left"] not in seen_left and match["left"].exists():
-            _backup_and_delete(match["left"], report["left"], backup_root, result)
-            seen_left.add(match["left"])
-        if prune_right and match["right"] not in seen_right and match["right"].exists():
-            _backup_and_delete(match["right"], report["right"], backup_root, result)
-            seen_right.add(match["right"])
+
+    for dataset, names in selection:
+        image_dir = lsapi.image_source_dir(source_root() / dataset.name)
+        for name in dict.fromkeys(names):  # de-duplicated, order preserved
+            path = resolve_dataset_image(image_dir, name)
+            if path is None:
+                result["skipped"] += 1
+                continue
+            _backup_and_delete(path, dataset, backup_root, result)
 
     if result["deleted_images"] or result["deleted_labels"]:
         result["backup_dir"] = str(backup_root)
     return result
+
+
+def resolve_dataset_image(image_dir: Path, name: str) -> Path | None:
+    """``image_dir/name`` when that names an existing image file, else None.
+
+    Rejects anything with a path separator in it up front, so ``..`` and
+    absolute paths can never resolve — the check is on the *name*, not on the
+    joined path, because ``Path("/a") / "/etc/passwd"`` is ``/etc/passwd``.
+    """
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        return None
+    candidate = image_dir / name
+    if candidate.suffix.lower() not in lsapi.IMAGE_EXTENSIONS or not candidate.is_file():
+        return None
+    return candidate

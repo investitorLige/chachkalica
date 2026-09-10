@@ -49,6 +49,7 @@ The cleanup command removes only the container. It does not delete the Docker vo
 - [Build Nodes](build-nodes.md) — register other GPU machines and compile TensorRT engines/bundles on them, so a bundle is valid on the GPU it will actually run on
 - [Bundle Benchmarks](bundle-benchmarks.md) — measure an exported bundle on real frames: latency percentiles, throughput, GPU memory, and where the frame budget actually goes
 - [Marketing Renders](marketing-videos.md) — the second inference action: styled, watchable boxes, a one-frame preview, and a delivery-sized file
+- [Marketing Studio](marketing-studio.md) — the same renderer as its own section: own video library, own bundle root, own presets, bundles only
 - [VLM Live Inference](vlm-live-inference.md) — running a vision-language model over a video and watching its commentary arrive
 - [VLM Dataset Runs](vlm-dataset-runs.md) — running a VLM over a whole dataset and scoring its answers against the labels
 - [.pt Bundles](pt-bundles.md) — export a checkpoint plus its full catalog/pipeline/training provenance as one `.tar.gz`, to catalog on another machine

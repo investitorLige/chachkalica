@@ -1,0 +1,101 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<style>
+  #ovv-controls { margin: 10px 0; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  #ovv-status { margin: 6px 0; font-weight: 600; }
+  #ovv-kind { font-weight: 600; }
+  #ovv-kind.ovv-exact { color: #34d399; }
+  #ovv-kind.ovv-near { color: #e6c07a; }
+  #ovv-copies { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
+  .ovv-copy { flex: 1 1 340px; min-width: 300px; }
+  .ovv-copy img { display: block; width: 100%; max-height: 70vh; object-fit: contain;
+                  background: #060b07; border: 1px solid #1d2a20; border-radius: 4px; }
+  .ovv-copy .ovv-ds { margin: 6px 0 0; font-size: 13px; color: #34d399; font-weight: 600; }
+  .ovv-copy .ovv-file { margin: 0; font-size: 12px; color: #9bb7a6; word-break: break-all; }
+</style>
+
+{{ groups_payload|json_script:"ovv-data" }}
+
+<p class="help">
+  {{ group_count }} duplicate group{{ group_count|pluralize }} — every copy of one picture
+  side by side. Use ← / → or the buttons to step through. This is a read-only look;
+  the keep/delete choices live on the report page you came from.
+</p>
+
+<div id="ovv-controls">
+  <button type="button" id="ovv-prev" class="button">← Prev</button>
+  <input type="number" id="ovv-index" value="1" min="1" max="{{ group_count }}" style="width:6em">
+  <span>/ {{ group_count }}</span>
+  <button type="button" id="ovv-next" class="button">Next →</button>
+  <span id="ovv-kind"></span>
+</div>
+
+<div id="ovv-status"></div>
+<div id="ovv-copies"></div>
+
+<script>
+(function () {
+  var GROUPS = JSON.parse(document.getElementById("ovv-data").textContent);
+  var IMAGE_URL = "{{ image_url }}";
+  var copiesEl = document.getElementById("ovv-copies");
+  var statusEl = document.getElementById("ovv-status");
+  var kindEl = document.getElementById("ovv-kind");
+  var idxInput = document.getElementById("ovv-index");
+  var index = 0;
+
+  function imageSrc(copy) {
+    // Full size here, unlike the report grid's thumbnails: telling two
+    // re-encodes of one photo apart is the whole reason to open this page.
+    return IMAGE_URL + "?dataset=" + encodeURIComponent(copy.dataset)
+      + "&name=" + encodeURIComponent(copy.name);
+  }
+
+  function load(i) {
+    if (i < 0 || i >= GROUPS.length) return;
+    index = i;
+    idxInput.value = i + 1;
+    var group = GROUPS[i];
+
+    kindEl.textContent = group.kind === "exact" ? "byte-identical" : "near-duplicate";
+    kindEl.className = group.kind === "exact" ? "ovv-exact" : "ovv-near";
+    statusEl.textContent = "Group " + (i + 1) + " / " + GROUPS.length
+      + " — " + group.copies.length + " copies";
+
+    copiesEl.textContent = "";
+    group.copies.forEach(function (copy) {
+      var wrap = document.createElement("div");
+      wrap.className = "ovv-copy";
+      var img = document.createElement("img");
+      img.src = imageSrc(copy);
+      img.alt = copy.name;
+      var ds = document.createElement("p");
+      ds.className = "ovv-ds";
+      ds.textContent = copy.dataset_name;
+      var file = document.createElement("p");
+      file.className = "ovv-file";
+      file.textContent = copy.name;
+      wrap.appendChild(img);
+      wrap.appendChild(ds);
+      wrap.appendChild(file);
+      copiesEl.appendChild(wrap);
+    });
+  }
+
+  document.getElementById("ovv-prev").addEventListener("click", function () { load(index - 1); });
+  document.getElementById("ovv-next").addEventListener("click", function () { load(index + 1); });
+  idxInput.addEventListener("change", function () {
+    var v = parseInt(idxInput.value, 10);
+    if (!isNaN(v)) load(Math.min(Math.max(v - 1, 0), GROUPS.length - 1));
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.target.tagName === "INPUT") return;
+    if (e.key === "ArrowLeft") load(index - 1);
+    else if (e.key === "ArrowRight") load(index + 1);
+  });
+
+  if (GROUPS.length) load(0);
+  else statusEl.textContent = "Nothing overlaps between these datasets.";
+})();
+</script>
+{% endblock %}

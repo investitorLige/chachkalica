@@ -35,6 +35,16 @@ def vlm_videos_root(fleet_settings: FleetSettings | None = None) -> Path:
     return _resolve(fs.vlm_videos_dir)
 
 
+def marketing_videos_root(fleet_settings: FleetSettings | None = None) -> Path:
+    fs = fleet_settings or FleetSettings.load()
+    return _resolve(fs.marketing_videos_dir)
+
+
+def marketing_bundles_root(fleet_settings: FleetSettings | None = None) -> Path:
+    fs = fleet_settings or FleetSettings.load()
+    return _resolve(fs.marketing_bundles_dir)
+
+
 def annotator_base_url(annotator) -> str:
     """Base URL to reach an annotator's Label Studio from server-side code.
 

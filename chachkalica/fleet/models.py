@@ -52,6 +52,21 @@ class FleetSettings(models.Model):
                   "Deliberately separate from videos_dir: the VLM section owns its own "
                   "library, so adding a clip there never disturbs the detection Videos tab.",
     )
+    marketing_videos_dir = models.CharField(
+        max_length=512, default="data/marketing/videos",
+        help_text="Directory holding Marketing Studio's video files. Deliberately "
+                  "separate from videos_dir: the studio owns its own library, and "
+                  "its own <dir>/inferred output folder, so a render there can "
+                  "never collide with an Inferred video from the Videos tab.",
+    )
+    marketing_bundles_dir = models.CharField(
+        max_length=512, default="data/marketing/bundles",
+        help_text="Where Marketing Studio looks for infer bundles. Deliberately "
+                  "separate from TrainingSettings.bundles_root: the studio ships "
+                  "its own curated set. Must live on the mount the trainer "
+                  "container sees (anything under data/ is), because a bundle's "
+                  "model reaches /predict_image as an absolute path.",
+    )
     webhook_url = models.CharField(
         max_length=512, default="http://host.docker.internal:9000",
         help_text="Base URL each container POSTs annotation events to (the /hook receiver).",

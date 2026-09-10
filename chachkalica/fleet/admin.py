@@ -6,13 +6,16 @@ returns immediately. The row's status column then reflects
 ``queued -> running -> ok/error`` as the worker picks it up (refresh to see it).
 """
 
+import json
+from collections import Counter
 from pathlib import Path
 
+import cv2
 import django_rq
 from django import forms
 from django.contrib import admin, messages
 from django.contrib.admin.helpers import ACTION_CHECKBOX_NAME
-from django.http import FileResponse, Http404, JsonResponse
+from django.http import FileResponse, Http404, HttpResponse, JsonResponse
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
@@ -42,8 +45,35 @@ _STATUS_COLORS = {
 }
 
 
+#: Cap on resolve cards per page. The cards carry the operator's decision back
+#: in one form field, so an unbounded report would eventually outgrow
+#: DATA_UPLOAD_MAX_MEMORY_SIZE — and a five-figure card count is not a page
+#: anyone can work through anyway. Past this, prune what's shown and re-run.
+_OVERLAP_MAX_CARDS = 1500
+
+#: Width the resolve grid asks for its thumbnails at. Wide enough to tell two
+#: similar frames apart at a glance, small enough that a few hundred cards
+#: aren't a multi-gigabyte page load.
+_OVERLAP_THUMB_WIDTH = 220
+
+
 def _queue():
     return django_rq.get_queue("default")
+
+
+def _thumbnail_response(path: Path, width: int) -> HttpResponse:
+    """Re-encode one image down to ``width`` px as JPEG (never upscales)."""
+    image = cv2.imread(str(path))
+    if image is None:
+        raise Http404("unreadable image")
+    height, original_width = image.shape[:2]
+    if original_width > width:
+        image = cv2.resize(image, (width, max(1, round(height * width / original_width))),
+                           interpolation=cv2.INTER_AREA)
+    ok, buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if not ok:
+        raise Http404("could not encode thumbnail")
+    return HttpResponse(buffer.tobytes(), content_type="image/jpeg")
 
 
 def _status_badge(value: str):
@@ -660,7 +690,7 @@ class DatasetAdmin(admin.ModelAdmin):
 
     @admin.action(description="Check for overlapping images…")
     def check_overlapping_images(self, request, queryset):
-        """Find images duplicated across two or more datasets.
+        """Find images duplicated across the selected datasets, and resolve them.
 
         Every image is matched by file MD5 (byte-identical copies) and, failing
         that, by an 8x8 difference hash (the same photo re-exported at a
@@ -669,11 +699,21 @@ class DatasetAdmin(admin.ModelAdmin):
         ``analyze_selected`` — it's disk I/O, not model inference — so large
         datasets can take a minute or two.
 
-        Pruning the duplicates found is only offered when exactly two datasets
-        are selected: with three or more it's ambiguous which side(s) an
-        operator means to keep. Pruning itself is enqueued as an rq job — it
-        re-hashes and then deletes on the worker — since a two-dataset prune
-        can run long enough to hit the request timeout.
+        The findings are shown twice over. First a table per dataset pair: which
+        image matched which, unchanged from what this action has always
+        reported. Then a *resolve* section that regroups those matches into one
+        card per picture listing every copy of it, with the survivor picked per
+        copy and bulk buttons for the usual "keep everything from this one"
+        answer. The regrouping is the point — a near-duplicate matches several
+        images on the other side, so pair rows let an operator make
+        contradictory choices about the same file, while a group has exactly one
+        survivor by construction (see ``overlap.group_overlaps``).
+
+        Pruning is enqueued as an rq job: backing up and deleting thousands of
+        full-resolution frames outruns the request timeout on its own. Unlike
+        the whole-dataset prunes it does *not* re-hash on the worker — the
+        operator's per-copy choice is the input, and re-deriving it would throw
+        that choice away.
         """
         datasets = sorted(queryset, key=lambda d: d.name)
         if len(datasets) < 2:
@@ -690,41 +730,215 @@ class DatasetAdmin(admin.ModelAdmin):
             return None
 
         if request.POST.get("apply"):
-            if len(datasets) != 2:
-                self.message_user(request, "Pruning is only available for exactly two datasets.", level=messages.ERROR)
-                return None
-            prune_left = bool(request.POST.get("prune_left"))
-            prune_right = bool(request.POST.get("prune_right"))
-            if not prune_left and not prune_right:
-                self.message_user(request, "Select at least one dataset to prune from.", level=messages.WARNING)
-                return None
-            _queue().enqueue(
-                jobs.prune_overlaps,
-                datasets[0].id,
-                datasets[1].id,
-                prune_left=prune_left,
-                prune_right=prune_right,
-                job_timeout=jobs.PRUNE_OVERLAPS_JOB_TIMEOUT,
-            )
+            return self._queue_overlap_prune(request)
+
+        # Dataset.name isn't unique at the DB level (two sections may each hold a
+        # row for the same folder), and every path here is source_root()/name —
+        # so two such rows are the *same files* and would show up as overlapping
+        # copies of each other. Pruning "one of them" would delete the other's
+        # images out from under it, so say so rather than let it happen quietly.
+        counts = Counter(dataset.name for dataset in datasets)
+        shared = sorted(name for name, rows in counts.items() if rows > 1)
+        if shared:
             self.message_user(
                 request,
-                "Prune queued — re-hashes both datasets and deletes duplicates on the worker; "
-                "check /django-rq/ for progress and the backup dir once it finishes.",
+                "Selected more than one dataset row pointing at the same folder ("
+                + ", ".join(shared) + ") — they share their images on disk, so every "
+                "image will look overlapping and pruning either row deletes the same files. "
+                "Deselect the duplicates.",
+                level=messages.ERROR,
             )
             return None
 
-        reports = overlap_svc.find_overlaps(datasets)
+        try:
+            prints = {d.pk: overlap_svc.fingerprint_dataset(d) for d in datasets}
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            self.message_user(request, f"Could not read a dataset's images: {exc}",
+                              level=messages.ERROR)
+            return None
+
+        reports = overlap_svc.find_overlaps(datasets, prints)
+        grouped = overlap_svc.group_overlaps(datasets, prints)
+        listed = grouped["groups"][:_OVERLAP_MAX_CARDS]
         context = {
             **self.admin_site.each_context(request),
             "title": "Overlapping images",
             "datasets": datasets,
             "reports": reports,
-            "can_prune": len(datasets) == 2,
+            "grouped": grouped,
+            # Only the cards the page will actually render, numbered for the
+            # "group N had no copy kept" error the prune handler can raise.
+            "resolve_groups": [
+                {**group, "number": number}
+                for number, group in enumerate(listed, start=1)
+            ],
+            "hidden_group_count": len(grouped["groups"]) - len(listed),
+            "max_cards": _OVERLAP_MAX_CARDS,
+            "thumb_url": reverse("admin:fleet_dataset_overlap_image"),
+            "preview_url": reverse("admin:fleet_dataset_overlap_preview"),
+            "thumb_width": _OVERLAP_THUMB_WIDTH,
             "action": "check_overlapping_images",
             "selected": [str(d.pk) for d in datasets],
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
         }
         return TemplateResponse(request, "admin/fleet/dataset_overlaps.html", context)
+
+    # ---------------------------------------------------------- overlap resolve
+    @staticmethod
+    def _posted_overlap_groups(request) -> list[dict]:
+        """The resolve form's groups and choices, as ``{kind, tokens, delete}``.
+
+        The whole decision travels in ONE field, assembled by the page's script,
+        for two reasons. It has to travel at all — recomputing the groups here
+        would mean fingerprinting every image again (the most expensive thing in
+        this module) to answer a *different* question: what overlaps right now,
+        not what the operator was looking at when they chose. And it has to be
+        one field rather than a hidden input plus a radio pair per copy, because
+        that shape hits Django's 1000-field ``DATA_UPLOAD_MAX_NUMBER_FIELDS``
+        ceiling at a couple of hundred groups — well inside the range this
+        section exists to handle.
+
+        Anything malformed is dropped rather than raising: the field is rebuilt
+        from scratch on every submit, so a bad one means a bug on the page, and
+        the caller's "nothing to prune" path is the safe answer. Tokens are
+        validated against the datasets' own image listings at deletion time.
+        """
+        try:
+            payload = json.loads(request.POST.get("selection") or "{}")
+            raw_groups = payload["groups"]
+        except (TypeError, ValueError, KeyError):
+            return []
+
+        groups = []
+        for entry in raw_groups if isinstance(raw_groups, list) else ():
+            try:
+                tokens = [str(token) for token in entry["tokens"]]
+                deleting = {str(token) for token in entry.get("delete", ())}
+            except (TypeError, ValueError, KeyError):
+                continue
+            if tokens:
+                groups.append({
+                    "kind": str(entry.get("kind", "near")),
+                    "tokens": tokens,
+                    "delete": [token for token in tokens if token in deleting],
+                })
+        return groups
+
+    def _queue_overlap_prune(self, request):
+        """Validate the resolve form's per-copy choices and enqueue the deletion."""
+        groups = self._posted_overlap_groups(request)
+        if not groups:
+            self.message_user(request, "Nothing to prune — the form carried no duplicate groups.",
+                              level=messages.WARNING)
+            return None
+
+        doomed: dict[int, list[str]] = {}
+        wiped = []
+        for number, group in enumerate(groups, start=1):
+            if len(group["delete"]) == len(group["tokens"]):
+                wiped.append(number)
+                continue
+            for token in group["delete"]:
+                pk, _, name = token.partition(":")
+                if pk.isdigit() and name:
+                    doomed.setdefault(int(pk), []).append(name)
+
+        # Every group must keep a survivor: the point of the action is to
+        # de-duplicate, never to lose the picture from every dataset at once.
+        if wiped:
+            numbers = ", ".join(str(n) for n in wiped[:10])
+            self.message_user(
+                request,
+                f"Nothing was pruned: group{'' if len(wiped) == 1 else 's'} {numbers}"
+                + (" …" if len(wiped) > 10 else "")
+                + " had every copy marked for deletion. Keep one copy per group and resubmit.",
+                level=messages.ERROR,
+            )
+            return None
+        if not doomed:
+            self.message_user(request, "Nothing selected for deletion.", level=messages.WARNING)
+            return None
+
+        total = sum(len(names) for names in doomed.values())
+        _queue().enqueue(
+            jobs.prune_overlap_selection, doomed,
+            job_timeout=jobs.PRUNE_OVERLAP_SELECTION_JOB_TIMEOUT,
+        )
+        self.message_user(
+            request,
+            f"Prune queued for {total} image{'' if total == 1 else 's'} across "
+            f"{len(doomed)} dataset{'' if len(doomed) == 1 else 's'} — each image and its label "
+            "file is copied into the backup dir before deletion; check /django-rq/ for progress.",
+        )
+        return None
+
+    def overlap_preview_view(self, request):
+        """Full-screen pager over the duplicate groups, one group per step.
+
+        Reached by submitting the resolve form to this URL, so it inherits the
+        exact groups on screen for free — no query string long enough to hold
+        them, and no second fingerprinting pass. That also means it is POST-only
+        and not bookmarkable, which is fine for a look-before-you-delete view.
+        """
+        if request.method != "POST":
+            raise Http404("the overlap preview opens from the overlap report")
+
+        groups = self._posted_overlap_groups(request)
+        names = {}
+        for token in (token for group in groups for token in group["tokens"]):
+            pk, _, _name = token.partition(":")
+            if pk.isdigit():
+                names[int(pk)] = None
+        for dataset in Dataset.objects.filter(pk__in=list(names)):
+            names[dataset.pk] = dataset.name
+
+        payload = []
+        for group in groups:
+            copies = []
+            for token in group["tokens"]:
+                pk, _, name = token.partition(":")
+                if not pk.isdigit() or not name:
+                    continue
+                copies.append({"dataset": int(pk), "dataset_name": names.get(int(pk)) or "?",
+                               "name": name})
+            if copies:
+                payload.append({"kind": group["kind"], "copies": copies})
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Preview overlapping images",
+            "groups_payload": payload,
+            "group_count": len(payload),
+            "image_url": reverse("admin:fleet_dataset_overlap_image"),
+            "thumb_width": _OVERLAP_THUMB_WIDTH,
+        }
+        return TemplateResponse(request, "admin/fleet/dataset_overlap_viewer.html", context)
+
+    def overlap_image(self, request):
+        """Stream one dataset image by filename, downscaled when ``?w=`` is given.
+
+        Addressed by name, not by the label viewer's ``?index=``: a prune shifts
+        every index after the deleted file, and the resolve grid outlives the
+        prune it queues. ``?w=`` matters for the grid specifically — a few
+        hundred cards pulling 4K frames at full size is tens of gigabytes, so
+        the thumbnails ask for a downscaled re-encode instead.
+        """
+        dataset = Dataset.objects.filter(pk=request.GET.get("dataset")).first()
+        if dataset is None:
+            raise Http404("unknown dataset")
+
+        image = overlap_svc.resolve_dataset_image(
+            lsapi.image_source_dir(source_root() / dataset.name), request.GET.get("name") or "")
+        if image is None:
+            raise Http404("unknown image")
+
+        try:
+            width = int(request.GET.get("w") or 0)
+        except (TypeError, ValueError):
+            raise Http404("bad width")
+        if width <= 0:
+            return FileResponse(open(image, "rb"))
+        return _thumbnail_response(image, min(max(width, 32), 1024))
 
     # -------------------------------------------------------------- label preview
     @admin.action(description="Preview dataset labels…")
@@ -777,6 +991,10 @@ class DatasetAdmin(admin.ModelAdmin):
                  name="fleet_dataset_preview_data"),
             path("dataset-quality/fix/", self.admin_site.admin_view(self.quality_fix),
                  name="fleet_dataset_quality_fix"),
+            path("dataset-overlaps/preview/", self.admin_site.admin_view(self.overlap_preview_view),
+                 name="fleet_dataset_overlap_preview"),
+            path("dataset-overlaps/image/", self.admin_site.admin_view(self.overlap_image),
+                 name="fleet_dataset_overlap_image"),
         ]
         return custom + super().get_urls()
 

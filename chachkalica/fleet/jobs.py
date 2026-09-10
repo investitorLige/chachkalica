@@ -25,8 +25,11 @@ from fleet.services import split as split_svc
 # well past the queue's 900s DEFAULT_TIMEOUT. Sized with headroom for that to
 # grow rather than the current count exactly.
 PRUNE_INTRA_DUPLICATES_JOB_TIMEOUT = 3600
-# prune_overlaps fingerprints two datasets, so it gets proportionally longer.
-PRUNE_OVERLAPS_JOB_TIMEOUT = 2 * PRUNE_INTRA_DUPLICATES_JOB_TIMEOUT
+# prune_overlap_selection hashes nothing — the report page already decided which
+# copies go — so its cost is one directory listing per dataset plus a backup copy
+# per deletion. Sized off the intra-duplicate timeout anyway: copying tens of
+# thousands of full-resolution frames to the backup dir is slow on its own.
+PRUNE_OVERLAP_SELECTION_JOB_TIMEOUT = PRUNE_INTRA_DUPLICATES_JOB_TIMEOUT
 
 
 def _mark_running(obj, action: str | None):
@@ -148,25 +151,30 @@ def split_dataset(
     return split_svc.split_by_percentage(dataset, left_name, right_name, left_percent, shuffle=shuffle)
 
 
-def prune_overlaps(left_id: int, right_id: int, *, prune_left: bool, prune_right: bool) -> dict:
-    """Re-fingerprint a dataset pair and delete the duplicate copies found.
+def prune_overlap_selection(selection: dict[int, list[str]]) -> dict:
+    """Delete the copies an operator marked for deletion on the overlap report.
 
-    Re-hashes rather than reusing the report shown on screen, since that report
-    may be stale by the time the worker picks this up (the picture on disk is
-    the only thing safe to prune from).
+    ``selection`` maps a dataset id to the image filenames to remove from it.
+    Unlike the duplicate-detection jobs there is nothing to re-derive on the
+    worker: re-hashing would produce a *different* set of matches from the one
+    the operator looked at and agreed to, which is the opposite of what re-
+    hashing is for elsewhere in this module. A dataset that has since been
+    deleted, or a filename already gone, is skipped rather than failing the job.
     """
-    left = Dataset.objects.get(pk=left_id)
-    right = Dataset.objects.get(pk=right_id)
-    report = overlap_svc.compare_pair(left, right)
-    return overlap_svc.prune_overlaps(report, prune_left=prune_left, prune_right=prune_right)
+    resolved = []
+    for dataset_id, names in selection.items():
+        dataset = Dataset.objects.filter(pk=dataset_id).first()
+        if dataset is not None:
+            resolved.append((dataset, names))
+    return overlap_svc.prune_paths(resolved)
 
 
 def prune_intra_duplicates(dataset_id: int) -> dict:
     """Re-fingerprint one dataset and delete its duplicate/near-duplicate images.
 
     Queued rather than run inline from the analytics page for the same reason
-    as ``prune_overlaps``: re-hashing every image can run long enough to hit
-    the request timeout.
+    as the analytics page's other long jobs: re-hashing every image can run
+    long enough to hit the request timeout.
     """
     dataset = Dataset.objects.get(pk=dataset_id)
     return overlap_svc.prune_intra_duplicates(dataset)
