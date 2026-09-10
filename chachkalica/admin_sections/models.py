@@ -7,10 +7,12 @@ own table.
 An ``AdminSection`` is one project's own admin front, reachable at
 ``/admin/s/<slug>/`` — mounted by the single dynamic ``section_site`` in
 sites.py, so adding one is a DB row, not a urls.py edit or a redeploy. A
-``SectionAssignment`` is the one row that says "this object currently lives in
-that section", keyed by ContentType so it works for any model uniformly. No
-assignment row means the object still shows up on the main ``/admin/``
-(unfiltered, exactly as before this feature existed) but on no section front.
+``SectionAssignment`` is one row saying "this object also shows up on that
+section", keyed by ContentType so it works for any model uniformly — an object
+can carry any number of these (main admin plus several sections at once; it's
+membership, not a move). No assignment row at all just means the object shows
+up on the main ``/admin/`` only (unfiltered, exactly as before this feature
+existed) and on no section front.
 """
 
 from django.contrib.contenttypes.fields import GenericForeignKey
@@ -31,11 +33,14 @@ class AdminSection(models.Model):
 
 
 class SectionAssignment(models.Model):
-    """Which section (if any) one specific row currently belongs to.
+    """One "this object also shows up on that section" membership row.
 
-    ``object_id`` is a plain CharField rather than tied to the target model's
-    own pk type/field, so this works the same whether the target uses an
-    integer or a UUID primary key.
+    A given object can have any number of these (one per section it's been
+    added to) — the unique constraint below only rules out adding the *same*
+    object to the *same* section twice, not adding it to several different
+    ones. ``object_id`` is a plain CharField rather than tied to the target
+    model's own pk type/field, so this works the same whether the target uses
+    an integer or a UUID primary key.
     """
 
     content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)
@@ -46,7 +51,7 @@ class SectionAssignment(models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=["content_type", "object_id"], name="one_section_per_object"
+                fields=["content_type", "object_id", "section"], name="one_membership_per_object_per_section"
             ),
         ]
 

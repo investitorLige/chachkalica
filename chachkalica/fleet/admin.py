@@ -20,6 +20,7 @@ from django.utils import timezone
 from django.utils.html import format_html
 from django.utils.http import urlencode
 
+from admin_sections.scoping import scope_queryset
 from fleet import jobs
 from fleet.models import Annotator, Dataset, FleetSettings, GroundingSamRun, Project
 from fleet.services import analytics as analytics_svc
@@ -127,8 +128,14 @@ class DatasetAdminForm(forms.ModelForm):
 
     Listing the on-disk source directories (rather than free text) keeps the
     name in lockstep with what's actually present to set up. When adding, only
-    folders not yet registered are offered; when editing, the current name stays
-    selectable even if its folder has since gone missing.
+    folders not yet registered *on this same admin front* are offered — main
+    admin sees (and so excludes) every dataset everywhere, but a section only
+    excludes names already used by a row that's actually visible there, so the
+    same on-disk dataset can get its own independent row per project admin
+    without two rows of it ever colliding on one front. ``request`` is set by
+    ``DatasetAdmin.get_form`` below; its absence (e.g. a form built directly,
+    outside the admin) falls back to the original global check. When editing,
+    the current name stays selectable even if its folder has since gone missing.
     """
 
     class Meta:
@@ -140,7 +147,8 @@ class DatasetAdminForm(forms.ModelForm):
         name_field = self._meta.model._meta.get_field("name")
         current = self.instance.name if self.instance and self.instance.pk else None
 
-        taken = set(Dataset.objects.values_list("name", flat=True))
+        taken_qs = scope_queryset(Dataset.objects.all(), Dataset, getattr(self, "request", None))
+        taken = set(taken_qs.values_list("name", flat=True))
         taken.discard(current)
         choices = [(d, d) for d in self._source_dirs() if d not in taken]
         if current and current not in {value for value, _ in choices}:
@@ -223,9 +231,20 @@ class DatasetAdmin(admin.ModelAdmin):
         "merge_selected",
         "split_selected",
         "analyze_selected",
+        "check_duplicate_images",
         "check_overlapping_images",
         "preview_labels",
     ]
+
+    def get_form(self, request, obj=None, **kwargs):
+        # DatasetAdminForm needs to know which admin front it's rendering on
+        # (main vs. a section), to scope its "already taken" dropdown check
+        # accordingly — this is the standard way to hand a request through to
+        # a ModelForm: get_form() builds a fresh Form subclass per request, so
+        # stamping the class attribute here can't leak across requests.
+        Form = super().get_form(request, obj, **kwargs)
+        Form.request = request
+        return Form
 
     def save_model(self, request, obj, form, change):
         # Refresh has_labels from disk whenever a dataset is added/edited here,
@@ -558,6 +577,87 @@ class DatasetAdmin(admin.ModelAdmin):
         }
         return TemplateResponse(request, "admin/fleet/dataset_analytics.html", context)
 
+    @admin.action(description="Check for duplicate images in selected dataset(s)…")
+    def check_duplicate_images(self, request, queryset):
+        """Find duplicate/near-duplicate images *within* each selected dataset.
+
+        This used to be one of the checks in ``analyze_selected``, but it is the
+        only one that hashes image bytes rather than reading label files — on a
+        large dataset it dominated the runtime of a report operators otherwise
+        wanted to run often, so it lives on its own action.
+
+        Matching is the same as ``check_overlapping_images``: exact file MD5
+        first, then an 8x8 difference hash for the same photo re-exported at a
+        different size/compression. Runs synchronously (disk I/O, not model
+        inference), so a big dataset can take a minute or two. Pruning keeps the
+        alphabetically first image of each group and is enqueued as an rq job,
+        which re-hashes on the worker rather than trusting this report.
+        """
+        datasets = sorted(queryset, key=lambda d: d.name)
+        if not datasets:
+            return None
+
+        cloud = [d.name for d in datasets if d.storage_type != Dataset.LOCAL]
+        if cloud:
+            self.message_user(
+                request,
+                "Duplicate checking only supports local-storage datasets: " + ", ".join(cloud),
+                level=messages.ERROR,
+            )
+            return None
+
+        if request.POST.get("apply"):
+            prune_ids = {str(pk) for pk in request.POST.getlist("prune")}
+            targets = [d for d in datasets if str(d.pk) in prune_ids]
+            if not targets:
+                self.message_user(request, "Select at least one dataset to prune from.",
+                                  level=messages.WARNING)
+                return None
+            for dataset in targets:
+                _queue().enqueue(
+                    jobs.prune_intra_duplicates, dataset.id,
+                    job_timeout=jobs.PRUNE_INTRA_DUPLICATES_JOB_TIMEOUT,
+                )
+            self.message_user(
+                request,
+                f"Prune queued for {', '.join(d.name for d in targets)} — re-hashes each dataset and "
+                "deletes the extra copies on the worker; check /django-rq/ for progress and the "
+                "backup dir once it finishes.",
+            )
+            return None
+
+        reports = []
+        for dataset in datasets:
+            try:
+                reports.append(overlap_svc.find_intra_duplicates(dataset))
+            except (FileNotFoundError, RuntimeError) as exc:
+                self.message_user(request, f"{dataset.name}: {exc}", level=messages.ERROR)
+        if not reports:
+            return None
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Duplicate images",
+            "reports": [
+                {
+                    **report,
+                    "groups": [
+                        {"kind": kind, "keep": group[0], "extras": group[1:]}
+                        for kind, groups in (("exact", report["exact_groups"]),
+                                             ("near", report["near_groups"]))
+                        for group in groups
+                    ],
+                    "duplicate_extra": (report["exact_duplicate_extra"]
+                                        + report["near_duplicate_extra"]),
+                }
+                for report in reports
+            ],
+            "action": "check_duplicate_images",
+            "selected": [str(report["dataset"].pk) for report in reports],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+        }
+        return TemplateResponse(request, "admin/fleet/dataset_duplicates.html", context)
+
     @admin.action(description="Check for overlapping images…")
     def check_overlapping_images(self, request, queryset):
         """Find images duplicated across two or more datasets.
@@ -691,18 +791,6 @@ class DatasetAdmin(admin.ModelAdmin):
 
         issue = request.POST.get("issue") or ""
         action = request.POST.get("action") or None
-
-        if issue == "duplicate_images":
-            # Unlike the label-file repairs below, pruning duplicates re-hashes
-            # every image in the dataset — that can run long enough to hit the
-            # request timeout, so it's queued the same way as check_overlapping_images.
-            if action not in (None, "", "prune"):
-                return JsonResponse({"error": "duplicate images only support prune"}, status=400)
-            _queue().enqueue(
-                jobs.prune_intra_duplicates, dataset.id,
-                job_timeout=jobs.PRUNE_INTRA_DUPLICATES_JOB_TIMEOUT,
-            )
-            return JsonResponse({"queued": True, "dataset": dataset.name, "issue": issue})
 
         try:
             result = data_quality_solve.solve_dataset_quality(dataset, issue, action)

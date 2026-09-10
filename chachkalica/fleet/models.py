@@ -150,14 +150,21 @@ class Dataset(models.Model):
 
     Paths are derived: source is ``<source_dir>/<name>`` and per-annotator
     output is ``<target_dir>/<name>/<username>/``. The labels and labeling
-    tools come from the on-disk ``classes.txt``, not the database."""
+    tools come from the on-disk ``classes.txt``, not the database.
+
+    ``name`` is deliberately *not* unique at the database level: two rows may
+    point at the same on-disk directory as long as they're never visible on
+    the same admin front at once (main admin plus at most one row per section
+    — enforced in ``DatasetAdminForm``, not here) — that's what lets the same
+    already-imported dataset get its own independent row per project admin.
+    """
 
     LOCAL = "local"
     CLOUD = "cloud"
     STORAGE_CHOICES = [(LOCAL, "local"), (CLOUD, "cloud")]
 
     name = models.CharField(
-        max_length=255, unique=True,
+        max_length=255,
         help_text="Directory name under the source root (e.g. dataset1).",
     )
     storage_type = models.CharField(max_length=16, choices=STORAGE_CHOICES, default=LOCAL)

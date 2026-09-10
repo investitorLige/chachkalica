@@ -26,7 +26,9 @@ from training import pipelines
 from training.models import TrainedModel
 from training.services import bundles, exports, pipeline_meta
 from videos import jobs
-from videos.models import FrameExtractionJob, InferenceJob, RenderPreset, Video
+from videos.models import (
+    FrameExtractionJob, InferenceJob, MarketingVideo, RenderPreset, Video,
+)
 from videos.services import (
     downloader, frame_extraction, inference, render_style, streaming,
 )
@@ -497,11 +499,12 @@ class VideoAdmin(admin.ModelAdmin):
                 job.save()
                 _queue().enqueue(jobs.run_inference, job.id,
                                  job_timeout=jobs.INFERENCE_JOB_TIMEOUT)
+                tab = "Marketing videos" if marketing else "Inferred videos"
                 self.message_user(
                     request,
                     f"{'Marketing render' if marketing else 'Inference'} queued for "
                     f"{video.name} with {job.model_label()} [{job.pipeline}] — see the "
-                    "Inferred videos tab for progress.",
+                    f"{tab} tab for progress.",
                 )
                 return None
 
@@ -1019,7 +1022,7 @@ class InferenceJobAdmin(admin.ModelAdmin):
     """Read-only log of "Run model inference…" runs — rows are only created by the action."""
 
     list_display = ["video", "model_display", "pipeline", "look", "status_badge",
-                     "frames_processed", "play_link", "created_at"]
+                     "frames_processed", "play_link", "download_link", "created_at"]
     list_filter = ["status", "model_source", "pipeline", "trained_model"]
     search_fields = ["video__name", "trained_model__name", "artifact_path",
                      "bundle_path"]
@@ -1028,6 +1031,12 @@ class InferenceJobAdmin(admin.ModelAdmin):
 
     def has_add_permission(self, request):
         return False
+
+    def get_queryset(self, request):
+        # Marketing renders live under their own "Marketing videos" tab (see
+        # MarketingVideoAdmin below) so they don't clutter this one — same split
+        # as training.admin.TrainingRunAdmin / FineTuningRunAdmin.
+        return super().get_queryset(request).filter(render_style={})
 
     def get_actions(self, request):
         """Relabel the stock ``delete_selected`` so it's clear the annotated
@@ -1088,15 +1097,44 @@ class InferenceJobAdmin(admin.ModelAdmin):
     def play_link(self, obj):
         if not obj.output_exists():
             return "—"
-        url = reverse("admin:videos_inferencejob_play") + f"?job={obj.pk}"
+        url = reverse(f"admin:{self._url_name('play')}") + f"?job={obj.pk}"
         return format_html('<a class="button" href="{}">▶ play</a>', url)
+
+    @admin.display(description="")
+    def download_link(self, obj):
+        # Same trick as the player page's own download button: a same-origin
+        # link with a `download` attribute makes the browser save the file
+        # rather than navigate to it, with no server-side attachment handling
+        # needed — the stream endpoint already serves the raw mp4 bytes.
+        if not obj.output_exists():
+            return "—"
+        url = reverse(f"admin:{self._url_name('stream')}") + f"?job={obj.pk}"
+        return format_html(
+            '<a class="button" href="{}" download="{}">⭳ download</a>',
+            url, obj.output_filename,
+        )
+
+    def _url_name(self, suffix: str) -> str:
+        """A URL name scoped to this ModelAdmin's own model.
+
+        MarketingVideoAdmin subclasses this admin over the MarketingVideo proxy
+        (see videos.models.MarketingVideo) rather than overriding get_urls, so
+        deriving the name from ``self.model`` — the same trick Django's own
+        admin uses for its changelist/add/change routes, and
+        training.admin.TrainingRunAdmin uses for the same reason — is what
+        keeps its routes (``videos_marketingvideo_play`` etc.) distinct from
+        InferenceJobAdmin's, instead of two ``path()`` entries silently sharing
+        one name and ``reverse()`` picking whichever was registered last.
+        """
+        opts = self.model._meta
+        return f"{opts.app_label}_{opts.model_name}_{suffix}"
 
     def get_urls(self):
         custom = [
             path("play/", self.admin_site.admin_view(self.play_view),
-                 name="videos_inferencejob_play"),
+                 name=self._url_name("play")),
             path("stream/", self.admin_site.admin_view(self.stream_view),
-                 name="videos_inferencejob_stream"),
+                 name=self._url_name("stream")),
         ]
         return custom + super().get_urls()
 
@@ -1110,7 +1148,7 @@ class InferenceJobAdmin(admin.ModelAdmin):
             "title": f"Inferred — {job.video.name}",
             "job": job,
             "exists": job.output_exists(),
-            "stream_url": reverse("admin:videos_inferencejob_stream") + f"?job={job.pk}",
+            "stream_url": reverse(f"admin:{self._url_name('stream')}") + f"?job={job.pk}",
         }
         return TemplateResponse(request, "admin/videos/inference_player.html", context)
 
@@ -1120,3 +1158,18 @@ class InferenceJobAdmin(admin.ModelAdmin):
         if job is None or not job.output_exists():
             raise Http404("inference output not found")
         return streaming.serve(request, job.output_path())
+
+
+@admin.register(MarketingVideo)
+class MarketingVideoAdmin(InferenceJobAdmin):
+    """"Marketing videos" tab: the same log as "Inferred videos", scoped to the
+    runs made by "Run model inference for marketing…".
+
+    A plain subclass over the ``MarketingVideo`` proxy (see
+    ``videos.models.MarketingVideo``) — every display, action, and the play/
+    stream views (see ``InferenceJobAdmin._url_name``) come along for free.
+    Only the queryset differs, and only in which half of the split it keeps.
+    """
+
+    def get_queryset(self, request):
+        return InferenceJob.objects.exclude(render_style={})

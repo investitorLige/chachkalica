@@ -28,10 +28,24 @@ class SectionAdminMiddleware:
 
     def __call__(self, request):
         match = _SECTION_PREFIX_RE.match(request.path_info)
-        if match:
-            prefix = match.group(0)
-            request.admin_section_slug = match.group("slug")
-            request.path_info = "/" + request.path_info[len(prefix):]
-            request.urlconf = "admin_sections.section_urlconf"
-            set_script_prefix(prefix)
-        return self.get_response(request)
+        if not match:
+            return self.get_response(request)
+
+        prefix = match.group(0)
+        request.admin_section_slug = match.group("slug")
+        request.path_info = "/" + request.path_info[len(prefix):]
+        request.urlconf = "admin_sections.section_urlconf"
+
+        # set_script_prefix is a thread-local, not per-request state — Django's
+        # real WSGI handler resets it before every call (get_script_name(environ)
+        # is always "" here), but nothing resets it *between* two calls that
+        # don't both go through that handler: Django's own test Client doesn't,
+        # and neither does a bare reverse() call in test code run right after a
+        # section request (both bit this exactly). try/finally scopes the
+        # prefix to just this one request, however it exits, instead of
+        # trusting whatever runs next to clean up after it.
+        set_script_prefix(prefix)
+        try:
+            return self.get_response(request)
+        finally:
+            set_script_prefix("/")

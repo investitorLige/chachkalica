@@ -16,8 +16,9 @@ from fleet.models import FleetSettings
 from training.models import TrainedModel, TrainingSettings
 from training.services import exports, pipeline_meta
 from videos import jobs
+from videos import admin as videos_admin
 from videos.admin import VideoAddForm
-from videos.models import InferenceJob, RenderPreset, Video
+from videos.models import InferenceJob, MarketingVideo, RenderPreset, Video
 from videos.services import inference, render_style
 from videos.services.videos import list_video_files
 
@@ -1588,8 +1589,9 @@ class MarketingRenderEndToEndTests(VideosBase):
 
 
 class InferredVideosListTests(VideosBase):
-    """The Inferred videos changelist — the page an operator lands on straight
-    after queuing, so both kinds of row have to render there."""
+    """The Inferred videos and Marketing videos changelists — a plain row and a
+    marketing row (InferenceJob.is_marketing()) each render on exactly one of
+    them, same split as training.models.FineTuningRun / TrainingRun."""
 
     def setUp(self):
         super().setUp()
@@ -1599,15 +1601,51 @@ class InferredVideosListTests(VideosBase):
         self.video = Video.objects.create(
             name="clip", filename="clip.mp4", status=Video.READY)
 
-    def test_both_a_plain_and_a_marketing_row_render(self):
+    def test_a_plain_row_renders_only_on_the_inferred_videos_page(self):
         InferenceJob.objects.create(video=self.video, pipeline="raw")
+        resp = self.client.get(reverse("admin:videos_inferencejob_changelist"))
+        self.assertContains(resp, "plain")
+        resp = self.client.get(reverse("admin:videos_marketingvideo_changelist"))
+        self.assertNotContains(resp, "plain")
+
+    def test_a_marketing_row_renders_only_on_the_marketing_videos_page(self):
         InferenceJob.objects.create(
             video=self.video, pipeline="raw",
             render_style=render_style.normalize({"box_style": "corners",
                                                  "palette": "neon"}))
-        resp = self.client.get(reverse("admin:videos_inferencejob_changelist"))
-        self.assertContains(resp, "plain")
+        resp = self.client.get(reverse("admin:videos_marketingvideo_changelist"))
         self.assertContains(resp, "corners · neon")
+        resp = self.client.get(reverse("admin:videos_inferencejob_changelist"))
+        self.assertNotContains(resp, "corners · neon")
+
+    def test_inference_job_admin_and_marketing_video_admin_split_the_queryset(self):
+        plain = InferenceJob.objects.create(video=self.video, pipeline="raw")
+        marketing = InferenceJob.objects.create(
+            video=self.video, pipeline="raw",
+            render_style=render_style.normalize({"box_style": "corners"}))
+
+        plain_ids = set(
+            videos_admin.InferenceJobAdmin(InferenceJob, None).get_queryset(None)
+            .values_list("pk", flat=True)
+        )
+        marketing_ids = set(
+            videos_admin.MarketingVideoAdmin(MarketingVideo, None).get_queryset(None)
+            .values_list("pk", flat=True)
+        )
+        self.assertEqual(plain_ids, {plain.pk})
+        self.assertEqual(marketing_ids, {marketing.pk})
+
+    def test_download_link_present_only_when_the_output_file_exists(self):
+        job = InferenceJob.objects.create(video=self.video, pipeline="raw")
+        resp = self.client.get(reverse("admin:videos_inferencejob_changelist"))
+        self.assertNotContains(resp, "⭳ download")
+
+        job.output_filename = "out.mp4"
+        job.save(update_fields=["output_filename"])
+        (self.root / "inferred").mkdir(parents=True, exist_ok=True)
+        (self.root / "inferred" / "out.mp4").write_bytes(b"data")
+        resp = self.client.get(reverse("admin:videos_inferencejob_changelist"))
+        self.assertContains(resp, "⭳ download")
 
 
 class OutlineStyleTests(TestCase):

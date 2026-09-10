@@ -201,14 +201,13 @@
 
   <div class="ds-section">
     <div class="cap ds-info" data-info-title="Data quality"
-         data-info="Automatic checks for common annotation problems: orphan label files with no matching image, class indices outside classes.txt, boxes extending past the image edge, zero/negative-area boxes, and duplicate/near-duplicate images (by exact file match and by visual similarity).">Data quality</div>
+         data-info="Automatic checks for common annotation problems: orphan label files with no matching image, class indices outside classes.txt, boxes extending past the image edge, and zero/negative-area boxes. Duplicate/near-duplicate images are checked separately, by the &quot;Check for duplicate images&quot; action — it has to hash every image, so it is kept out of this report.">Data quality</div>
     {% if report.quality.issue_total %}
     <ul class="ds-issues">
       {% if report.quality.orphan_label_files %}<li><button type="button" class="ds-fix-trigger" data-dataset-id="{{ report.dataset.pk }}" data-dataset-name="{{ report.dataset.name }}" data-fix-issue="orphan_label_files" data-primary-action="delete" data-primary-label="Delete orphan label files" data-message="Delete {{ report.quality.orphan_label_files }} label file(s) that do not match any image? Changed files are backed up first.">Warning: {{ report.quality.orphan_label_files }} orphan label file(s) - no matching image{% if report.quality.orphan_examples %} (e.g. {{ report.quality.orphan_examples|join:", " }}){% endif %}.</button></li>{% endif %}
       {% if report.quality.invalid_class_regions %}<li><button type="button" class="ds-fix-trigger" data-dataset-id="{{ report.dataset.pk }}" data-dataset-name="{{ report.dataset.name }}" data-fix-issue="invalid_class_regions" data-primary-action="remove" data-primary-label="Remove invalid regions" data-message="Remove {{ report.quality.invalid_class_regions }} region(s) whose class index is outside classes.txt? Changed files are backed up first.">Warning: {{ report.quality.invalid_class_regions }} region(s) with a class index outside classes.txt (ignored in the stats above).</button></li>{% endif %}
       {% if report.quality.out_of_bounds_boxes %}<li><button type="button" class="ds-fix-trigger" data-dataset-id="{{ report.dataset.pk }}" data-dataset-name="{{ report.dataset.name }}" data-fix-issue="out_of_bounds_boxes" data-primary-action="clip" data-primary-label="Clip boxes" data-secondary-action="remove" data-secondary-label="Remove boxes" data-message="Fix {{ report.quality.out_of_bounds_boxes }} box(es) extending outside the image bounds? Clipping preserves labels by fitting them to the image. Changed files are backed up first.">Warning: {{ report.quality.out_of_bounds_boxes }} box(es) extending outside the image bounds.</button></li>{% endif %}
       {% if report.quality.zero_area_boxes %}<li><button type="button" class="ds-fix-trigger" data-dataset-id="{{ report.dataset.pk }}" data-dataset-name="{{ report.dataset.name }}" data-fix-issue="zero_area_boxes" data-primary-action="remove" data-primary-label="Remove zero-area boxes" data-message="Remove {{ report.quality.zero_area_boxes }} box(es) with zero/negative area? Changed files are backed up first.">Warning: {{ report.quality.zero_area_boxes }} box(es) with zero/negative area.</button></li>{% endif %}
-      {% if report.quality.duplicate_extra_images %}<li><button type="button" class="ds-fix-trigger" data-dataset-id="{{ report.dataset.pk }}" data-dataset-name="{{ report.dataset.name }}" data-fix-issue="duplicate_images" data-primary-action="prune" data-primary-label="Prune duplicates" data-message="Prune {{ report.quality.duplicate_extra_images }} duplicate/near-duplicate image(s) across {{ report.quality.duplicate_image_groups }} group(s), keeping one copy per group? This re-checks and runs as a background job; changed files are backed up first.">Warning: {{ report.quality.duplicate_extra_images }} duplicate/near-duplicate image(s) in {{ report.quality.duplicate_image_groups }} group(s){% if report.quality.duplicate_examples %} (e.g. {{ report.quality.duplicate_examples|join:", " }}){% endif %}.</button></li>{% endif %}
     </ul>
     {% else %}
       <p class="ds-note ds-ok">✓ No data-quality issues detected.</p>
@@ -338,13 +337,9 @@
         if (!response.ok) throw new Error(data.error || 'Fix failed');
         return data;
       });
-    }).then(function (data) {
-      if (data.queued) {
-        modalStatus.textContent = 'Prune queued as a background job — refresh in a bit to see updated results.';
-        primaryBtn.disabled = false;
-        secondaryBtn.disabled = false;
-        return;
-      }
+    }).then(function () {
+      // Every repair reachable from here rewrites label files synchronously;
+      // the one queued fix (duplicate pruning) moved to its own action.
       modalStatus.textContent = 'Fix applied. Reloading analytics...';
       refreshAnalytics();
     }).catch(function (err) {

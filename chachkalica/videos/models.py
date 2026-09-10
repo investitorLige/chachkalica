@@ -414,3 +414,21 @@ class InferenceJob(models.Model):
 
     def output_exists(self) -> bool:
         return bool(self.output_filename) and self.output_path().is_file()
+
+
+class MarketingVideo(InferenceJob):
+    """Proxy for :class:`InferenceJob`, scoped to marketing renders.
+
+    Same table, same fields, same behaviour — it exists purely so
+    ``videos/admin.py`` can register a second ``ModelAdmin`` over the one table
+    as its own "Marketing videos" tab (Django admin can't register a model
+    twice otherwise). ``MarketingVideoAdmin`` filters its queryset to
+    ``~Q(render_style={})`` (i.e. :meth:`InferenceJob.is_marketing`) and
+    ``InferenceJobAdmin``'s own queryset excludes those rows, so a run appears
+    in exactly one tab — same split as ``training.models.FineTuningRun``.
+    """
+
+    class Meta:
+        proxy = True
+        verbose_name = "Marketing video"
+        verbose_name_plural = "Marketing videos"

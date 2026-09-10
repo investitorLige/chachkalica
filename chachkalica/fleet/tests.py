@@ -563,6 +563,66 @@ class IntraDatasetDuplicatesTests(TestCase):
         backup_dir = Path(result["backup_dir"])
         self.assertTrue((backup_dir / "prune_me" / "b.jpg").exists())
 
+    def test_analyze_does_not_look_for_duplicates(self):
+        # Duplicate detection is its own action (it hashes every image), so the
+        # analytics report must neither report it nor pay for it.
+        ds = _make_dataset(
+            self.src, "analyzed_dupes", "", ["cat"], ["a.jpg", "b.jpg"],
+            labels={"a.txt": "0 0.5 0.5 0.1 0.1\n"},
+        )
+        (self.src / "analyzed_dupes" / "b.jpg").write_bytes(
+            (self.src / "analyzed_dupes" / "a.jpg").read_bytes())
+
+        with mock.patch.object(overlap_svc, "find_intra_duplicates") as find:
+            quality = analytics_svc.analyze_dataset(ds)["quality"]
+
+        find.assert_not_called()
+        self.assertNotIn("duplicate_extra_images", quality)
+        self.assertEqual(quality["issue_total"], 0)
+
+    def _login_admin(self):
+        User = get_user_model()
+        User.objects.create_superuser(username="admin", email="admin@example.com", password="pw")
+        self.client.login(username="admin", password="pw")
+
+    def test_admin_action_reports_duplicate_groups(self):
+        ds = self._make_images_dataset("admin_dupes", {
+            "a.jpg": b"same-bytes", "b.jpg": b"same-bytes", "c.jpg": b"unique",
+        })
+        self._login_admin()
+
+        response = self.client.post(reverse("admin:fleet_dataset_changelist"), {
+            "action": "check_duplicate_images",
+            "index": "0",
+            "_selected_action": [str(ds.pk)],
+        })
+
+        self.assertEqual(response.status_code, 200)
+        report = response.context["reports"][0]
+        self.assertEqual(report["duplicate_extra"], 1)
+        self.assertEqual([g["kind"] for g in report["groups"]], ["exact"])
+        self.assertEqual(report["groups"][0]["keep"]["path"].name, "a.jpg")
+        self.assertEqual([fp["path"].name for fp in report["groups"][0]["extras"]], ["b.jpg"])
+
+    def test_admin_action_queues_prune_for_checked_datasets_only(self):
+        left = self._make_images_dataset("dupes_left", {"a.jpg": b"same", "b.jpg": b"same"})
+        right = self._make_images_dataset("dupes_right", {"a.jpg": b"same", "b.jpg": b"same"})
+        self._login_admin()
+
+        with mock.patch("fleet.admin._queue") as queue:
+            response = self.client.post(reverse("admin:fleet_dataset_changelist"), {
+                "action": "check_duplicate_images",
+                "index": "0",
+                "_selected_action": [str(left.pk), str(right.pk)],
+                "apply": "1",
+                "prune": [str(right.pk)],
+            })
+
+        self.assertEqual(response.status_code, 302)  # back to the changelist
+        enqueued = queue.return_value.enqueue.call_args_list
+        self.assertEqual(len(enqueued), 1)
+        self.assertEqual(enqueued[0].args[1], right.id)
+
     def test_prune_is_a_noop_when_nothing_is_duplicated(self):
         ds = self._make_images_dataset("clean", {"a.jpg": b"one", "b.jpg": b"two"})
 

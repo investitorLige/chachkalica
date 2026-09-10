@@ -1,0 +1,102 @@
+{% extends "admin/base_site.html" %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  .dup-wrap { max-width: 1000px; }
+  .dup-ds { margin: 20px 0; border: 1px solid #1d2a20; border-radius: 8px; padding: 14px 18px; background: #0f1a12; }
+  .dup-ds h2 { margin: 0 0 8px; font-size: 16px; }
+  .dup-stats { color: #9bb7a6; font-size: 13px; margin-bottom: 10px; }
+  .dup-stats strong { color: #34d399; }
+  .dup-table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 12px; }
+  .dup-table th, .dup-table td { padding: 4px 8px; border-bottom: 1px solid #1d2a20; text-align: left; vertical-align: top; }
+  .dup-kind-exact { color: #34d399; }
+  .dup-kind-near { color: #e6c07a; }
+  .dup-note { color: #9bb7a6; font-size: 12px; margin-top: 6px; }
+  .dup-prune { margin-top: 24px; border-top: 1px solid #1d2a20; padding-top: 16px; }
+  .dup-prune label { display: block; margin: 4px 0; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="dup-wrap">
+
+<p class="dup-note">
+  Images are matched by exact file contents (MD5) and, failing that, by visual
+  similarity (an 8x8 difference hash) — the latter catches the same photo
+  re-exported at a different size or compression. Only images inside each
+  dataset are compared; use <em>Check for overlapping images</em> to compare
+  two datasets against each other.
+</p>
+
+{% for report in reports %}
+  <div class="dup-ds">
+    <h2>{{ report.dataset.name }}</h2>
+    <div class="dup-stats">
+      <strong>{{ report.image_count }}</strong> image{{ report.image_count|pluralize }} ·
+      <strong>{{ report.exact_duplicate_extra }}</strong> exact duplicate{{ report.exact_duplicate_extra|pluralize }} ·
+      <strong>{{ report.near_duplicate_extra }}</strong> near-duplicate{{ report.near_duplicate_extra|pluralize }} (re-encoded/resized)
+      in <strong>{{ report.groups|length }}</strong> group{{ report.groups|length|pluralize }}
+    </div>
+
+    {% if report.groups %}
+    <table class="dup-table">
+      <thead>
+        <tr>
+          <th>keep</th>
+          <th>duplicates (pruned)</th>
+          <th>match</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for group in report.groups|slice:":200" %}
+        <tr>
+          <td>{{ group.keep.path.name }}</td>
+          <td>{% for fp in group.extras %}{{ fp.path.name }}{% if not forloop.last %}, {% endif %}{% endfor %}</td>
+          <td class="{% if group.kind == 'exact' %}dup-kind-exact{% else %}dup-kind-near{% endif %}">{{ group.kind }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if report.groups|length > 200 %}
+      <p class="dup-note">Showing first 200 of {{ report.groups|length }} groups.</p>
+    {% endif %}
+    {% else %}
+      <p class="dup-note">No duplicate images found in this dataset.</p>
+    {% endif %}
+  </div>
+{% endfor %}
+
+<div class="dup-prune">
+  <p>
+    Pruning keeps the first image of each group and deletes the rest. It runs as
+    a background job that re-hashes the dataset first; deleted images and their
+    label files are backed up before removal.
+  </p>
+  <form action="" method="post">
+    {% csrf_token %}
+    {% for pk in selected %}
+      <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+    {% endfor %}
+    <input type="hidden" name="action" value="{{ action }}">
+    <input type="hidden" name="apply" value="1">
+    <p>
+      {% for report in reports %}
+        {% if report.duplicate_extra %}
+          <label>
+            <input type="checkbox" name="prune" value="{{ report.dataset.pk }}">
+            Prune {{ report.duplicate_extra }} duplicate image{{ report.duplicate_extra|pluralize }} from
+            <strong>{{ report.dataset.name }}</strong>
+          </label>
+        {% endif %}
+      {% endfor %}
+    </p>
+    <div class="submit-row">
+      <input type="submit" class="default" value="Prune duplicate images">
+      <a href="../" class="button cancel-link">Cancel</a>
+    </div>
+  </form>
+</div>
+
+<p style="margin-top:2em;"><a href="../" class="button cancel-link">Back</a></p>
+</div>
+{% endblock %}

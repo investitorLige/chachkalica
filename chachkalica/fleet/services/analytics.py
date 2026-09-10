@@ -14,6 +14,12 @@ Both share one colour per class so a single legend reads against both donuts.
 Alongside the distributions it reports object-size buckets, per-image density,
 per-class average box size and a set of data-quality flags.
 
+Duplicate/near-duplicate detection deliberately lives elsewhere
+(``overlap.find_intra_duplicates``, reachable from its own admin action): it
+hashes every image byte-for-byte and perceptually, which costs orders of
+magnitude more time than reading the label files, and made this report slow
+enough that operators avoided running it at all.
+
 Box areas are computed from the normalized ``w*h`` (a fraction of the image),
 so they need no pixel dimensions — YOLO files carry none. Buckets and the
 out-of-bounds test are therefore relative to the image, not absolute pixels.
@@ -26,7 +32,6 @@ from fleet.models import Dataset
 from fleet.reconcile.txt_format import parse_label_text
 from fleet.services import datasets as datasets_svc
 from fleet.services import lsapi
-from fleet.services import overlap as overlap_svc
 from fleet.services.paths import source_root
 
 # Cycled across classes; picked to stay distinct on a white admin background.
@@ -117,6 +122,9 @@ def _conic_gradient(rows: list[dict], pct_key: str) -> str:
 
 def analyze_dataset(dataset: Dataset) -> dict:
     """Compute class-distribution stats for a labeled dataset (reads disk only).
+
+    Does not look for duplicate images — that's the separate "check for
+    duplicate images" action, since it needs to hash every image.
 
     Raises ``FileNotFoundError``/``RuntimeError`` (via ``parse_classes_file``)
     when the dataset directory or its ``classes.txt`` is missing or empty.
@@ -215,7 +223,6 @@ def analyze_dataset(dataset: Dataset) -> dict:
             image_counts[cid] += 1
 
     orphan_count, orphan_examples = _orphan_label_files(labels_dir, images)
-    duplicates = overlap_svc.find_intra_duplicates(dataset)
 
     image_count = len(images)
     present_total = sum(image_counts)
@@ -278,11 +285,6 @@ def analyze_dataset(dataset: Dataset) -> dict:
         )
     ]
 
-    duplicate_extra_images = duplicates["exact_duplicate_extra"] + duplicates["near_duplicate_extra"]
-    duplicate_examples = [
-        group[0]["path"].name for group in (duplicates["exact_groups"] + duplicates["near_groups"])[:5]
-    ]
-
     quality = {
         "orphan_label_files": orphan_count,
         "orphan_examples": orphan_examples,
@@ -290,17 +292,12 @@ def analyze_dataset(dataset: Dataset) -> dict:
         "invalid_class_regions": invalid_class_regions,
         "out_of_bounds_boxes": out_of_bounds_boxes,
         "zero_area_boxes": zero_area_boxes,
-        "duplicate_image_groups": len(duplicates["exact_groups"]) + len(duplicates["near_groups"]),
-        "duplicate_extra_images": duplicate_extra_images,
-        "duplicate_examples": duplicate_examples,
     }
     # `empty_label_files` is excluded: an empty .txt is the YOLO convention for a
     # background/negative image, usually intentional (shown in the summary card),
     # not a defect. issue_total counts genuine errors only.
     quality["issue_total"] = (
-        orphan_count + invalid_class_regions + out_of_bounds_boxes + zero_area_boxes
-        + duplicate_extra_images
-    )
+        orphan_count + invalid_class_regions + out_of_bounds_boxes + zero_area_boxes)
 
     return {
         "dataset": dataset,
