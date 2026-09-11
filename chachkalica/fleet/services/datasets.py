@@ -12,7 +12,7 @@ from pathlib import Path
 import requests
 
 from fleet.models import Annotator, Dataset, FleetSettings, Project, project_title
-from fleet.reconcile import writer
+from fleet.reconcile import tag_values, writer
 from fleet.services import lsapi
 from fleet.services.paths import annotator_base_url, source_root, target_root
 
@@ -53,6 +53,12 @@ def promote_annotator_labels(dataset: Dataset, annotator: Annotator, fs: FleetSe
     dataset root. This makes the annotator's annotations the source labels by
     moving every ``.txt`` across, overwriting any existing source label of the
     same name. Images and classes.txt in the dataset root are untouched.
+
+    The ``annotation_tags.json`` sidecar travels with the labels it describes:
+    its per-box rows are line numbers in these very ``.txt`` files, so leaving
+    it behind in target/ would leave the promoted labels with tag answers that
+    nothing can find, and copying it late (after the next sync rewrote the
+    txts) would leave rows pointing at different boxes.
     """
     fs = fs or FleetSettings.load()
     src_dir = target_root(fs) / dataset.name / annotator.username
@@ -80,6 +86,20 @@ def promote_annotator_labels(dataset: Dataset, annotator: Annotator, fs: FleetSe
         if legacy_dest != dest:
             legacy_dest.unlink(missing_ok=True)
 
+    # Copied, not moved: the annotator's own sidecar stays valid for their
+    # target/ labels (which the next sync will rewrite anyway), and a promote
+    # must not be the thing that deletes it.
+    tags_src = tag_values.tags_path(src_dir)
+    tags_dest = tag_values.tags_path(dest_dir)
+    tags_promoted = tags_src.exists()
+    if tags_promoted:
+        shutil.copy2(str(tags_src), str(tags_dest))
+    else:
+        # A promote from an annotator with no tag answers must not leave the
+        # previous annotator's sidecar sitting next to the new labels, where
+        # its rows now point at somebody else's boxes.
+        tags_dest.unlink(missing_ok=True)
+
     # Source labels now exist — refresh the flag so the admin/training path sees them.
     detect_labels(dataset)
     return {
@@ -87,7 +107,64 @@ def promote_annotator_labels(dataset: Dataset, annotator: Annotator, fs: FleetSe
         "annotator": annotator.username,
         "moved": len(txts),
         "dest": str(dest_dir),
+        "tags_promoted": tags_promoted,
     }
+
+
+def dataset_tag_specs(dataset: Dataset) -> list[dict]:
+    """The dataset's annotation tags in the ORM-free form the renderer takes."""
+    return [tag.to_spec() for tag in dataset.tags.all()]
+
+
+def dataset_label_config(dataset: Dataset, fs: FleetSettings | None = None) -> str:
+    """Build the labeling interface a project for this dataset would get.
+
+    Classes and drawing tools come from the on-disk ``classes.txt``; the extra
+    controls come from the dataset's tags. Shared by project creation, the
+    "push tags to existing projects" path, and the tag editor's preview, so
+    what the editor shows is literally what gets sent.
+    """
+    fs = fs or FleetSettings.load()
+    classes_file = source_root(fs) / dataset.name / "classes.txt"
+    lsapi.require_path(classes_file, kind="Classes file")
+    return lsapi.build_label_config(classes_file, dataset_tag_specs(dataset))
+
+
+def apply_tags_to_projects(dataset: Dataset) -> list[dict]:
+    """Push the dataset's current label config onto every project it already has.
+
+    Creating a project bakes the tags in, so a tag added afterwards would only
+    reach annotators set up from then on. This rewrites the interface of the
+    existing projects instead, which keeps every annotation already made —
+    the alternative, recreating the project, would throw that work away.
+
+    Best-effort per annotator: a stopped container or an LS rejection (removing
+    a control that regions already use) is recorded against that one project and
+    never blocks the others.
+    """
+    label_config = dataset_label_config(dataset)
+
+    results: list[dict] = []
+    for project in dataset.projects.select_related("annotator"):
+        annotator = project.annotator
+        entry = {"username": annotator.username, "project_id": project.ls_project_id}
+        if project.ls_project_id is None:
+            entry["status"] = "skipped (no LS project)"
+        elif not lsapi.container_running(annotator.container_name):
+            entry["status"] = "skipped (container not running)"
+        else:
+            try:
+                lsapi.update_project_label_config(
+                    ls_url=annotator_base_url(annotator),
+                    api_token=annotator.token,
+                    project_id=project.ls_project_id,
+                    label_config=label_config,
+                )
+                entry["status"] = "updated"
+            except requests.RequestException as exc:
+                entry["status"] = f"failed ({exc})"
+        results.append(entry)
+    return results
 
 
 def _webhook_target(webhook_base: str, *, dataset: str, username: str, project_id: int) -> str:
@@ -156,6 +233,7 @@ def setup_dataset(dataset: Dataset, annotators: list[Annotator]) -> list[dict]:
 
     # Refresh the flag from disk so labels added after the row are still picked up.
     labels_dir = labels_source_dir(dataset, fs) if detect_labels(dataset) else None
+    tags = dataset_tag_specs(dataset)
 
     results: list[dict] = []
     for annotator in annotators:
@@ -174,6 +252,7 @@ def setup_dataset(dataset: Dataset, annotators: list[Annotator]) -> list[dict]:
             storage_type=dataset.storage_type,
             storage_root=dataset.storage_root or None,
             labels_dir=labels_dir,
+            tags=tags,
         )
         project_id = create["project_id"]
 

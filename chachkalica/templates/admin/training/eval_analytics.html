@@ -92,6 +92,9 @@
       {% else %}
         <span class="note">— no worst-images artifact for this eval</span>
       {% endif %}
+      {% if col.tag_analytics_url %}
+        <a class="button" href="{{ col.tag_analytics_url }}">Tag analytics</a>
+      {% endif %}
     </li>
   {% endfor %}
 </ul>

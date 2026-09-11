@@ -26,6 +26,7 @@ try:
         TrainingConfig,
         _to_builtin,
         _write_hard_images,
+        _write_match_table,
         _write_yaml,
         build_eval_dataloader,
         evaluate_detection,
@@ -50,6 +51,7 @@ except ImportError:  # run as a flat script
         TrainingConfig,
         _to_builtin,
         _write_hard_images,
+        _write_match_table,
         _write_yaml,
         build_eval_dataloader,
         evaluate_detection,
@@ -327,6 +329,20 @@ def run_combined_pipeline(config) -> Dict[str, Any]:
             eval_classes=config.classes,
             score_threshold=config.score_threshold,
             top_k_fraction=EVAL_HARD_IMAGES_FRACTION,
+        )
+        _write_match_table(
+            prediction_path,
+            all_predictions,
+            all_targets,
+            records,
+            config=None,
+            num_classes=len(config.classes),
+            prediction_classes=config.classes,
+            target_classes=config.classes,
+            eval_classes=config.classes,
+            iou_thresholds=config.iou_thresholds,
+            score_threshold=config.score_threshold,
+            map_score_threshold=config.map_score_threshold,
         )
 
     output = {

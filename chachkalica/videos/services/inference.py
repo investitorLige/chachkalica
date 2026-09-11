@@ -163,6 +163,11 @@ def build_predict_payload(job) -> dict:
     reused for every frame with
     only ``image_path`` swapped in. Raises ``RuntimeError`` for an unusable model
     or an inconsistent pipeline configuration.
+
+    ``job`` is duck-typed, not necessarily an :class:`~videos.models.InferenceJob`:
+    ``fleet.models.DatasetInferenceRun`` carries the same model + geometry field
+    set and the same ``model_checkpoint()`` contract, and is fed to this too, so
+    a model runs identically over a clip and over a folder.
     """
     from training.services import config_gen
 

@@ -19,8 +19,9 @@ the verbatim-copied chachak modules — which import these names at module level
 load unchanged; the inference path never reaches them. That covers the training
 toolkit (model building, dataset loaders, experiment configs) and the handful of
 helpers ``Pipeline.run()`` uses only in its batch-eval tail (serializing the
-result, writing the worst-images artifact) — ``friendy_chachkalica/ml/val.py``
-and ``ml/train.py``, both of which pull in the whole trainer at module level.
+result, writing the worst-images and match-table artifacts) —
+``friendy_chachkalica/ml/val.py`` and ``ml/train.py``, both of which pull in the
+whole trainer at module level.
 
 Regenerate by re-exporting the bundle.
 """
@@ -61,6 +62,7 @@ def _training_only(name: str):
 _to_builtin = _training_only("_to_builtin")
 _write_yaml = _training_only("_write_yaml")
 _write_hard_images = _training_only("_write_hard_images")
+_write_match_table = _training_only("_write_match_table")
 
 build_model = _training_only("build_model")
 build_eval_dataloader = _training_only("build_eval_dataloader")
@@ -85,6 +87,7 @@ __all__ = [
     "_to_builtin",
     "_write_yaml",
     "_write_hard_images",
+    "_write_match_table",
     "build_model",
     "build_eval_dataloader",
     "detection_collate_fn",

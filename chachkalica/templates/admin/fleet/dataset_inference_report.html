@@ -1,0 +1,270 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  /* Same visual language as the VLM dataset report and the eval analytics page:
+     tabular numbers, an explicit light palette so labels stay legible under the
+     admin's dark theme, headline tiles above the tables. */
+  .dir { max-width: 1200px; }
+  .dir h2 { margin-top: 1.6em; border-bottom: 1px solid #ccc; padding-bottom: .3em; }
+  .dir .note { color: #777; font-size: 12px; max-width: 820px; }
+  .dir .meta { color: #666; margin: 6px 0; }
+  .dir .tiles { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+  .dir .tile {
+    border: 1px solid #ddd; border-radius: 6px; padding: 8px 14px;
+    background: #fafafa; min-width: 118px;
+  }
+  .dir .tile .v {
+    font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; color: #222;
+  }
+  .dir .tile .l { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: .04em; }
+  .dir .tile.na .v { color: #bbb; }
+  .dir .tile.headline { background: #f0f7ff; border-color: #bcd8f7; }
+  .dir table { border-collapse: collapse; margin: 12px 0; background: #fff; }
+  .dir th, .dir td {
+    padding: 6px 12px; border-bottom: 1px solid #e0e0e0; text-align: right;
+    font-variant-numeric: tabular-nums; color: #222; background-color: #fff;
+  }
+  .dir th.rowlabel, .dir td.rowlabel { text-align: left; font-weight: 600; }
+  .dir thead th { text-align: right; font-size: 12px; color: #333; }
+  .dir thead th.rowlabel { text-align: left; }
+  .dir td.na { color: #bbb; }
+  .dir table.geometry td { text-align: left; font-weight: 400; }
+  .dir .bar { display: inline-block; height: 9px; border-radius: 2px; background: #4363d8; }
+  .dir table.images { width: 100%; }
+  .dir table.images td, .dir table.images th { text-align: left; vertical-align: top; }
+  .dir table.images td.seq { text-align: right; color: #888; width: 4em; }
+  .dir table.images td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .dir table.images td.thumb { width: 96px; }
+  .dir table.images img { width: 84px; height: 60px; object-fit: cover; border-radius: 3px; background: #eee; }
+  .dir .row-error { color: #ba2121; font-size: 12px; }
+  .dir .errornote { margin: 8px 0; }
+  .dir .banner {
+    margin: 8px 0; padding: 8px 10px; border-radius: 4px;
+    background: #fff7ed; border: 1px solid #fed7aa; color: #9a3412; max-width: 820px;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="dir">
+
+<p class="meta">
+  <b>{{ run.dataset_name_snapshot }}</b>
+  · {{ run.model_label }}
+  · {{ run.get_model_source_display }}
+  · pipeline <code>{{ run.pipeline }}</code>
+  · {% if run.image_limit %}capped at {{ run.image_limit }} image(s){% else %}all images{% endif %}
+</p>
+<p class="meta">
+  status: <strong id="dir-status">{{ run.status }}</strong>
+  · ran <span id="dir-progress">{{ run.images_processed }}{% if run.images_total %}/{{ run.images_total }}{% endif %}</span> image(s)
+  · <span id="dir-detections">{{ run.detections_total }}</span> detection(s)
+  · <span id="dir-errors">{{ run.errors_count }}</span> failure(s)
+</p>
+
+{% if run.last_error %}<p class="errornote">{{ run.last_error }}</p>{% endif %}
+
+<p>
+  <a href="{{ back_url }}" class="button cancel-link">Back to dataset inference runs</a>
+  {% if not is_terminal %}
+    <form action="{{ cancel_url }}" method="post" style="display:inline">
+      {% csrf_token %}
+      <button type="submit" class="button" style="margin-left:6px">Stop this run</button>
+    </form>
+  {% endif %}
+</p>
+
+<h2>Speed</h2>
+{% if timings.timing_source == "request" %}
+  <p class="banner">The trainer reported no per-call timing, so these numbers are the
+    <strong>whole round trip</strong> — HTTP, JSON and the worker included — not the model
+    alone. Rebuild the trainer image to get the model's own time; until then read this as an
+    upper bound on the frame cost.</p>
+{% endif %}
+
+<div class="tiles">
+  <div class="tile headline{% if timings.fps is None %} na{% endif %}">
+    <div class="v" id="dir-fps">
+      {% if timings.fps is None %}&mdash;{% else %}{{ timings.fps|floatformat:1 }}{% endif %}
+    </div>
+    <div class="l">{% if timings.timing_source == "request" %}fps, round trip{% else %}fps, model{% endif %}</div>
+  </div>
+  <div class="tile headline{% if run.p50_ms is None %} na{% endif %}">
+    <div class="v" id="dir-p50">
+      {% if run.p50_ms is None %}&mdash;{% else %}{{ run.p50_ms|floatformat:1 }}{% endif %}
+    </div>
+    <div class="l">median ms / image</div>
+  </div>
+  <div class="tile{% if timings.model_ms.p90 is None %} na{% endif %}">
+    <div class="v">
+      {% if timings.model_ms.p90 is None %}&mdash;{% else %}{{ timings.model_ms.p90|floatformat:1 }}{% endif %}
+    </div>
+    <div class="l">p90 ms, model</div>
+  </div>
+  <div class="tile{% if timings.request_fps is None %} na{% endif %}">
+    <div class="v">
+      {% if timings.request_fps is None %}&mdash;{% else %}{{ timings.request_fps|floatformat:1 }}{% endif %}
+    </div>
+    <div class="l">fps, round trip</div>
+  </div>
+  <div class="tile{% if timings.wall_fps is None %} na{% endif %}">
+    <div class="v">
+      {% if timings.wall_fps is None %}&mdash;{% else %}{{ timings.wall_fps|floatformat:1 }}{% endif %}
+    </div>
+    <div class="l">fps, wall clock</div>
+  </div>
+  <div class="tile"><div class="v">{{ timings.images_timed|default:"0" }}</div><div class="l">images timed</div></div>
+</div>
+
+<p class="note">Three clocks, on purpose. <strong>Model</strong> is what the trainer measured
+  around its own inference call — image read, preprocess, forward, postprocess, synchronized
+  at the end — and is the number a deployment gets. <strong>Round trip</strong> adds the HTTP
+  call to the trainer and this worker's own work; the gap between the two <em>is</em> the
+  wrapper overhead, which is why both are shown rather than only the flattering one.
+  <strong>Wall clock</strong> is the whole run divided by its images, so it also carries the
+  database writes between images. The first {{ timings.warmup|default:run.warmup }} call(s)
+  are warmup and counted in none of them.</p>
+
+{% if timings.model_ms or timings.request_ms %}
+  <table>
+    <thead>
+      <tr>
+        <th class="rowlabel">Per image</th>
+        <th>mean</th><th>p50</th><th>p90</th><th>p99</th><th>min</th><th>max</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if timings.model_ms %}
+        <tr>
+          <td class="rowlabel">model ms</td>
+          <td>{{ timings.model_ms.mean|floatformat:1 }}</td>
+          <td>{{ timings.model_ms.p50|floatformat:1 }}</td>
+          <td>{{ timings.model_ms.p90|floatformat:1 }}</td>
+          <td>{{ timings.model_ms.p99|floatformat:1 }}</td>
+          <td>{{ timings.model_ms.min|floatformat:1 }}</td>
+          <td>{{ timings.model_ms.max|floatformat:1 }}</td>
+        </tr>
+      {% endif %}
+      {% if timings.request_ms %}
+        <tr>
+          <td class="rowlabel">round trip ms</td>
+          <td>{{ timings.request_ms.mean|floatformat:1 }}</td>
+          <td>{{ timings.request_ms.p50|floatformat:1 }}</td>
+          <td>{{ timings.request_ms.p90|floatformat:1 }}</td>
+          <td>{{ timings.request_ms.p99|floatformat:1 }}</td>
+          <td>{{ timings.request_ms.min|floatformat:1 }}</td>
+          <td>{{ timings.request_ms.max|floatformat:1 }}</td>
+        </tr>
+      {% endif %}
+    </tbody>
+  </table>
+{% else %}
+  <p class="banner">Nothing timed yet.
+    {% if is_terminal %}Every image failed — see the failures below.{% else %}Numbers appear
+    as images are run.{% endif %}</p>
+{% endif %}
+
+{% if stage_rows %}
+  <h3>Where the frame goes</h3>
+  <table>
+    <thead>
+      <tr><th class="rowlabel">Stage</th><th>share</th><th>mean ms</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for stage in stage_rows %}
+        <tr>
+          <td class="rowlabel">{{ stage.name }}</td>
+          <td>{{ stage.percent }}%</td>
+          <td>{% if stage.mean_ms is None %}&mdash;{% else %}{{ stage.mean_ms|floatformat:2 }}{% endif %}</td>
+          <td style="text-align:left;width:220px">
+            <span class="bar" style="width:{{ stage.percent }}%"></span>
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="note">Read the <em>shares</em>, not the absolutes: attributing stages needs the
+    GPU synchronized at every boundary, which inflates the total being split. A preprocess
+    share far above the forward's is the usual sign of a bundle exported before the
+    GPU-resident path — the fix is a re-export, not a faster card.</p>
+{% endif %}
+
+<h2>What ran</h2>
+<table class="geometry">
+  <tbody>
+    {% for label, value in geometry %}
+      <tr><td class="rowlabel" style="white-space:nowrap">{{ label }}</td><td>{{ value }}</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p class="note">The geometry is the model's own recorded pipeline unless it was overridden on
+  the form — serving a model through different geometry than it was trained with is quietly
+  wrong rather than an error, so the run records exactly what it used.</p>
+
+<h2>Images</h2>
+<p class="note">Click a thumbnail to open the full-size image with the model's boxes drawn
+  on. Boxes are stored per image, so this costs no GPU.
+  {% if only_detections %}
+    Showing images with detections only{% if total_rows > shown %} — first {{ shown }} of {{ total_rows }}{% else %} ({{ shown }}){% endif %}.
+    <a href="{{ report_url }}">Show all</a>
+  {% else %}
+    Showing {{ shown }}{% if total_rows > shown %} of {{ total_rows }} (first {{ row_limit }}){% endif %}.
+    <a href="{{ report_url }}&amp;only=detections">Show only images with detections</a>
+  {% endif %}
+</p>
+
+<table class="images">
+  <thead>
+    <tr>
+      <th class="seq">#</th>
+      <th>Image</th>
+      <th>File</th>
+      <th style="text-align:right">detections</th>
+      <th style="text-align:right">model ms</th>
+      <th style="text-align:right">round trip ms</th>
+    </tr>
+  </thead>
+  <tbody id="dir-rows">
+    {% for row in rows %}
+      <tr data-seq="{{ row.seq }}">
+        <td class="seq">{{ row.seq }}</td>
+        <td class="thumb">
+          {# The link asks for the annotated copy, the thumbnail for a small
+             re-encode of the plain file — a full page of rows must not mean a
+             full page of redraws on load. #}
+          <a href="{{ image_url }}?result={{ row.pk }}&amp;boxes=1" target="_blank"
+             title="Open full size with the model's boxes drawn on">
+            <img loading="lazy" src="{{ image_url }}?result={{ row.pk }}"
+                 alt="{{ row.image_filename }}">
+          </a>
+        </td>
+        <td>
+          {{ row.image_filename }}
+          {% if row.error %}<div class="row-error">{{ row.error }}</div>{% endif %}
+        </td>
+        <td class="num">{{ row.detections }}</td>
+        {# Not `|floatformat|default_if_none`: floatformat turns None into an
+           empty string, so the fallback would never fire. #}
+        <td class="num">{% if row.model_ms is None %}&mdash;{% else %}{{ row.model_ms|floatformat:1 }}{% endif %}</td>
+        <td class="num">{% if row.request_ms is None %}&mdash;{% else %}{{ row.request_ms|floatformat:1 }}{% endif %}</td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p id="dir-empty" {% if rows %}hidden{% endif %} class="note">
+  {% if is_terminal %}No images to show.{% else %}Waiting for the first image…{% endif %}
+</p>
+
+</div>
+
+{{ last_seq|json_script:"dir-last-seq" }}
+{{ progress_url|json_script:"dir-progress-url" }}
+{{ image_url|json_script:"dir-image-url" }}
+{{ is_terminal|json_script:"dir-is-terminal" }}
+{{ live_append|json_script:"dir-live-append" }}
+{{ row_limit|json_script:"dir-row-limit" }}
+
+<script src="{% static 'fleet/dataset_inference_report.js' %}"></script>
+{% endblock %}

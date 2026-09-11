@@ -48,6 +48,7 @@ try:
         _require_prediction_batch,
         _target_to_cpu,
         _write_hard_images,
+        _write_match_table,
         predict_dataset,
         resolve_operating_nms_threshold,
     )
@@ -79,6 +80,7 @@ except ImportError:
         _require_prediction_batch,
         _target_to_cpu,
         _write_hard_images,
+        _write_match_table,
         predict_dataset,
         resolve_operating_nms_threshold,
     )
@@ -348,6 +350,18 @@ def eval_combined_checkpoints(
             eval_classes=eval_classes,
             operating_nms_threshold=operating_nms_threshold,
             top_k_fraction=EVAL_HARD_IMAGES_FRACTION,
+        )
+        _write_match_table(
+            prediction_path,
+            all_predictions,
+            all_targets,
+            records,
+            config=config,
+            num_classes=len(eval_classes),
+            prediction_classes=eval_classes,
+            target_classes=eval_classes,
+            eval_classes=eval_classes,
+            operating_nms_threshold=operating_nms_threshold,
         )
 
     result = {

@@ -12,6 +12,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# deb.debian.org is TLS-intercepted on this network: plain HTTP comes back with
+# no status line (apt reports "Bad header line Bad header data") and HTTPS is
+# MITM'd with a self-signed "atlas-MASTER" cert, so apt can use neither.
+# cloudfront.debian.net is an official Debian CDN the proxy leaves alone.
+# Override with --build-arg DEBIAN_MIRROR=https://deb.debian.org off this network.
+ARG DEBIAN_MIRROR=https://cloudfront.debian.net
+RUN sed -i -E "s|https?://deb\\.debian\\.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl \

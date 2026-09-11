@@ -4,12 +4,20 @@ Mirrors the old ``fleet.py sync``: for each project, pull the export snapshot,
 rewrite each image's per-image ``.txt`` from its latest annotation (pruning
 stale ones), then assemble the ``<username>.coco.json``. Uses the persisted
 ``ls_project_id`` directly instead of re-looking-up by title.
+
+Annotation tag answers come out in the same pass, as an ``annotation_tags.json``
+sidecar in the label directory (see :mod:`fleet.reconcile.tag_values`). Sync,
+not the webhook, owns that file for the same reason it owns the COCO document:
+it is one file describing the whole project, and a per-event read-modify-write
+of it would race itself across webhook threads and processes. Tag answers
+therefore land at sync time, and the file is a snapshot of Label Studio's
+state exactly like the ``.txt``s beside it.
 """
 
 import json
 
 from fleet.models import FleetSettings, Project
-from fleet.reconcile import coco, labels, txt_format, validate, writer
+from fleet.reconcile import coco, labels, tag_values, txt_format, validate, writer
 from fleet.services import lsapi
 from fleet.services.paths import annotator_base_url, source_root, target_root
 
@@ -37,6 +45,9 @@ def sync_project(project: Project) -> dict:
         ls_url=annotator_base_url(annotator), api_token=annotator.token, project_id=project.ls_project_id
     )
 
+    tag_specs = [tag.to_spec() for tag in project.dataset.tags.all()]
+    tagged_images: dict[str, dict] = {}
+
     label_dir = writer.labels_dir(tgt, dataset, username)
     present: set[str] = set()
     for task in tasks:
@@ -48,6 +59,16 @@ def sync_project(project: Project) -> dict:
         result = annotation.get("result") or [] if annotation else []
         width, height, objects = txt_format.result_to_image(result, name_to_index)
         objects, _ = validate.clean_objects(objects, len(class_names))
+
+        if tag_specs:
+            frame, regions = tag_values.collect_answers(result, tag_specs)
+            # Built from the cleaned objects, so a box's position here is the
+            # line it is about to get in the .txt — the join key the sidecar
+            # records. A dropped object shifts the rows of every box after it,
+            # which is exactly why this cannot be computed from the raw result.
+            entry = tag_values.image_entry(objects, frame, regions)
+            if entry is not None:
+                tagged_images[filename] = entry
 
         path = writer.label_path(tgt, dataset, username, filename)
         if objects:
@@ -73,6 +94,17 @@ def sync_project(project: Project) -> dict:
     coco_file = writer.coco_path(tgt, dataset, username)
     writer.write_atomic(coco_file, json.dumps(doc, indent=2))
 
+    tags_file = tag_values.tags_path(label_dir)
+    if tag_specs:
+        document = tag_values.build_document(
+            dataset=dataset, annotator=username, specs=tag_specs, images=tagged_images,
+        )
+        writer.write_atomic(tags_file, json.dumps(document, indent=2))
+    else:
+        # The dataset's tags were deleted (or never existed): drop a stale
+        # sidecar rather than leave one describing controls that are gone.
+        writer.delete(tags_file)
+
     return {
         "username": username,
         "dataset": dataset,
@@ -81,6 +113,7 @@ def sync_project(project: Project) -> dict:
         "pruned": pruned,
         "errors": errors,
         "coco_path": str(coco_file),
+        "tagged_images": len(tagged_images),
     }
 
 

@@ -1,5 +1,6 @@
 """Tests for chachak pipeline evals: request generation and metric ingest."""
 
+import json
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -20,7 +21,7 @@ from training.models import (
 )
 from training.services import autoeval, config_gen, ingest, promote, runner
 
-from eval_pipelines.admin import CombinedEvalAdmin
+from eval_pipelines.admin import BaseEvalAdmin, CombinedEvalAdmin
 from eval_pipelines.models import (
     BaseEval,
     BatchDetectEval,
@@ -30,6 +31,27 @@ from eval_pipelines.models import (
     PeopleDetectFirstEval,
     PipelineEvalRun,
 )
+
+
+#: A two-image match table for the tag-analytics page: img1 has a box the model
+#: found, img2 has one it missed. Small on purpose — the scoring itself is
+#: covered in ``training.tests_tag_analytics``; these tests are about the page.
+_MATCH_TABLE = {
+    "version": 1, "iou_thresholds": [0.5], "score_threshold": 0.25, "score_floor": 0.001,
+    "operating_nms_threshold": None, "classes": {"0": "helmet"},
+    "images": ["img1.jpg", "img2.jpg"],
+    "gt": {"image": [0, 1], "class": [0, 0], "row": [0, 0]},
+    "pred": {"image": [0], "class": [0], "score": [0.9], "iou": [0.9], "gt": [0]},
+    "pred_operating": None,
+}
+
+_TAG_DOCUMENT = {
+    "version": 1, "dataset": "ds1", "annotator": "ann1",
+    "tags": [{"name": "weather", "scope": "frame", "widget": "radio",
+              "choices": ["sun", "rain"], "max_rating": 5}],
+    "images": {"img1.jpg": {"frame": {"weather": ["sun"]}},
+               "img2.jpg": {"frame": {"weather": ["rain"]}}},
+}
 
 
 def _make_dataset_on_disk(source_root: Path, name: str, classes: list[str]) -> None:
@@ -258,6 +280,143 @@ class CombinedEvalViewTests(PipelineEvalSetup):
         payload = promote_call.call_args.args[0]
         self.assertTrue(payload["predictions_path"].endswith("pipeline-7/predictions.pt"))
         self.assertEqual(payload["score_threshold"], 0.4)
+
+
+class MatchTablePayloadTests(PipelineEvalSetup):
+    """The backfill payload has to describe the evaluation that actually ran."""
+
+    def _eval(self, **kwargs):
+        return EvalRun.objects.create(
+            trained_model=self.tm, dataset=self.ds1, label_source=EvalRun.SOURCE, **kwargs)
+
+    def _with_predictions(self, eval_obj, filename="eval_predictions.pt"):
+        directory = Path(eval_obj.output_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / filename).write_bytes(b"")
+
+    def test_thresholds_come_from_the_metrics_the_eval_recorded(self):
+        er = self._eval(
+            output_dir=str(self.source.parent / "eval-3"),
+            score_threshold=0.4, map_score_threshold=0.002,
+            metrics={"iou_thresholds": [0.5, 0.75], "operating_nms_threshold": 0.65},
+        )
+        self._with_predictions(er)
+
+        payload = config_gen.build_match_table_payload(er, "base")
+
+        # operating_nms_threshold is derived inside the trainer and never appears
+        # on the eval request, so the metrics are the only record of it.
+        self.assertEqual(payload["iou_thresholds"], [0.5, 0.75])
+        self.assertEqual(payload["operating_nms_threshold"], 0.65)
+        self.assertEqual(payload["score_threshold"], 0.4)
+        self.assertEqual(payload["map_score_threshold"], 0.002)
+        self.assertEqual(payload["classes"], ["helmet", "head", "vest"])
+        self.assertEqual(payload["checkpoint_path"], self.tm.checkpoint_path)
+        self.assertTrue(payload["predictions_path"].endswith("eval-3/eval_predictions.pt"))
+        self.assertTrue(payload["labels_dir"].endswith("ds1/labels"))
+
+    def test_a_pipeline_eval_points_at_its_own_predictions_file(self):
+        pe = self._make(pipeline=PipelineEvalRun.BATCH_DETECT,
+                        output_dir=str(self.source.parent / "pipeline-4"))
+        self._with_predictions(pe, "predictions.pt")
+
+        payload = config_gen.build_match_table_payload(pe, "pipeline")
+
+        self.assertTrue(payload["predictions_path"].endswith("pipeline-4/predictions.pt"))
+
+    def test_missing_predictions_says_so_instead_of_failing_in_the_trainer(self):
+        er = self._eval(output_dir=str(self.source.parent / "eval-9"))
+
+        with self.assertRaises(ValueError) as caught:
+            config_gen.build_match_table_payload(er, "base")
+
+        self.assertIn("eval_predictions.pt", str(caught.exception))
+
+    def test_the_action_reports_what_the_trainer_built(self):
+        er = self._eval(output_dir=str(self.source.parent / "eval-5"))
+        self._with_predictions(er)
+        admin = BaseEvalAdmin(BaseEval, AdminSite())
+        queryset = BaseEval.objects.filter(pk=er.pk)
+        request = RequestFactory().post("/")
+
+        with mock.patch.object(runner, "build_match_table", return_value={
+            "match_table_path": "/out/eval-5/eval_matches.json", "images": 4,
+            "images_without_labels": 0, "ground_truth_boxes": 5, "predictions": 4,
+        }) as call, mock.patch.object(admin, "message_user") as message:
+            admin.build_tag_data(request, queryset)
+
+        call.assert_called_once()
+        self.assertIn("eval_matches.json", message.call_args.args[1])
+
+
+class TagAnalyticsViewTests(PipelineEvalSetup):
+    """The report page: what it says when the two artifacts are and aren't there."""
+
+    def _eval_with_table(self, table=None, tags=None):
+        output_dir = self.source.parent / "eval-7"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        er = EvalRun.objects.create(
+            trained_model=self.tm, dataset=self.ds1, label_source=EvalRun.SOURCE,
+            output_dir=str(output_dir), metrics={"map50": 0.5},
+        )
+        if table is not None:
+            (output_dir / "eval_matches.json").write_text(json.dumps(table), encoding="utf-8")
+        if tags is not None:
+            (self.source / "ds1" / "labels" / "annotation_tags.json").write_text(
+                json.dumps(tags), encoding="utf-8")
+        return er
+
+    def _get(self, er, view="tag_analytics_view", **params):
+        admin = CombinedEvalAdmin(CombinedEval, AdminSite())
+        query = {"kind": CombinedEval.BASE, "eval": er.pk, **params}
+        request = RequestFactory().get("/", query)
+        request.user = mock.Mock(is_active=True, is_staff=True)
+        return getattr(admin, view)(request)
+
+    def test_an_eval_with_no_match_table_is_told_how_to_get_one(self):
+        er = self._eval_with_table(tags={"version": 1, "tags": [], "images": {}})
+
+        response = self._get(er)
+
+        self.assertIn("Build tag analytics data", response.context_data["problem"])
+
+    def test_a_dataset_with_no_tag_answers_says_where_they_would_be(self):
+        er = self._eval_with_table(table=_MATCH_TABLE)
+
+        response = self._get(er)
+
+        self.assertIn("annotation_tags.json", response.context_data["problem"])
+
+    def test_both_artifacts_present_renders_the_report(self):
+        er = self._eval_with_table(table=_MATCH_TABLE, tags=_TAG_DOCUMENT)
+
+        response = self._get(er)
+        response.render()
+
+        self.assertIsNone(response.context_data["problem"])
+        report = response.context_data["report"]
+        self.assertEqual([b["name"] for b in report["breakdowns"]], ["weather"])
+        self.assertContains(response, "Tag analytics")
+        self.assertContains(response, "weather")
+
+    def test_the_data_endpoint_scores_an_arbitrary_intersection(self):
+        er = self._eval_with_table(table=_MATCH_TABLE, tags=_TAG_DOCUMENT)
+
+        response = self._get(er, view="tag_analytics_data", mode="slice",
+                             clauses=json.dumps([["weather", "rain"]]))
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["kind"], "frame")
+        self.assertEqual(payload["images"], 1)
+
+    def test_a_filter_naming_something_that_does_not_exist_is_a_400(self):
+        er = self._eval_with_table(table=_MATCH_TABLE, tags=_TAG_DOCUMENT)
+
+        response = self._get(er, view="tag_analytics_data", mode="slice",
+                             clauses=json.dumps([["weather", "hail"]]))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("hail", json.loads(response.content)["error"])
 
 
 class AutoEvalPipelineTests(TestCase):

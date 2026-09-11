@@ -1,13 +1,15 @@
 {% comment %}
 The model + pipeline half of an inference form: which model runs, and what
-geometry the frames reach it through. Shared verbatim by "Run model inference…"
-and "Run model inference for marketing…" — the two differ only in what they add
-around it (the marketing form adds a Look section and a preview), and a knob
-added here has to appear on both or the two actions quietly stop being the same
-run.
+geometry the frames reach it through. Shared verbatim by "Run model inference…",
+"Run model inference for marketing…" and the Datasets tab's "Run model
+inference…" — they differ only in what they add around it (a Look section and a
+preview; an image limit), and a knob added here has to appear on all of them or
+they quietly stop being the same run.
 
-Expects the context videos.admin._inference_wizard builds, and must sit inside
-that page's <form>.
+Expects the context training.services.inference_form builds (model_context +
+pipeline_context + form_values), and must sit inside that page's <form>. The
+frame_stride row is opt-in via ``show_frame_stride``: it is a property of a
+video, and a run over a folder of images has no such thing.
 {% endcomment %}
   {% if is_bundle %}
     <div class="form-row" data-bundle-sync="{{ bundle_sync_url }}">
@@ -185,6 +187,7 @@ that page's <form>.
     <p class="help">Detections below this confidence are dropped.</p>
   </div>
 
+  {% if show_frame_stride %}
   <div class="form-row">
     <label for="frame_stride">Frame stride:</label>
     <input type="number" name="frame_stride" id="frame_stride" min="1"
@@ -193,4 +196,5 @@ that page's <form>.
     inferred boxes. Higher = faster, less temporally precise. Pipelines run the model
     several times per frame, so raise this for anything but <code>raw</code>.</p>
   </div>
+  {% endif %}
 

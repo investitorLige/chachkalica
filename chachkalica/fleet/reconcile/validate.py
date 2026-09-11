@@ -40,7 +40,11 @@ def clean_objects(objects: list[dict], num_classes: int) -> tuple[list[dict], li
             else:
                 polygon = [min(1.0, max(0.0, float(v))) for v in polygon]
 
-        clean.append({"class_id": class_id, "bbox": (cx, cy, w, h), "polygon": polygon})
+        # region_id is carried through untouched: it is not geometry, but the
+        # tag sidecar joins per-region answers on it and only sees the cleaned
+        # list (see reconcile.tag_values.image_entry).
+        clean.append({"class_id": class_id, "bbox": (cx, cy, w, h), "polygon": polygon,
+                      "region_id": obj.get("region_id")})
 
     return clean, warnings
 

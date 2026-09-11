@@ -25,6 +25,7 @@ try:
         HARD_IMAGE_METRIC_DESCRIPTION,
         evaluate_detection,
         hard_images_top_k,
+        match_table,
         select_hard_images,
     )
     from ..postprocess import apply_class_aware_nms
@@ -41,6 +42,7 @@ except ImportError:
         HARD_IMAGE_METRIC_DESCRIPTION,
         evaluate_detection,
         hard_images_top_k,
+        match_table,
         select_hard_images,
     )
     from postprocess import apply_class_aware_nms
@@ -1270,6 +1272,18 @@ def predict_dataset(
         operating_nms_threshold=operating_nms_threshold,
         top_k_fraction=hard_images_top_k_fraction,
     )
+    _write_match_table(
+        output_path,
+        all_predictions,
+        all_targets,
+        records,
+        config=config,
+        num_classes=num_classes,
+        prediction_classes=prediction_classes,
+        target_classes=target_classes,
+        eval_classes=eval_classes,
+        operating_nms_threshold=operating_nms_threshold,
+    )
     return metrics
 
 
@@ -1359,6 +1373,94 @@ def _write_hard_images(
         print(f"[train] Saved hard images: {output_path} count={len(images)}")
     except Exception as exc:  # noqa: BLE001 - artifact is best-effort; never break the eval
         print(f"[train] WARNING: failed to write hard images ({output_path}): {exc}")
+
+
+MATCH_TABLE_SUFFIX = "_matches.json"
+
+
+def match_table_path(predictions_path: str | Path) -> Path:
+    """``<split>_matches.json`` beside ``<split>_predictions.pt``.
+
+    Same naming rule as the hard-images artifact, so an eval directory reads as
+    one family: ``eval_predictions.pt`` / ``eval_hard_images.json`` /
+    ``eval_matches.json``, and a chachak pipeline's ``predictions.pt`` gets
+    ``predictions_matches.json``.
+    """
+    predictions_path = Path(predictions_path)
+    if predictions_path.name.endswith("_predictions.pt"):
+        stem = predictions_path.name[: -len("_predictions.pt")]
+    else:
+        stem = predictions_path.stem
+    return predictions_path.with_name(stem + MATCH_TABLE_SUFFIX)
+
+
+def _write_match_table(
+    predictions_path: str | Path,
+    all_predictions: List[torch.Tensor],
+    all_targets: List[Dict[str, Any]],
+    records: List[Dict[str, Any]],
+    *,
+    config: Optional[ExperimentConfig],
+    num_classes: Optional[int] = None,
+    prediction_classes: Optional[Dict[int, str]],
+    target_classes: Optional[Dict[int, str]],
+    eval_classes: Optional[Dict[int, str]],
+    operating_nms_threshold: Optional[float] = None,
+    iou_thresholds: Optional[List[float]] = None,
+    score_threshold: Optional[float] = None,
+    map_score_threshold: Optional[float] = None,
+) -> None:
+    """Persist the per-detection match outcomes next to the predictions file.
+
+    The artifact that makes sliced analytics possible: per-tag, per-class or
+    per-anything metrics are computed from this table instead of from a second
+    inference pass (see ``metrics.match_table``). Best-effort and last, exactly
+    like the hard-images artifact — an eval that produced its metrics must not
+    fail over an analytics extra.
+
+    The arguments are forwarded verbatim from the same call that produced the
+    headline metrics, so the table describes *that* evaluation. A consumer can
+    therefore check itself: re-scoring the unfiltered table has to reproduce the
+    stored map50, and if it doesn't, the consumer is wrong.
+    """
+    if not all_targets or not any(int(target['labels'].numel()) for target in all_targets):
+        print("[train] Skipping match table: no ground-truth labels in split")
+        return
+
+    # Explicit thresholds win over the config's, for callers that have no
+    # ExperimentConfig to hand (chachak's pipelines) — the same fallback
+    # _write_hard_images uses. They must be whatever the accompanying
+    # evaluate_detection call was given, or the table describes a different
+    # evaluation than the metrics beside it.
+    if iou_thresholds is None and config is not None:
+        iou_thresholds = config.evaluation.iou_thresholds
+    if score_threshold is None:
+        score_threshold = config.evaluation.score_threshold if config is not None else 0.001
+    if map_score_threshold is None and config is not None:
+        map_score_threshold = config.evaluation.map_score_threshold
+
+    output_path = match_table_path(predictions_path)
+    try:
+        table = match_table(
+            all_predictions,
+            all_targets,
+            iou_thresholds=iou_thresholds,
+            score_threshold=score_threshold,
+            map_score_threshold=map_score_threshold,
+            num_classes=num_classes,
+            prediction_classes=prediction_classes,
+            target_classes=target_classes,
+            eval_classes=eval_classes,
+            operating_nms_threshold=operating_nms_threshold,
+            image_names=[record.get("image_path") for record in records],
+        )
+        _atomic_write_json(output_path, table)
+        print(
+            f"[train] Saved match table: {output_path} "
+            f"gt={len(table['gt']['image'])} pred={len(table['pred']['image'])}"
+        )
+    except Exception as exc:  # noqa: BLE001 - artifact is best-effort; never break the eval
+        print(f"[train] WARNING: failed to write match table ({output_path}): {exc}")
 
 
 def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:

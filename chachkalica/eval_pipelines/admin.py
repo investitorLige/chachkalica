@@ -18,7 +18,7 @@ from pathlib import Path
 import django_rq
 from django.contrib import admin, messages
 from django.contrib.admin.helpers import ACTION_CHECKBOX_NAME
-from django.http import FileResponse, Http404, JsonResponse
+from django.http import FileResponse, Http404, HttpResponseRedirect, JsonResponse
 from django.template.loader import render_to_string
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
@@ -31,7 +31,7 @@ from fleet.services.paths import source_root
 from training import jobs
 from training.admin import _hard_image_path_from_request, _hard_image_token, _preview_index
 from training.models import EvalRun
-from training.services import config_gen, eval_analytics, runner
+from training.services import config_gen, eval_analytics, runner, tag_analytics
 
 from eval_pipelines.models import (
     BaseEval,
@@ -62,15 +62,24 @@ def _hard_images_artifact(output_dir):
     return matches[0] if matches else None
 
 
-def _attach_hard_images_links(columns):
-    """Add a ``hard_images_url`` (or None) to each compare-page column in place."""
+def _attach_eval_links(columns):
+    """Add the per-eval viewer links to each compare-page column, in place.
+
+    ``hard_images_url`` and ``tag_analytics_url`` are None when that eval has no
+    artifact behind them — an eval predating the feature, or one whose dataset
+    carries no tags — so the template can simply omit the link rather than
+    offer a page that would 404.
+    """
     for column in columns:
-        has_artifact = _hard_images_artifact(column.get("output_dir")) is not None
+        query = urlencode({"kind": column["kind"], "eval": column["orig_id"]})
+        has_hard_images = _hard_images_artifact(column.get("output_dir")) is not None
         column["hard_images_url"] = (
-            reverse("admin:eval_pipelines_combinedeval_hard_images") + "?" + urlencode(
-                {"kind": column["kind"], "eval": column["orig_id"]}
-            )
-        ) if has_artifact else None
+            reverse("admin:eval_pipelines_combinedeval_hard_images") + "?" + query
+        ) if has_hard_images else None
+        has_matches = tag_analytics.match_table_artifact(column.get("output_dir")) is not None
+        column["tag_analytics_url"] = (
+            reverse("admin:eval_pipelines_combinedeval_tag_analytics") + "?" + query
+        ) if has_matches else None
     return columns
 
 
@@ -118,7 +127,7 @@ def _analyze(model_admin, request, queryset, title):
         return None
 
     compared = eval_analytics.compare(runs)
-    _attach_hard_images_links(compared["columns"])
+    _attach_eval_links(compared["columns"])
     context = {
         **model_admin.admin_site.each_context(request),
         "title": title,
@@ -189,19 +198,24 @@ class PromoteLabelsMixin:
     ``labels/``. Refreshes the dataset's ``has_labels`` flag afterwards.
 
     Subclasses set :attr:`promote_kind` (``"base"`` / ``"pipeline"``); the
-    combined list overrides :meth:`_promote_target` to resolve each row back to
+    combined list overrides :meth:`_eval_target` to resolve each row back to
     its real eval before promoting.
     """
 
     promote_kind = None
 
-    def _promote_target(self, obj):
-        """Return ``(real_eval, kind)`` for one selected row."""
+    def _eval_target(self, obj):
+        """Return ``(real_eval, kind)`` for one selected row.
+
+        Shared with :class:`TagAnalyticsMixin`, which needs the same
+        resolution: the combined list's rows come from a database view and have
+        to be traced back to a real eval before anything reads their files.
+        """
         return obj, self.promote_kind
 
     @admin.action(description="Promote predictions to source labels…")
     def promote_labels(self, request, queryset):
-        targets = [self._promote_target(obj) for obj in queryset]
+        targets = [self._eval_target(obj) for obj in queryset]
 
         if request.POST.get("apply"):
             try:
@@ -248,13 +262,130 @@ class PromoteLabelsMixin:
         return TemplateResponse(request, "admin/eval_pipelines/promote_labels.html", context)
 
 
+def _tag_analytics_url(eval_obj, kind: str) -> str:
+    """Link to the shared tag-analytics report for one eval."""
+    return reverse("admin:eval_pipelines_combinedeval_tag_analytics") + "?" + urlencode(
+        {"kind": kind, "eval": eval_obj.pk}
+    )
+
+
+def _resolve_eval_for_tags(request):
+    """The real ``EvalRun``/``PipelineEvalRun`` a tag-analytics URL points at.
+
+    Addressed by ``?kind=base|pipeline&eval=<pk>`` for the same reason the
+    worst-images viewer is: one report serves every eval list, so it cannot be
+    hung off any one list's pk space.
+    """
+    kind = request.GET.get("kind")
+    model = PipelineEvalRun if kind == CombinedEval.PIPELINE else EvalRun
+    obj = model.objects.filter(pk=request.GET.get("eval")).first()
+    if obj is None:
+        raise Http404("unknown eval")
+    return obj, (CombinedEval.PIPELINE if kind == CombinedEval.PIPELINE else CombinedEval.BASE)
+
+
+def _load_tag_analysis(eval_obj):
+    """``(table, index)`` for an eval, or a string saying what is missing.
+
+    Two artifacts have to meet: the eval's own match table (written by the
+    trainer, or rebuilt by the "Build tag analytics data" action) and the
+    dataset's tag answers (written into the label directory by ``fleet sync``).
+    Either one absent is an ordinary state with a specific fix, so this returns
+    the explanation rather than raising — the page prints it.
+    """
+    artifact = tag_analytics.match_table_artifact(getattr(eval_obj, "output_dir", ""))
+    if artifact is None:
+        return None, (
+            "This eval has no match table. Evals run before tag analytics existed "
+            "did not write one — select the eval and run “Build tag analytics data…”, "
+            "which rebuilds it from the predictions it already saved (no GPU, no "
+            "re-inference)."
+        )
+    try:
+        labels_dir = config_gen.resolve_label_dir(
+            eval_obj.dataset, eval_obj.label_source,
+            getattr(eval_obj, "annotator", None),
+            getattr(eval_obj, "explicit_labels_path", "") or "",
+        )
+    except ValueError as exc:
+        return None, f"Cannot locate this eval's labels: {exc}"
+
+    document = tag_analytics.load_tag_document(labels_dir)
+    if document is None:
+        return None, (
+            f"No annotation_tags.json next to this eval's labels ({labels_dir}). "
+            "Tag answers land there when the dataset's annotator projects are "
+            "synced — define tags on the dataset, sync, and re-run or rebuild."
+        )
+
+    try:
+        table = tag_analytics.load_table(artifact)
+    except (OSError, ValueError) as exc:
+        return None, f"Could not read {artifact.name}: {exc}"
+    return (table, tag_analytics.build_tag_index(table, document)), None
+
+
+class TagAnalyticsMixin:
+    """"Tag analytics" + "Build tag analytics data" actions for an eval list.
+
+    The report itself lives on the combined list (one page, every eval kind —
+    see :meth:`CombinedEvalAdmin.tag_analytics_view`); these actions are how
+    each list reaches it and how an older eval gets the data it needs first.
+    """
+
+    @admin.action(description="Tag analytics (per-tag / cross-tag metrics)…")
+    def open_tag_analytics(self, request, queryset):
+        rows = list(queryset)
+        if len(rows) != 1:
+            self.message_user(
+                request,
+                "Select exactly one eval — tag analytics slices a single eval's own "
+                "predictions. Use “Analyze / compare” to put several side by side.",
+                level=messages.WARNING,
+            )
+            return None
+        eval_obj, kind = self._eval_target(rows[0])
+        return HttpResponseRedirect(_tag_analytics_url(eval_obj, kind))
+
+    @admin.action(description="Build tag analytics data (rebuild match table)")
+    def build_tag_data(self, request, queryset):
+        """Rebuild each selected eval's match table from its saved predictions.
+
+        Synchronous, like "Promote predictions to source labels": the trainer
+        reads the predictions file and the label files and writes one JSON. It
+        loads no model and never touches the GPU, so it does not queue behind a
+        training run — but it is not instant on a large eval, which is why the
+        result is reported per row rather than fired and forgotten.
+        """
+        for row in queryset:
+            eval_obj, kind = self._eval_target(row)
+            label = f"{kind} eval #{eval_obj.pk}"
+            try:
+                payload = config_gen.build_match_table_payload(eval_obj, kind)
+                summary = runner.build_match_table(payload)
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.message_user(request, f"{label}: {exc}", level=messages.ERROR)
+                continue
+            note = ""
+            if summary["images_without_labels"]:
+                note = (f"; {summary['images_without_labels']} image(s) had no readable "
+                        "label file and contribute no ground truth")
+            self.message_user(
+                request,
+                f"{label}: built {Path(summary['match_table_path']).name} — "
+                f"{summary['images']} image(s), {summary['ground_truth_boxes']} "
+                f"ground-truth box(es), {summary['predictions']} prediction(s){note}",
+            )
+
+
 @admin.register(BaseEval)
-class BaseEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
+class BaseEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin, admin.ModelAdmin):
     promote_kind = "base"
     list_display = ["__str__", "models_display", "dataset", "status_badge",
                     "map50", "map50_95", "eval_time", "created_at"]
     list_filter = ["status", "trained_model"]
-    actions = ["analyze_selected", "launch_selected", "reconcile_selected", "promote_labels"]
+    actions = ["analyze_selected", "open_tag_analytics", "build_tag_data",
+               "launch_selected", "reconcile_selected", "promote_labels"]
     readonly_fields = [
         "trained_model", "dataset", "label_source", "annotator", "explicit_labels_path",
         "score_threshold",
@@ -295,7 +426,7 @@ class BaseEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
             self.message_user(request, f"Eval #{eval_run.pk}: {outcome}")
 
 
-class PipelineEvalRunAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
+class PipelineEvalRunAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin, admin.ModelAdmin):
     """Shared admin for the per-pipeline proxies (Batch detect, Chain, …).
 
     Each pipeline type gets its own list via a proxy subclass registered below, so
@@ -308,7 +439,8 @@ class PipelineEvalRunAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmi
     list_display = ["__str__", "models_display", "dataset", "status_badge",
                     "map50", "map50_95", "eval_time", "created_at"]
     list_filter = ["status", "trained_model"]
-    actions = ["analyze_selected", "launch_selected", "reconcile_selected", "promote_labels"]
+    actions = ["analyze_selected", "open_tag_analytics", "build_tag_data",
+               "launch_selected", "reconcile_selected", "promote_labels"]
     readonly_fields = [
         "trained_model", "dataset", "label_source", "annotator", "explicit_labels_path",
         "pipeline", "detector_checkpoint", "detector_expand_ratio",
@@ -352,7 +484,7 @@ class PipelineEvalRunAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmi
 
 
 @admin.register(CombinedEval)
-class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
+class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin, admin.ModelAdmin):
     """The combined "All pipeline evals" list — base + every pipeline in one place.
 
     Read-only union view (see :class:`CombinedEval`): rows can't be edited here,
@@ -365,7 +497,8 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
                     "map50", "map50_95", "eval_time", "created_at"]
     list_display_links = None
     list_filter = ["status", "pipeline", "trained_model"]
-    actions = ["analyze_selected", "launch_selected", "reconcile_selected", "promote_labels",
+    actions = ["analyze_selected", "open_tag_analytics", "build_tag_data",
+               "launch_selected", "reconcile_selected", "promote_labels",
                "delete_selected_evals"]
 
     def has_add_permission(self, request):
@@ -377,13 +510,17 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
     def has_delete_permission(self, request, obj=None):
         return False
 
-    def _promote_target(self, obj):
+    def _eval_target(self, obj):
         if obj.kind == CombinedEval.BASE:
             return EvalRun.objects.get(pk=obj.orig_id), "base"
         return PipelineEvalRun.objects.get(pk=obj.orig_id), "pipeline"
 
     def get_urls(self):
         custom = [
+            path("tag-analytics/", self.admin_site.admin_view(self.tag_analytics_view),
+                 name="eval_pipelines_combinedeval_tag_analytics"),
+            path("tag-analytics/data/", self.admin_site.admin_view(self.tag_analytics_data),
+                 name="eval_pipelines_combinedeval_tag_analytics_data"),
             path("hard-images/", self.admin_site.admin_view(self.hard_images_view),
                  name="eval_pipelines_combinedeval_hard_images"),
             path("hard-images/image/", self.admin_site.admin_view(self.hard_images_image),
@@ -400,6 +537,61 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
     # ``TrainedModelAdmin``'s "hardest val images" viewer (``training.admin``),
     # but the worst 10% rather than a fixed top-50 — see
     # ``friendy_chachkalica.metrics.EVAL_HARD_IMAGES_FRACTION``.
+    # ------------------------------------------------------- tag analytics
+    # One report for every eval list, addressed by ``?kind=&eval=`` like the
+    # worst-images viewer. The page renders the per-tag tables server-side and
+    # then talks to ``tag_analytics_data`` for anything the operator builds by
+    # hand — a cross-tab, an arbitrary intersection of tag values. Those are
+    # numpy passes over a table already in memory, so a round trip is cheaper
+    # (and far less code) than shipping the whole table to the browser and
+    # re-implementing AP in JavaScript.
+    def tag_analytics_view(self, request):
+        eval_obj, kind = _resolve_eval_for_tags(request)
+        loaded, problem = _load_tag_analysis(eval_obj)
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Tag analytics — {eval_obj}",
+            "subject_name": str(eval_obj),
+            "dataset": eval_obj.dataset.name,
+            "problem": problem,
+            "query": urlencode({"kind": kind, "eval": eval_obj.pk}),
+            "data_url": reverse("admin:eval_pipelines_combinedeval_tag_analytics_data"),
+        }
+        if loaded is not None:
+            table, index = loaded
+            context["report"] = tag_analytics.report(table, index, eval_obj.metrics)
+        return TemplateResponse(request, "admin/eval_pipelines/tag_analytics.html", context)
+
+    def tag_analytics_data(self, request):
+        """Score one operator-built slice, or one cross-tab, as JSON.
+
+        ``?mode=slice&clauses=[["weather","rain"],["shift","night"]]`` intersects
+        the clauses; ``?mode=cross&tag_a=&tag_b=&metric=`` fills a grid with one
+        metric over every combination of two tags' values.
+        """
+        eval_obj, _kind = _resolve_eval_for_tags(request)
+        loaded, problem = _load_tag_analysis(eval_obj)
+        if loaded is None:
+            return JsonResponse({"error": problem}, status=400)
+        table, index = loaded
+
+        try:
+            if request.GET.get("mode") == "cross":
+                return JsonResponse(tag_analytics.cross_tab(
+                    table, index,
+                    request.GET.get("tag_a", ""), request.GET.get("tag_b", ""),
+                    request.GET.get("metric", ""),
+                ))
+            clauses = json.loads(request.GET.get("clauses") or "[]")
+            if not isinstance(clauses, list):
+                raise ValueError("clauses must be a list of [tag, value] pairs")
+            pairs = [(str(pair[0]), str(pair[1])) for pair in clauses]
+            return JsonResponse(tag_analytics.slice_metrics(table, index, pairs))
+        except tag_analytics.UnknownClause as exc:
+            return JsonResponse({"error": str(exc)}, status=400)
+        except (ValueError, TypeError, IndexError) as exc:
+            return JsonResponse({"error": f"bad filter: {exc}"}, status=400)
+
     def hard_images_view(self, request):
         """Render the viewer shell; the browser pulls images + precomputed boxes per index."""
         eval_obj = _resolve_eval_for_hard_images(request)
@@ -478,7 +670,7 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
         queue = _queue()
         prev_job = None  # chain so a multi-select launch doesn't race the trainer's single slot
         for row in queryset:
-            eval_obj, kind = self._promote_target(row)
+            eval_obj, kind = self._eval_target(row)
             if not eval_obj.request_yaml_path:
                 self.message_user(request, f"{kind} eval #{eval_obj.pk} has no request; skipped.",
                                   level=messages.WARNING)
@@ -497,7 +689,7 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
         from training.services import reconcile
 
         for row in queryset:
-            eval_obj, kind = self._promote_target(row)
+            eval_obj, kind = self._eval_target(row)
             outcome = (reconcile.reconcile_eval(eval_obj) if kind == "base"
                        else reconcile.reconcile_pipeline(eval_obj))
             self.message_user(request, f"{kind} eval #{eval_obj.pk}: {outcome}")
@@ -512,7 +704,7 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, admin.ModelAdmin):
         evals, ``eval_pipelines.signals`` for pipeline evals), which removes the
         run's output dir and generated request YAML from disk.
         """
-        targets = [self._promote_target(obj) for obj in queryset]
+        targets = [self._eval_target(obj) for obj in queryset]
 
         if request.POST.get("apply"):
             for eval_obj, kind in targets:

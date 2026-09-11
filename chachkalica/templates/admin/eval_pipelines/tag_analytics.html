@@ -1,0 +1,443 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  .tga { max-width: 1180px; }
+  .tga h2 { margin-top: 1.6em; border-bottom: 1px solid #ccc; padding-bottom: .3em; }
+  .tga h3 { margin: 1.4em 0 .2em; font-size: 15px; }
+  .tga .note { color: #777; font-size: 12px; margin: .3em 0; }
+  .tga .note code { font-size: 11px; }
+  .tga table { border-collapse: collapse; margin: 10px 0 4px; }
+  .tga th, .tga td { padding: 6px 13px; border-bottom: 1px solid #e0e0e0; text-align: right;
+                     font-variant-numeric: tabular-nums; }
+  .tga th.rowlabel, .tga td.rowlabel { text-align: left; font-weight: 600; }
+  .tga thead th { text-align: right; vertical-align: bottom; font-size: 12px; }
+  .tga thead th.rowlabel { text-align: left; }
+  .tga td.na { color: #bbb; }
+  .tga .scope { display: inline-block; font-size: 11px; font-weight: 400; color: #fff;
+                background: #6b7b8c; border-radius: 3px; padding: 1px 6px; margin-left: 8px;
+                vertical-align: middle; }
+  .tga .scope.box { background: #8c6b7b; }
+  /* Deltas carry an explicit palette so they stay legible under the admin's dark
+     theme, same reason the confusion matrix on the compare page does. */
+  .tga .delta { font-weight: 700; }
+  .tga .delta.down { color: #c62828; }
+  .tga .delta.up { color: #147837; }
+  .tga .banner { border-left: 4px solid #b8860b; background: #fff8e1; color: #4a3a00;
+                 padding: 10px 14px; margin: 14px 0; font-size: 13px; }
+  .tga .banner.bad { border-left-color: #c62828; background: #fdecea; color: #7a1c1c; }
+  .tga .banner.ok { border-left-color: #147837; background: #e8f6ec; color: #12572a; }
+  .tga .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+                   margin: 10px 0; font-size: 13px; }
+  .tga .controls label { display: block; font-size: 11px; color: #777; margin-bottom: 2px; }
+  .tga .clause { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+  .tga .clause .and { color: #888; font-size: 11px; width: 30px; }
+  .tga .result { border: 1px solid #ddd; padding: 12px 16px; margin: 10px 0; background: #fff;
+                 color: #222; }
+  .tga .tiles { display: flex; flex-wrap: wrap; gap: 22px; margin: 4px 0 10px; }
+  .tga .tile .k { font-size: 11px; color: #777; text-transform: uppercase; letter-spacing: .04em; }
+  .tga .tile .v { font-size: 21px; font-weight: 700; font-variant-numeric: tabular-nums;
+                  color: #222; }
+  .tga table.grid { background: #fff; }
+  .tga table.grid th, .tga table.grid td { border: 1px solid #dcdcdc; color: #222;
+                                           background-color: #fff; }
+  .tga table.grid th.rowlabel { background: #f2f2f2; }
+  .tga table.grid td.cell { color: #fff !important; font-weight: 700;
+                            background: rgba(20, 120, 55, calc(var(--i) * 0.9)); }
+  .tga table.grid td.cell .pop { display: block; font-size: 10px; font-weight: 400;
+                                 opacity: .85; }
+  .tga table.grid td.empty { color: #bbb; }
+  .tga details { margin: 6px 0 14px; }
+  .tga details summary { cursor: pointer; font-size: 12px; color: #777; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="tga">
+
+<p class="note">
+  <a href="javascript:history.back()">&larr; Back to evals</a> &nbsp;·&nbsp;
+  {{ subject_name }} &nbsp;·&nbsp; dataset <strong>{{ dataset }}</strong>
+</p>
+
+{% if problem %}
+  <div class="banner">{{ problem }}</div>
+{% else %}
+{% with report=report %}
+
+<p class="note">
+  How this model does on the slices of <strong>{{ dataset }}</strong> that its annotation
+  tags define. Nothing was re-run: every number here is re-scored from the match outcomes
+  this eval already recorded, at its own operating point —
+  confidence <code>&ge; {{ report.score_threshold }}</code>, IoU thresholds
+  <code>{{ report.iou_thresholds|join:", " }}</code>.
+  {% if report.backfilled %}The match table was rebuilt from the saved predictions after the fact.{% endif %}
+</p>
+
+{% if report.check %}
+  {% if report.check.agrees %}
+    <div class="banner ok">
+      Cross-checked against the eval's own metrics: with no filter applied this page
+      reproduces its stored mAP50, mAP50-95, precision and recall exactly
+      (largest difference {{ report.check.worst|floatformat:8 }}).
+    </div>
+  {% else %}
+    <div class="banner bad">
+      <strong>This page disagrees with the eval's stored metrics.</strong> Unfiltered, it
+      should reproduce them exactly, so the slices below are not trustworthy — the match
+      table and the metrics were probably produced by different thresholds.
+      <table>
+        <thead><tr><th class="rowlabel">Metric</th><th>Eval</th><th>This page</th><th>Difference</th></tr></thead>
+        <tbody>
+        {% for row in report.check.checks %}
+          <tr><td class="rowlabel">{{ row.label }}</td><td>{{ row.stored|floatformat:6 }}</td>
+              <td>{{ row.computed|floatformat:6 }}</td><td>{{ row.difference|floatformat:8 }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+{% endif %}
+
+<h2>Coverage</h2>
+<table>
+  <tbody>
+    <tr><td class="rowlabel">Images in the eval</td><td>{{ report.coverage.images }}</td></tr>
+    <tr><td class="rowlabel">Ground-truth boxes</td><td>{{ report.coverage.gt }}</td></tr>
+    <tr><td class="rowlabel">Images carrying tag answers</td><td>{{ report.coverage.images_with_tags }}</td></tr>
+    {% if report.coverage.images_not_in_eval %}
+      <tr><td class="rowlabel">Tagged images not in this eval</td>
+          <td>{{ report.coverage.images_not_in_eval }}</td></tr>
+    {% endif %}
+    {% if report.coverage.row_mismatches %}
+      <tr><td class="rowlabel">Images whose box tags were dropped</td>
+          <td>{{ report.coverage.row_mismatches }}</td></tr>
+    {% endif %}
+  </tbody>
+</table>
+{% if report.coverage.row_mismatches %}
+  <p class="note">
+    Box tags are joined to ground-truth boxes by their line number in the label file, checked
+    against the class recorded beside it. {{ report.coverage.row_mismatches }} image(s)
+    disagreed — their labels and tag answers have drifted apart (relabelled, re-promoted, or
+    hand-edited since the sync) — so their <em>box</em> tags were left out rather than
+    attributed to the wrong boxes. Their frame tags are unaffected. Re-sync the annotator's
+    project to line them up again.
+  </p>
+{% endif %}
+
+<h2>Whole dataset</h2>
+<div class="result">
+  <div class="tiles">
+    <div class="tile"><div class="k">mAP50</div><div class="v">{{ report.overall.map50|floatformat:4 }}</div></div>
+    <div class="tile"><div class="k">mAP50-95</div><div class="v">{{ report.overall.map50_95|floatformat:4 }}</div></div>
+    <div class="tile"><div class="k">precision</div><div class="v">{{ report.overall.precision|floatformat:4 }}</div></div>
+    <div class="tile"><div class="k">recall</div><div class="v">{{ report.overall.recall|floatformat:4 }}</div></div>
+    <div class="tile"><div class="k">F1</div><div class="v">{{ report.overall.f1|floatformat:4 }}</div></div>
+    <div class="tile"><div class="k">images</div><div class="v">{{ report.overall.images }}</div></div>
+    <div class="tile"><div class="k">gt boxes</div><div class="v">{{ report.overall.gt }}</div></div>
+  </div>
+</div>
+
+{% for breakdown in report.breakdowns %}
+  <h3>{{ breakdown.name }}
+    <span class="scope {% if breakdown.kind == 'box' %}box{% endif %}">
+      {% if breakdown.kind == 'box' %}box-wide{% else %}frame-wide{% endif %}</span>
+  </h3>
+  <p class="note">
+    answered on {{ breakdown.answered }} of {{ breakdown.total }}
+    {% if breakdown.kind == 'box' %}boxes{% else %}images{% endif %}
+    {% if breakdown.truncated %}· only the most common values are shown{% endif %}
+  </p>
+
+  {% if breakdown.kind == 'frame' %}
+    <table>
+      <thead>
+        <tr><th class="rowlabel">value</th><th>images</th><th>gt</th><th>preds</th>
+            <th>mAP50</th><th>vs all</th><th>mAP50-95</th>
+            <th>precision</th><th>recall</th><th>F1</th></tr>
+      </thead>
+      <tbody>
+        {% for row in breakdown.rows %}
+          <tr>
+            <td class="rowlabel">{{ row.value }}</td>
+            <td>{{ row.images }}</td><td>{{ row.gt }}</td><td>{{ row.predictions }}</td>
+            <td>{{ row.map50|floatformat:4 }}</td>
+            <td class="delta {% if row.delta < 0 %}down{% elif row.delta > 0 %}up{% endif %}">
+              {% if row.delta < 0 %}{{ row.delta|floatformat:3 }}{% else %}+{{ row.delta|floatformat:3 }}{% endif %}</td>
+            <td>{{ row.map50_95|floatformat:4 }}</td>
+            <td>{{ row.precision|floatformat:4 }}</td>
+            <td>{{ row.recall|floatformat:4 }}</td>
+            <td>{{ row.f1|floatformat:4 }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <table>
+      <thead>
+        <tr><th class="rowlabel">value</th><th>boxes</th><th>found</th><th>missed</th>
+            <th>recall</th><th>vs all</th><th>recall (mean IoU)</th>
+            <th>mean IoU</th><th>mean conf</th></tr>
+      </thead>
+      <tbody>
+        {% for row in breakdown.rows %}
+          <tr>
+            <td class="rowlabel">{{ row.value }}</td>
+            <td>{{ row.gt }}</td><td>{{ row.found }}</td><td>{{ row.missed }}</td>
+            <td>{{ row.recall|floatformat:4 }}</td>
+            <td class="delta {% if row.delta < 0 %}down{% elif row.delta > 0 %}up{% endif %}">
+              {% if row.delta < 0 %}{{ row.delta|floatformat:3 }}{% else %}+{{ row.delta|floatformat:3 }}{% endif %}</td>
+            <td>{{ row.recall_50_95|floatformat:4 }}</td>
+            <td>{{ row.mean_iou|floatformat:4 }}</td>
+            <td>{{ row.mean_score|floatformat:4 }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="note">
+      A box tag selects ground-truth boxes, and a prediction carries no tags — so a false
+      positive belongs to no value of this tag and precision and mAP are not defined here.
+      What is measurable is whether each tagged box was found, and how well: recall at the
+      eval's operating confidence and IoU 0.5, the same averaged over every IoU threshold,
+      and the IoU and confidence of the predictions that found them.
+    </p>
+  {% endif %}
+{% endfor %}
+
+<h2>Cross-tab</h2>
+<p class="note">
+  One metric over every combination of two tags' values — the intersection, so a cell is the
+  images (or boxes) answering both. Pairing a box tag with anything makes the whole grid a
+  box slice, with only the ground-truth-side metrics on offer.
+</p>
+<div class="controls">
+  <div><label for="tga-a">rows</label><select id="tga-a"></select></div>
+  <div><label for="tga-b">columns</label><select id="tga-b"></select></div>
+  <div><label for="tga-metric">metric</label><select id="tga-metric"></select></div>
+  <div><button type="button" class="button" id="tga-cross-go">Build grid</button></div>
+</div>
+<div id="tga-cross"></div>
+
+<h2>Custom slice</h2>
+<p class="note">
+  Any intersection of tag values, to whatever depth. Frame-only filters get the full metric
+  set; add a box tag and the slice becomes a set of boxes, scored on recall.
+</p>
+<div id="tga-clauses"></div>
+<div class="controls">
+  <button type="button" class="button" id="tga-add">Add condition</button>
+  <button type="button" class="button default" id="tga-run">Score this slice</button>
+</div>
+<div id="tga-slice"></div>
+
+{% comment %}The page's JS keys off these; they only exist when a report was
+built, which is what the script's own guard checks for. A {# #} comment would
+not do here: Django only strips those on a single line, so a wrapped one renders
+as page text.{% endcomment %}
+{{ report.tags|json_script:"tga-tags" }}
+{{ report.frame_metrics|json_script:"tga-frame-metrics" }}
+{{ report.box_metrics|json_script:"tga-box-metrics" }}
+
+{% endwith %}
+{% endif %}
+
+</div>
+
+<script>
+(function () {
+  const tagsNode = document.getElementById("tga-tags");
+  if (!tagsNode) { return; }
+  const TAGS = JSON.parse(tagsNode.textContent);
+  const FRAME_METRICS = JSON.parse(document.getElementById("tga-frame-metrics").textContent);
+  const BOX_METRICS = JSON.parse(document.getElementById("tga-box-metrics").textContent);
+  const DATA_URL = "{{ data_url }}?{{ query }}";
+  const byName = Object.fromEntries(TAGS.map(t => [t.name, t]));
+
+  function option(value, label) {
+    const node = document.createElement("option");
+    node.value = value;
+    node.textContent = label;
+    return node;
+  }
+
+  function fill(select, entries) {
+    select.innerHTML = "";
+    entries.forEach(([value, label]) => select.appendChild(option(value, label)));
+  }
+
+  function number(value) {
+    return value === null || value === undefined ? "—" : Number(value).toFixed(4);
+  }
+
+  // ------------------------------------------------------------ cross-tab
+  const selectA = document.getElementById("tga-a");
+  const selectB = document.getElementById("tga-b");
+  const selectMetric = document.getElementById("tga-metric");
+  const tagOptions = TAGS.map(t => [t.name, t.name + (t.kind === "box" ? "  (box-wide)" : "")]);
+  fill(selectA, tagOptions);
+  fill(selectB, tagOptions);
+  if (TAGS.length > 1) { selectB.selectedIndex = 1; }
+
+  function refreshMetrics() {
+    // The metric list follows the pair: two frame tags keep the full set, any
+    // box tag drops it to what a set of ground-truth boxes can answer.
+    const kind = (byName[selectA.value] || {}).kind === "frame"
+      && (byName[selectB.value] || {}).kind === "frame" ? "frame" : "box";
+    const previous = selectMetric.value;
+    fill(selectMetric, kind === "frame" ? FRAME_METRICS : BOX_METRICS);
+    if ([...selectMetric.options].some(o => o.value === previous)) { selectMetric.value = previous; }
+  }
+  selectA.addEventListener("change", refreshMetrics);
+  selectB.addEventListener("change", refreshMetrics);
+  refreshMetrics();
+
+  function renderCross(data) {
+    const target = document.getElementById("tga-cross");
+    let html = '<table class="grid"><thead><tr><th class="rowlabel">'
+      + data.tag_a + " \\ " + data.tag_b + "</th>";
+    data.columns.forEach(c => { html += "<th>" + c + "</th>"; });
+    html += "</tr></thead><tbody>";
+    data.rows.forEach(row => {
+      html += '<tr><th class="rowlabel">' + row.label + "</th>";
+      row.cells.forEach(cell => {
+        if (cell.value === null) {
+          html += '<td class="empty">—</td>';
+        } else {
+          html += '<td class="cell" style="--i:' + cell.intensity + '">'
+            + Number(cell.value).toFixed(3)
+            + '<span class="pop">' + cell.population + " " + data.population_label + "</span></td>";
+        }
+      });
+      html += "</tr>";
+    });
+    html += "</tbody></table><p class='note'>Shading runs from the grid's own worst cell to its"
+      + " best, so it compares cells with each other and not with any absolute scale.</p>";
+    target.innerHTML = html;
+  }
+
+  document.getElementById("tga-cross-go").addEventListener("click", () => {
+    const params = new URLSearchParams({
+      mode: "cross", tag_a: selectA.value, tag_b: selectB.value, metric: selectMetric.value,
+    });
+    document.getElementById("tga-cross").textContent = "Scoring…";
+    fetch(DATA_URL + "&" + params.toString())
+      .then(response => response.json())
+      .then(data => {
+        if (data.error) { document.getElementById("tga-cross").textContent = data.error; return; }
+        renderCross(data);
+      })
+      .catch(error => { document.getElementById("tga-cross").textContent = String(error); });
+  });
+
+  // --------------------------------------------------------- custom slice
+  const clauses = document.getElementById("tga-clauses");
+
+  function addClause() {
+    const row = document.createElement("div");
+    row.className = "clause";
+    const and = document.createElement("span");
+    and.className = "and";
+    and.textContent = clauses.children.length ? "and" : "where";
+    const tagSelect = document.createElement("select");
+    fill(tagSelect, tagOptions);
+    const valueSelect = document.createElement("select");
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "button";
+    remove.textContent = "×";
+
+    function refreshValues() {
+      const tag = byName[tagSelect.value] || { values: [] };
+      fill(valueSelect, tag.values.map(v => [v, v + " (" + (tag.counts[v] || 0) + ")"]));
+    }
+    tagSelect.addEventListener("change", refreshValues);
+    refreshValues();
+    remove.addEventListener("click", () => {
+      row.remove();
+      [...clauses.children].forEach((child, index) => {
+        child.querySelector(".and").textContent = index ? "and" : "where";
+      });
+    });
+
+    row.append(and, tagSelect, valueSelect, remove);
+    clauses.appendChild(row);
+  }
+  document.getElementById("tga-add").addEventListener("click", addClause);
+  if (TAGS.length) { addClause(); }
+
+  function tile(label, value) {
+    return '<div class="tile"><div class="k">' + label + '</div><div class="v">' + value + "</div></div>";
+  }
+
+  function renderSlice(data) {
+    const target = document.getElementById("tga-slice");
+    let tiles = "";
+    if (data.kind === "frame") {
+      tiles += tile("images", data.images) + tile("gt boxes", data.gt)
+        + tile("predictions", data.predictions)
+        + tile("mAP50", number(data.map50)) + tile("mAP50-95", number(data.map50_95))
+        + tile("precision", number(data.precision)) + tile("recall", number(data.recall))
+        + tile("F1", number(data.f1));
+    } else {
+      tiles += tile("images", data.images) + tile("boxes", data.gt)
+        + tile("found", data.found) + tile("missed", data.missed)
+        + tile("recall", number(data.recall))
+        + tile("recall (mean IoU)", number(data.recall_50_95))
+        + tile("mean IoU", number(data.mean_iou))
+        + tile("mean conf", number(data.mean_score));
+    }
+
+    let classes = "<table><thead><tr><th class='rowlabel'>class</th>";
+    const perClass = data.kind === "frame" ? data.per_class : data.per_class;
+    if (data.kind === "frame") {
+      classes += "<th>gt</th><th>preds</th><th>AP50</th><th>AP50-95</th><th>precision</th>"
+        + "<th>recall</th><th>F1</th></tr></thead><tbody>";
+      perClass.forEach(row => {
+        classes += "<tr><td class='rowlabel'>" + row.class_name + "</td><td>" + row.gt
+          + "</td><td>" + row.predictions + "</td><td>" + number(row.ap50) + "</td><td>"
+          + number(row.ap50_95) + "</td><td>" + number(row.precision) + "</td><td>"
+          + number(row.recall) + "</td><td>" + number(row.f1) + "</td></tr>";
+      });
+    } else {
+      classes += "<th>boxes</th><th>found</th><th>missed</th><th>recall</th></tr></thead><tbody>";
+      perClass.forEach(row => {
+        classes += "<tr><td class='rowlabel'>" + row.class_name + "</td><td>" + row.gt
+          + "</td><td>" + row.found + "</td><td>" + row.missed + "</td><td>"
+          + number(row.recall) + "</td></tr>";
+      });
+    }
+    classes += "</tbody></table>";
+
+    const warning = (data.kind === "box" && data.small)
+      ? "<p class='note'>Fewer than 30 boxes in this slice — read these as an indication, not a measurement.</p>"
+      : (data.kind === "frame" && data.gt < 30
+        ? "<p class='note'>Fewer than 30 ground-truth boxes in this slice — read these as an indication, not a measurement.</p>"
+        : "");
+    const caveat = data.kind === "box"
+      ? "<p class='note'>A box slice: no precision or mAP, because a false positive carries no tags to attribute it by.</p>"
+      : "";
+
+    target.innerHTML = '<div class="result"><div class="tiles">' + tiles + "</div>"
+      + warning + caveat + "<details><summary>per class</summary>" + classes + "</details></div>";
+  }
+
+  document.getElementById("tga-run").addEventListener("click", () => {
+    const pairs = [...clauses.children].map(row => {
+      const selects = row.querySelectorAll("select");
+      return [selects[0].value, selects[1].value];
+    });
+    const params = new URLSearchParams({ mode: "slice", clauses: JSON.stringify(pairs) });
+    document.getElementById("tga-slice").textContent = "Scoring…";
+    fetch(DATA_URL + "&" + params.toString())
+      .then(response => response.json())
+      .then(data => {
+        if (data.error) { document.getElementById("tga-slice").textContent = data.error; return; }
+        renderSlice(data);
+      })
+      .catch(error => { document.getElementById("tga-slice").textContent = String(error); });
+  });
+})();
+</script>
+{% endblock %}

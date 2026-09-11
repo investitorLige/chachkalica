@@ -7,13 +7,15 @@ import cv2
 import numpy as np
 
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.test import TestCase
 from django.urls import reverse
 
 from fleet import jobs
-from fleet.models import Annotator, Dataset, FleetSettings, Project
+from fleet.models import AnnotationTag, Annotator, Dataset, FleetSettings, Project
 from fleet.reconcile import txt_format
 from fleet.services import analytics as analytics_svc
+from fleet.services import annotation_tags as annotation_tags_svc
 from fleet.services import data_quality_solve
 from fleet.services import datasets as datasets_svc
 from fleet.services import lsapi
@@ -1531,3 +1533,612 @@ class LabelShapesTests(TestCase):
             "7 0.5 0.5 0.1 0.1\n", encoding="utf-8")
         shape = datasets_svc.label_shapes(self.labels_dir, "img.jpg", _PPE_NAMES)[0]
         self.assertEqual(shape["class_name"], "vest")
+
+
+class AnnotationTagConfigTests(TestCase):
+    """The XML a set of tags compiles to — the contract annotators actually see."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = Path(self.tmp.name)
+        (self.src / "ds").mkdir()
+        self.classes = self.src / "ds" / "classes.txt"
+        self.classes.write_text("# tools: bbox\nperson\nhelmet\n", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_no_tags_leaves_the_config_exactly_as_before(self):
+        self.assertEqual(lsapi.build_label_config(self.classes),
+                         lsapi.build_label_config(self.classes, []))
+
+    def test_each_widget_maps_to_its_choices_attributes(self):
+        widgets = {
+            "checkbox": 'choice="multiple"',
+            "radio": 'choice="single"',
+            "dropdown": 'choice="single" layout="select"',
+            "multiselect": 'choice="multiple" layout="select"',
+        }
+        for widget, attrs in widgets.items():
+            xml = lsapi.tag_control_xml({
+                "scope": lsapi.TAG_FRAME, "name": "t", "widget": widget, "choices": ["a"],
+            })
+            self.assertIn(f'<Choices name="t" toName="image" {attrs}>', xml, widget)
+            self.assertIn('<Choice value="a"/>', xml)
+
+    def test_region_scope_is_the_only_thing_that_adds_per_region(self):
+        frame = lsapi.tag_control_xml(
+            {"scope": lsapi.TAG_FRAME, "name": "t", "widget": "radio", "choices": ["a"]})
+        region = lsapi.tag_control_xml(
+            {"scope": lsapi.TAG_REGION, "name": "t", "widget": "radio", "choices": ["a"]})
+        self.assertNotIn("perRegion", frame)
+        self.assertIn('perRegion="true"', region)
+
+    def test_rating_and_text_need_no_choices(self):
+        rating = lsapi.tag_control_xml({
+            "scope": lsapi.TAG_REGION, "name": "distance", "widget": "rating", "max_rating": 3,
+        })
+        self.assertEqual(
+            rating.strip(),
+            '<Rating name="distance" toName="image" perRegion="true" maxRating="3"/>',
+        )
+        text = lsapi.tag_control_xml(
+            {"scope": lsapi.TAG_FRAME, "name": "note", "widget": "text"})
+        self.assertIn("<TextArea", text)
+        self.assertNotIn("<Choice ", text)
+
+    def test_a_choices_widget_with_no_options_is_an_error(self):
+        with self.assertRaises(RuntimeError):
+            lsapi.tag_control_xml(
+                {"scope": lsapi.TAG_FRAME, "name": "t", "widget": "dropdown", "choices": []})
+
+    def test_required_is_passed_through(self):
+        xml = lsapi.tag_control_xml({
+            "scope": lsapi.TAG_FRAME, "name": "t", "widget": "radio",
+            "choices": ["a"], "required": True,
+        })
+        self.assertIn('required="true"', xml)
+
+    def test_option_values_are_xml_escaped(self):
+        xml = lsapi.tag_control_xml({
+            "scope": lsapi.TAG_FRAME, "name": "t", "widget": "radio", "choices": ['a & "b"'],
+        })
+        self.assertIn("&amp;", xml)
+        self.assertNotIn('value="a & "b""', xml)
+
+    def test_frame_tags_get_headers_and_region_tags_get_none(self):
+        xml = lsapi.tags_xml([
+            {"scope": lsapi.TAG_FRAME, "name": "weather", "widget": "dropdown", "choices": ["sun"]},
+            {"scope": lsapi.TAG_REGION, "name": "occlusion", "widget": "radio", "choices": ["none"]},
+        ])
+        # The frame tag is captioned; a header next to a perRegion control would
+        # be stranded on the canvas, so the region tag gets no caption at all.
+        self.assertIn('<Header value="Frame tags" size="4"/>', xml)
+        self.assertIn('<Header value="weather" size="6"/>', xml)
+        self.assertNotIn('value="occlusion" size="6"', xml)
+
+    def test_region_controls_sit_outside_the_frame_view(self):
+        xml = lsapi.tags_xml([
+            {"scope": lsapi.TAG_FRAME, "name": "weather", "widget": "radio", "choices": ["sun"]},
+            {"scope": lsapi.TAG_REGION, "name": "occlusion", "widget": "radio", "choices": ["none"]},
+        ])
+        self.assertLess(xml.index("</View>"), xml.index('name="occlusion"'))
+
+    def test_tags_join_the_drawing_controls_in_one_valid_document(self):
+        from xml.etree import ElementTree
+
+        config = lsapi.build_label_config(self.classes, [
+            {"scope": lsapi.TAG_FRAME, "name": "weather", "widget": "dropdown",
+             "choices": ["sun", "rain"]},
+            {"scope": lsapi.TAG_REGION, "name": "occlusion", "widget": "radio",
+             "choices": ["none", "high"], "required": True},
+            {"scope": lsapi.TAG_REGION, "name": "distance", "widget": "rating", "max_rating": 3},
+        ])
+        root = ElementTree.fromstring(config)  # parses at all == LS will accept the shape
+        names = [el.get("name") for el in root.iter() if el.get("name")]
+        self.assertEqual(names, ["image", "bbox", "weather", "occlusion", "distance"])
+        # The box tool is untouched by tagging.
+        bbox = root.find(".//RectangleLabels")
+        self.assertEqual([label.get("value") for label in bbox], ["person", "helmet"])
+
+    def test_reserved_names_cover_every_drawing_control(self):
+        self.assertEqual(
+            lsapi.RESERVED_CONTROL_NAMES,
+            frozenset({"image", "bbox", "segmentation", "sam_point"}),
+        )
+
+
+class AnnotationTagModelTests(TestCase):
+    def setUp(self):
+        self.dataset = Dataset.objects.create(name="ds", storage_type=Dataset.LOCAL)
+
+    def _tag(self, **kwargs):
+        defaults = {
+            "dataset": self.dataset, "scope": AnnotationTag.FRAME,
+            "name": "weather", "widget": AnnotationTag.RADIO, "choices": ["sun"],
+        }
+        return AnnotationTag(**{**defaults, **kwargs})
+
+    def test_a_name_colliding_with_a_drawing_control_is_rejected(self):
+        with self.assertRaises(DjangoValidationError) as ctx:
+            self._tag(name="bbox").clean()
+        self.assertIn("name", ctx.exception.message_dict)
+
+    def test_names_must_be_control_identifiers(self):
+        for bad in ["", "2fast", "has space", "dot.ted"]:
+            with self.assertRaises(DjangoValidationError, msg=bad):
+                self._tag(name=bad).clean()
+        self._tag(name="occlusion_level-2").clean()  # does not raise
+
+    def test_choice_widgets_require_options_and_others_do_not(self):
+        with self.assertRaises(DjangoValidationError):
+            self._tag(widget=AnnotationTag.DROPDOWN, choices=[]).clean()
+        self._tag(widget=AnnotationTag.RATING, choices=[], max_rating=3).clean()
+        self._tag(widget=AnnotationTag.TEXT, choices=[]).clean()
+
+    def test_blank_and_duplicate_options_are_dropped_in_order(self):
+        tag = self._tag(choices=["none", " low ", "", "none", "high"])
+        self.assertEqual(tag.cleaned_choices(), ["none", "low", "high"])
+
+    def test_to_spec_is_what_the_renderer_takes(self):
+        tag = self._tag(name="occlusion", scope=AnnotationTag.REGION, choices=["none", "high"])
+        self.assertIn('perRegion="true"', lsapi.tag_control_xml(tag.to_spec()))
+
+    def test_tags_die_with_their_dataset(self):
+        self._tag().save()
+        self.dataset.delete()
+        self.assertFalse(AnnotationTag.objects.exists())
+
+
+class AnnotationTagFormTests(TestCase):
+    """Reading the editor's POST back — indices, ordering, and all-or-nothing saves."""
+
+    def setUp(self):
+        self.dataset = Dataset.objects.create(name="ds", storage_type=Dataset.LOCAL)
+
+    @staticmethod
+    def _post(*rows) -> dict:
+        post = {}
+        for index, row in rows:
+            for field, value in row.items():
+                post[f"tag-{index}-{field}"] = value
+        return post
+
+    def test_rows_are_read_by_index_not_by_position(self):
+        # Row 1 has no `required` key at all — an unchecked checkbox posts
+        # nothing, which is exactly why the field names carry an index.
+        rows = annotation_tags_svc.posted_rows(self._post(
+            (0, {"scope": "frame", "name": "a", "widget": "radio", "choices": "x,y"}),
+            (1, {"scope": "region", "name": "b", "widget": "radio", "choices": "p"}),
+            (2, {"scope": "frame", "name": "c", "widget": "radio", "choices": "q", "required": "1"}),
+        ))
+        self.assertEqual([r["name"] for r in rows], ["a", "b", "c"])
+        self.assertEqual([r["required"] for r in rows], [False, False, True])
+        self.assertEqual(rows[0]["choices"], ["x", "y"])
+
+    def test_order_counts_within_a_section_so_a_deleted_row_leaves_no_gap(self):
+        rows = annotation_tags_svc.posted_rows(self._post(
+            (0, {"scope": "frame", "name": "a", "widget": "radio", "choices": "x"}),
+            (5, {"scope": "region", "name": "b", "widget": "radio", "choices": "x"}),
+            (9, {"scope": "frame", "name": "c", "widget": "radio", "choices": "x"}),
+            (11, {"scope": "region", "name": "d", "widget": "radio", "choices": "x"}),
+        ))
+        self.assertEqual([(r["name"], r["order"]) for r in rows],
+                         [("a", 0), ("b", 0), ("c", 1), ("d", 1)])
+
+    def test_a_row_left_blank_is_ignored_not_rejected(self):
+        rows = annotation_tags_svc.posted_rows(self._post(
+            (0, {"scope": "frame", "name": "a", "widget": "radio", "choices": "x"}),
+            (1, {"scope": "frame", "name": "  ", "widget": "radio", "choices": ""}),
+        ))
+        self.assertEqual([r["name"] for r in rows], ["a"])
+
+    def test_options_split_on_commas_and_newlines_alike(self):
+        self.assertEqual(
+            annotation_tags_svc.split_choices("none, low\nmoderate\r\nhigh,,none"),
+            ["none", "low", "moderate", "high"],
+        )
+
+    def test_save_replaces_the_whole_set(self):
+        annotation_tags_svc.save_tags(self.dataset, annotation_tags_svc.posted_rows(self._post(
+            (0, {"scope": "frame", "name": "a", "widget": "radio", "choices": "x"}),
+            (1, {"scope": "frame", "name": "b", "widget": "radio", "choices": "x"}),
+        )))
+        annotation_tags_svc.save_tags(self.dataset, annotation_tags_svc.posted_rows(self._post(
+            (0, {"scope": "frame", "name": "b", "widget": "radio", "choices": "x"}),
+        )))
+        self.assertEqual([t.name for t in self.dataset.tags.all()], ["b"])
+
+    def test_one_bad_row_saves_nothing(self):
+        annotation_tags_svc.save_tags(self.dataset, annotation_tags_svc.posted_rows(self._post(
+            (0, {"scope": "frame", "name": "keep", "widget": "radio", "choices": "x"}),
+        )))
+        with self.assertRaises(DjangoValidationError):
+            annotation_tags_svc.save_tags(self.dataset, annotation_tags_svc.posted_rows(self._post(
+                (0, {"scope": "frame", "name": "fine", "widget": "radio", "choices": "x"}),
+                (1, {"scope": "frame", "name": "bbox", "widget": "radio", "choices": "x"}),
+            )))
+        # The pre-existing tag survived: nothing was deleted or written.
+        self.assertEqual([t.name for t in self.dataset.tags.all()], ["keep"])
+
+    def test_two_rows_with_one_name_are_rejected(self):
+        with self.assertRaises(DjangoValidationError):
+            annotation_tags_svc.save_tags(self.dataset, annotation_tags_svc.posted_rows(self._post(
+                (0, {"scope": "frame", "name": "dup", "widget": "radio", "choices": "x"}),
+                (1, {"scope": "region", "name": "dup", "widget": "radio", "choices": "x"}),
+            )))
+        self.assertFalse(self.dataset.tags.exists())
+
+
+class AnnotationTagAdminTests(TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = Path(self.tmp.name)
+        fs = FleetSettings.load()
+        fs.source_dir = str(self.src)
+        fs.save()
+        (self.src / "ds").mkdir()
+        (self.src / "ds" / "classes.txt").write_text(
+            "# tools: bbox\nperson\n", encoding="utf-8")
+        self.dataset = Dataset.objects.create(name="ds", storage_type=Dataset.LOCAL)
+        User = get_user_model()
+        User.objects.create_superuser(username="admin", email="a@example.com", password="pw")
+        self.client.login(username="admin", password="pw")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _post(self, extra=None):
+        payload = {
+            "action": "edit_annotation_tags",
+            "index": "0",
+            "_selected_action": [str(self.dataset.pk)],
+        }
+        payload.update(extra or {})
+        return self.client.post(reverse("admin:fleet_dataset_changelist"), payload)
+
+    def test_the_editor_renders_saved_tags_split_into_two_sections(self):
+        AnnotationTag.objects.create(
+            dataset=self.dataset, scope=AnnotationTag.FRAME, name="weather",
+            widget=AnnotationTag.DROPDOWN, choices=["sun", "rain"])
+        AnnotationTag.objects.create(
+            dataset=self.dataset, scope=AnnotationTag.REGION, name="occlusion",
+            widget=AnnotationTag.RADIO, choices=["none"])
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([r["name"] for r in response.context["frame_rows"]], ["weather"])
+        self.assertEqual([r["name"] for r in response.context["region_rows"]], ["occlusion"])
+        # Every row's field index is unique across both tables — they post as one list.
+        indexes = [r["index"] for r in
+                   response.context["frame_rows"] + response.context["region_rows"]]
+        self.assertEqual(sorted(indexes), [0, 1])
+        self.assertIn('perRegion="true"', response.context["preview"])
+
+    def test_saving_writes_the_tags_and_does_not_touch_projects_by_default(self):
+        with mock.patch("fleet.admin._queue") as queue:
+            response = self._post({
+                "apply": "1",
+                "tag-0-scope": "region", "tag-0-name": "occlusion",
+                "tag-0-widget": "dropdown", "tag-0-choices": "none, high",
+            })
+
+        self.assertEqual(response.status_code, 200)
+        tag = self.dataset.tags.get()
+        self.assertEqual((tag.name, tag.scope, tag.choices), ("occlusion", "region", ["none", "high"]))
+        queue.return_value.enqueue.assert_not_called()
+
+    def test_push_to_existing_queues_the_job_and_marks_the_projects(self):
+        annotator = Annotator.objects.create(username="ann")
+        project = Project.objects.create(
+            annotator=annotator, dataset=self.dataset, ls_project_id=7)
+
+        with mock.patch("fleet.admin._queue") as queue:
+            self._post({
+                "apply": "1", "push_existing": "1",
+                "tag-0-scope": "frame", "tag-0-name": "weather",
+                "tag-0-widget": "radio", "tag-0-choices": "sun",
+            })
+
+        enqueued = queue.return_value.enqueue.call_args_list
+        self.assertEqual(len(enqueued), 1)
+        self.assertEqual(enqueued[0].args, (jobs.apply_dataset_tags, self.dataset.id))
+        project.refresh_from_db()
+        self.assertEqual(project.last_status, "queued")
+
+    def test_a_rejected_row_reports_the_error_and_redraws_what_was_typed(self):
+        response = self._post({
+            "apply": "1",
+            "tag-0-scope": "frame", "tag-0-name": "bbox",
+            "tag-0-widget": "radio", "tag-0-choices": "sun",
+        })
+
+        self.assertFalse(self.dataset.tags.exists())
+        self.assertEqual([r["name"] for r in response.context["frame_rows"]], ["bbox"])
+        messages_shown = [str(m) for m in response.context["messages"]]
+        self.assertTrue(any("bbox" in m for m in messages_shown), messages_shown)
+
+    def test_selecting_two_datasets_refuses_rather_than_guessing(self):
+        Dataset.objects.create(name="other", storage_type=Dataset.LOCAL)
+        response = self.client.post(reverse("admin:fleet_dataset_changelist"), {
+            "action": "edit_annotation_tags",
+            "index": "0",
+            "_selected_action": [str(d.pk) for d in Dataset.objects.all()],
+        })
+        self.assertEqual(response.status_code, 302)
+
+    def test_a_missing_classes_file_loses_the_preview_but_not_the_editor(self):
+        (self.src / "ds" / "classes.txt").unlink()
+        response = self._post()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.context["preview_error"])
+
+
+class ApplyTagsToProjectsTests(TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = Path(self.tmp.name)
+        fs = FleetSettings.load()
+        fs.source_dir = str(self.src)
+        fs.save()
+        (self.src / "ds").mkdir()
+        (self.src / "ds" / "classes.txt").write_text("# tools: bbox\nperson\n", encoding="utf-8")
+        self.dataset = Dataset.objects.create(name="ds", storage_type=Dataset.LOCAL)
+        AnnotationTag.objects.create(
+            dataset=self.dataset, scope=AnnotationTag.REGION, name="occlusion",
+            widget=AnnotationTag.RADIO, choices=["none", "high"])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_every_running_project_gets_the_new_config(self):
+        for username, project_id in [("ann1", 11), ("ann2", 22)]:
+            Project.objects.create(
+                annotator=Annotator.objects.create(username=username),
+                dataset=self.dataset, ls_project_id=project_id)
+
+        with mock.patch.object(lsapi, "container_running", return_value=True), \
+                mock.patch.object(lsapi, "update_project_label_config") as patch_config:
+            results = datasets_svc.apply_tags_to_projects(self.dataset)
+
+        self.assertEqual([r["status"] for r in results], ["updated", "updated"])
+        self.assertEqual(sorted(c.kwargs["project_id"] for c in patch_config.call_args_list), [11, 22])
+        sent = patch_config.call_args_list[0].kwargs["label_config"]
+        self.assertIn('<Choices name="occlusion" toName="image" perRegion="true"', sent)
+
+    def test_one_annotator_being_down_does_not_stop_the_others(self):
+        up = Annotator.objects.create(username="up")
+        down = Annotator.objects.create(username="down")
+        Project.objects.create(annotator=up, dataset=self.dataset, ls_project_id=11)
+        Project.objects.create(annotator=down, dataset=self.dataset, ls_project_id=22)
+
+        with mock.patch.object(
+            lsapi, "container_running",
+            side_effect=lambda name: name == up.container_name,
+        ), mock.patch.object(lsapi, "update_project_label_config") as patch_config:
+            results = datasets_svc.apply_tags_to_projects(self.dataset)
+
+        by_user = {r["username"]: r["status"] for r in results}
+        self.assertEqual(by_user["up"], "updated")
+        self.assertIn("skipped", by_user["down"])
+        self.assertEqual(len(patch_config.call_args_list), 1)
+
+    def test_a_rejected_config_is_recorded_on_that_project_only(self):
+        import requests as requests_lib
+
+        Project.objects.create(
+            annotator=Annotator.objects.create(username="ann"),
+            dataset=self.dataset, ls_project_id=11)
+
+        with mock.patch.object(lsapi, "container_running", return_value=True), \
+                mock.patch.object(lsapi, "update_project_label_config",
+                                  side_effect=requests_lib.HTTPError("400 bad config")):
+            results = jobs.apply_dataset_tags(self.dataset.id)
+
+        self.assertIn("failed", results["projects"][0]["status"])
+        project = Project.objects.get()
+        self.assertEqual(project.last_status, "error")
+        self.assertIn("400 bad config", project.last_error)
+
+
+class SetupDatasetTagsTests(TestCase):
+    def test_project_creation_carries_the_datasets_tags(self):
+        dataset = Dataset.objects.create(name="ds", storage_type=Dataset.LOCAL)
+        AnnotationTag.objects.create(
+            dataset=dataset, scope=AnnotationTag.FRAME, name="weather",
+            widget=AnnotationTag.DROPDOWN, choices=["sun"])
+        annotator = Annotator.objects.create(username="ann")
+
+        with mock.patch.object(lsapi, "require_path"), \
+                mock.patch.object(lsapi, "container_running", return_value=True), \
+                mock.patch.object(datasets_svc, "detect_labels", return_value=False), \
+                mock.patch.object(datasets_svc, "register_webhook", return_value=("exists", 1)), \
+                mock.patch.object(lsapi, "create_dataset_project", return_value={
+                    "project_id": 1, "num_tasks": 0, "num_predictions": 0, "skipped": False,
+                }) as create:
+            datasets_svc.setup_dataset(dataset, [annotator])
+
+        self.assertEqual(create.call_args.kwargs["tags"], [{
+            "scope": "frame", "name": "weather", "widget": "dropdown",
+            "choices": ["sun"], "max_rating": 5, "required": False,
+        }])
+
+
+class SetupWithAnnotationTagsTests(TestCase):
+    """The tag editor carried by the two project-setup actions.
+
+    Setup is where the tags matter: a project's labeling interface is fixed
+    when the project is created, so these actions confirm first and the
+    confirmation is the editor.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = Path(self.tmp.name)
+        fs = FleetSettings.load()
+        fs.source_dir = str(self.src)
+        fs.save()
+        (self.src / "ds").mkdir()
+        (self.src / "ds" / "classes.txt").write_text("# tools: bbox\nperson\n", encoding="utf-8")
+        self.dataset = Dataset.objects.create(name="ds", storage_type=Dataset.LOCAL)
+        self.annotator = Annotator.objects.create(username="ann")
+        User = get_user_model()
+        User.objects.create_superuser(username="admin", email="a@example.com", password="pw")
+        self.client.login(username="admin", password="pw")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _post(self, action, datasets=None, extra=None):
+        payload = {
+            "action": action,
+            "index": "0",
+            "_selected_action": [str(d.pk) for d in (datasets or [self.dataset])],
+        }
+        payload.update(extra or {})
+        return self.client.post(reverse("admin:fleet_dataset_changelist"), payload)
+
+    @staticmethod
+    def _tag_fields(name="occlusion", scope="region", widget="dropdown", choices="none, high"):
+        return {
+            "tag-0-scope": scope, "tag-0-name": name,
+            "tag-0-widget": widget, "tag-0-choices": choices,
+        }
+
+    # --- set up for all active annotators -------------------------------
+
+    def test_setup_confirms_with_the_editor_instead_of_queueing_straight_off(self):
+        AnnotationTag.objects.create(
+            dataset=self.dataset, scope=AnnotationTag.REGION, name="occlusion",
+            widget=AnnotationTag.RADIO, choices=["none"])
+
+        with mock.patch("fleet.admin._queue") as queue:
+            response = self._post("setup_for_all_active")
+
+        self.assertEqual(response.status_code, 200)
+        queue.return_value.enqueue.assert_not_called()
+        self.assertEqual([r["name"] for r in response.context["region_rows"]], ["occlusion"])
+
+    def test_applying_saves_the_tags_and_queues_one_job_per_annotator(self):
+        second = Annotator.objects.create(username="ann2")
+
+        with mock.patch("fleet.admin._queue") as queue:
+            self._post("setup_for_all_active",
+                       extra={"apply": "1", **self._tag_fields()})
+
+        tag = self.dataset.tags.get()
+        self.assertEqual((tag.name, tag.scope, tag.choices), ("occlusion", "region", ["none", "high"]))
+        queued = [c.args for c in queue.return_value.enqueue.call_args_list]
+        self.assertEqual(sorted(queued, key=lambda a: a[2]), [
+            (jobs.setup_project, self.dataset.id, self.annotator.id),
+            (jobs.setup_project, self.dataset.id, second.id),
+        ])
+
+    def test_a_bad_tag_sets_nothing_up(self):
+        # Queueing here would bake the interface the operator was still editing
+        # into every project, and creation is idempotent — there is no second
+        # chance without an explicit push.
+        with mock.patch("fleet.admin._queue") as queue:
+            response = self._post("setup_for_all_active",
+                                  extra={"apply": "1", **self._tag_fields(name="bbox")})
+
+        self.assertEqual(response.status_code, 200)
+        queue.return_value.enqueue.assert_not_called()
+        self.assertFalse(self.dataset.tags.exists())
+        self.assertEqual([r["name"] for r in response.context["region_rows"]], ["bbox"])
+
+    def test_removing_every_row_sets_up_with_no_tags(self):
+        AnnotationTag.objects.create(
+            dataset=self.dataset, scope=AnnotationTag.FRAME, name="weather",
+            widget=AnnotationTag.RADIO, choices=["sun"])
+
+        with mock.patch("fleet.admin._queue") as queue:
+            self._post("setup_for_all_active", extra={"apply": "1"})
+
+        self.assertFalse(self.dataset.tags.exists())
+        self.assertEqual(len(queue.return_value.enqueue.call_args_list), 1)
+
+    def test_setup_can_also_push_onto_projects_that_already_exist(self):
+        Project.objects.create(
+            annotator=self.annotator, dataset=self.dataset, ls_project_id=7)
+
+        with mock.patch("fleet.admin._queue") as queue:
+            self._post("setup_for_all_active",
+                       extra={"apply": "1", "push_existing": "1", **self._tag_fields()})
+
+        queued = [c.args[0] for c in queue.return_value.enqueue.call_args_list]
+        self.assertIn(jobs.apply_dataset_tags, queued)
+        self.assertIn(jobs.setup_project, queued)
+
+    def test_several_datasets_are_listed_not_edited(self):
+        other = Dataset.objects.create(name="other", storage_type=Dataset.LOCAL)
+        AnnotationTag.objects.create(
+            dataset=other, scope=AnnotationTag.FRAME, name="weather",
+            widget=AnnotationTag.RADIO, choices=["sun"])
+
+        response = self._post("setup_for_all_active", datasets=[self.dataset, other])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.context["dataset"])
+        self.assertNotIn("frame_rows", response.context)
+        summaries = {s["dataset"].name: [t.name for t in s["tags"]]
+                     for s in response.context["tag_summaries"]}
+        self.assertEqual(summaries, {"ds": [], "other": ["weather"]})
+
+    def test_several_datasets_set_up_with_the_tags_they_already_carry(self):
+        other = Dataset.objects.create(name="other", storage_type=Dataset.LOCAL)
+        AnnotationTag.objects.create(
+            dataset=other, scope=AnnotationTag.FRAME, name="weather",
+            widget=AnnotationTag.RADIO, choices=["sun"])
+
+        with mock.patch("fleet.admin._queue") as queue:
+            self._post("setup_for_all_active", datasets=[self.dataset, other],
+                       extra={"apply": "1"})
+
+        self.assertEqual(len(queue.return_value.enqueue.call_args_list), 2)
+        self.assertEqual([t.name for t in other.tags.all()], ["weather"])  # untouched
+
+    def test_no_active_annotators_stops_before_the_editor(self):
+        self.annotator.status = Annotator.RETIRED
+        self.annotator.save()
+        response = self._post("setup_for_all_active")
+        self.assertEqual(response.status_code, 302)
+
+    # --- set up + sync for one annotator --------------------------------
+
+    def test_setup_sync_saves_the_tags_then_queues_for_the_chosen_annotator(self):
+        with mock.patch("fleet.admin._queue") as queue:
+            self._post("setup_sync_one_annotator", extra={
+                "apply": "1", "annotator": str(self.annotator.pk),
+                **self._tag_fields(name="weather", scope="frame",
+                                   widget="checkbox", choices="sun, rain"),
+            })
+
+        tag = self.dataset.tags.get()
+        self.assertEqual((tag.name, tag.scope, tag.widget), ("weather", "frame", "checkbox"))
+        self.assertEqual(
+            [c.args for c in queue.return_value.enqueue.call_args_list],
+            [(jobs.setup_and_sync_project, self.dataset.id, self.annotator.id)],
+        )
+
+    def test_setup_sync_with_a_bad_tag_queues_nothing_and_keeps_the_annotator(self):
+        with mock.patch("fleet.admin._queue") as queue:
+            response = self._post("setup_sync_one_annotator", extra={
+                "apply": "1", "annotator": str(self.annotator.pk),
+                **self._tag_fields(name="segmentation"),
+            })
+
+        queue.return_value.enqueue.assert_not_called()
+        self.assertFalse(self.dataset.tags.exists())
+        # The redraw remembers the annotator, so the error costs only the tag.
+        self.assertEqual(response.context["chosen_annotator"], str(self.annotator.pk))
+
+    def test_setup_sync_still_refuses_without_an_annotator(self):
+        with mock.patch("fleet.admin._queue") as queue:
+            response = self._post("setup_sync_one_annotator",
+                                  extra={"apply": "1", **self._tag_fields()})
+
+        self.assertEqual(response.status_code, 302)
+        queue.return_value.enqueue.assert_not_called()
+        self.assertFalse(self.dataset.tags.exists())

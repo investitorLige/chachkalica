@@ -15,6 +15,14 @@
 # deserializes a real engine. The host still needs the NVIDIA Container Toolkit.
 FROM python:3.12-slim
 
+# deb.debian.org is TLS-intercepted on this network: plain HTTP comes back with
+# no status line (apt reports "Bad header line Bad header data") and HTTPS is
+# MITM'd with a self-signed "atlas-MASTER" cert, so apt can use neither.
+# cloudfront.debian.net is an official Debian CDN the proxy leaves alone.
+# Override with --build-arg DEBIAN_MIRROR=https://deb.debian.org off this network.
+ARG DEBIAN_MIRROR=https://cloudfront.debian.net
+RUN sed -i -E "s|https?://deb\\.debian\\.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources
+
 # libgl/libglib: chachak's inference modules are copied in whole and some import
 # cv2 transitively at module scope. Cheap, and avoids a surprise at bundle time.
 RUN apt-get update && apt-get install -y --no-install-recommends \

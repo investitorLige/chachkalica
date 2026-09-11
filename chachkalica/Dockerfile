@@ -10,6 +10,14 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 
+# deb.debian.org is TLS-intercepted on this network: plain HTTP comes back with
+# no status line (apt reports "Bad header line Bad header data") and HTTPS is
+# MITM'd with a self-signed "atlas-MASTER" cert, so apt can use neither.
+# cloudfront.debian.net is an official Debian CDN the proxy leaves alone.
+# Override with --build-arg DEBIAN_MIRROR=https://deb.debian.org off this network.
+ARG DEBIAN_MIRROR=https://cloudfront.debian.net
+RUN sed -i -E "s|https?://deb\\.debian\\.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources
+
 # ffmpeg: merges/normalizes downloaded video+audio into mp4 (Videos admin tab).
 # nodejs: kept as a fallback JS runtime, but Debian's apt build is v20, below
 # yt-dlp's Node>=22 floor (yt_dlp/utils/_jsruntime.py) — yt-dlp rejects it as

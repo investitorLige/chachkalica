@@ -1,0 +1,15 @@
+{# The "reach the projects that already exist" opt-in. Setup alone can't do it:
+   creating a project bakes the tags in and an existing one is skipped, so an
+   edited tag would only reach annotators set up from here on. #}
+<p>
+  <label for="push_existing">
+    <input type="checkbox" name="push_existing" id="push_existing" value="1"
+           {% if not project_count %}disabled{% endif %}>
+    Also push onto the {{ project_count }} project{{ project_count|pluralize }} that already exist
+  </label>
+  <br><span class="help">
+    Rewrites their labeling interface in place, keeping every annotation already made.
+    Label Studio refuses a change that would orphan existing regions — removing a tag
+    annotators have already used can fail, and the Projects page will say so.
+  </span>
+</p>

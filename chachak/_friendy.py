@@ -47,7 +47,7 @@ from friendy_chachkalica.config import (  # noqa: E402
     ModelConfig,
     TrainingConfig,
 )
-from friendy_chachkalica.ml.train import _write_hard_images  # noqa: E402
+from friendy_chachkalica.ml.train import _write_hard_images, _write_match_table  # noqa: E402
 from friendy_chachkalica.ml.val import _to_builtin, _write_yaml  # noqa: E402
 
 __all__ = [
@@ -70,6 +70,7 @@ __all__ = [
     "ModelConfig",
     "TrainingConfig",
     "_write_hard_images",
+    "_write_match_table",
     "_to_builtin",
     "_write_yaml",
 ]

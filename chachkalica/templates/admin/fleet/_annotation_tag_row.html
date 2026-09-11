@@ -1,0 +1,25 @@
+{# One editor row. Field names carry ``row.index`` so a row deleted client-side
+   leaves a gap rather than shifting every later row's values onto it. #}
+<tr class="tag-row">
+  <td>
+    <input type="hidden" name="tag-{{ row.index }}-scope" value="{{ row.scope }}">
+    <input type="text" name="tag-{{ row.index }}-name" value="{{ row.name }}" size="18"
+           pattern="[A-Za-z][A-Za-z0-9_-]*"
+           title="Start with a letter; letters, digits, '_' and '-' only." required>
+  </td>
+  <td>
+    <select name="tag-{{ row.index }}-widget" class="tag-widget">
+      {% for value, label in widget_choices %}
+        <option value="{{ value }}" {% if value == row.widget %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </td>
+  <td>
+    <input type="text" name="tag-{{ row.index }}-choices" class="tag-choices" style="width: 100%;"
+           value="{{ row.choices|join:", " }}" placeholder="none, low, moderate, high">
+    <input type="number" name="tag-{{ row.index }}-max_rating" class="tag-max-rating"
+           min="1" max="10" value="{{ row.max_rating }}" style="display: none;">
+  </td>
+  <td><input type="checkbox" name="tag-{{ row.index }}-required" value="1" {% if row.required %}checked{% endif %}></td>
+  <td><button type="button" class="button tag-remove" title="Remove">&times;</button></td>
+</tr>

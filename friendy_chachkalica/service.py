@@ -21,7 +21,7 @@ Endpoints:
     GET  /evals/{eval_id}     -> {eval_id, status, returncode, started_at, finished_at, log_tail}
     POST /pipeline            -> {pipeline_id, status, pid} (body: {pipeline_id, request_path})
     GET  /pipelines/{id}      -> {pipeline_id, status, returncode, started_at, finished_at, log_tail}
-    POST /predict_image       -> {boxes, classes}          (synchronous 1-image inference; warm model)
+    POST /predict_image       -> {boxes, classes, timings} (synchronous 1-image inference; warm model)
     POST /checkpoint_info     -> {arch, trained_size}      (synchronous, cheap: no export)
     POST /export_onnx         -> {onnx_path, meta_path}    (synchronous ONNX export of one checkpoint)
     POST /export_trt_onnx     -> {onnx_path, meta_path, arch, prepared}  (TRT-ready ONNX; CPU-only)
@@ -305,6 +305,30 @@ class PromoteLabelsRequest(BaseModel):
     score_threshold: float = 0.25
 
 
+class MatchTableRequest(BaseModel):
+    """Rebuild an eval's match table from the predictions it already saved.
+
+    ``predictions_path`` is the eval's ``*_predictions.pt`` and ``classes`` the
+    eval dataset's class space. Exactly one of ``checkpoint_path`` (a
+    single-model eval — the space its saved predictions are indexed in is read
+    back out of the checkpoint) or ``prediction_classes`` (a combined run,
+    already merged in the eval space) should be set, mirroring
+    ``/promote_labels``. The thresholds must be the ones that eval ran with, or
+    the rebuilt table describes a different evaluation than the metrics stored
+    next to it.
+    """
+
+    predictions_path: str
+    classes: list[str]
+    prediction_classes: Optional[list[str]] = None
+    checkpoint_path: Optional[str] = None
+    labels_dir: Optional[str] = None
+    iou_thresholds: Optional[list[float]] = None
+    score_threshold: float = 0.25
+    map_score_threshold: Optional[float] = 0.001
+    operating_nms_threshold: Optional[float] = None
+
+
 class PredictImageRequest(BaseModel):
     """One-image, synchronous inference for the admin preview viewer."""
 
@@ -326,6 +350,11 @@ class PredictImageRequest(BaseModel):
     chain: Optional[list[str]] = None
     score_threshold: Optional[float] = 0.05
     device: str = "auto"
+    # Split the reported time into load / infer / format stages. Off by default
+    # because attributing stages means synchronizing the GPU at each boundary,
+    # which perturbs the very number it splits (the same trade the bundle
+    # benchmark's stage pass makes). ``timings.total_ms`` is reported either way.
+    stage_timings: bool = False
 
 
 def _job_status(job: dict) -> str:
@@ -726,14 +755,22 @@ def predict_image(req: PredictImageRequest):
             entry = _get_predict_runtime(req)
             from chachak.preview import predict_one, predict_one_raw
 
+            # Timed around the call itself, inside the lock, and only once the
+            # runtime is warm — so a caller measuring frame cost gets the frame
+            # and not the model load. The stage split is opt-in (see the request
+            # field); the total is always measured, and the last thing every
+            # path does is move predictions to the host, which synchronizes.
+            stages: dict = {} if req.stage_timings else None
+            started = time.perf_counter()
             if entry["kind"] == "raw":
                 boxes = predict_one_raw(
                     entry["obj"], entry["info"], image_path,
-                    entry["device"], req.score_threshold)
+                    entry["device"], req.score_threshold, timings=stages)
             else:
                 boxes = predict_one(
                     entry["obj"], entry["info"], image_path,
-                    entry["device"], req.score_threshold)
+                    entry["device"], req.score_threshold, timings=stages)
+            total_ms = (time.perf_counter() - started) * 1000.0
         except HTTPException:
             raise
         except ValueError as exc:
@@ -743,7 +780,15 @@ def predict_image(req: PredictImageRequest):
             log.exception("predict failed: %s", exc)
             raise HTTPException(status_code=500, detail=f"predict failed: {exc}")
 
-    return {"boxes": boxes, "classes": entry["info"].get("train_classes", {})}
+    # ``timings`` is additive: an older Django client ignores the key, and a
+    # newer one falls back to its own round-trip clock when it is absent (which
+    # is how it can tell "the model took this long" from "the call took this
+    # long"). Never omitted once present, so a missing key means an old trainer.
+    return {
+        "boxes": boxes,
+        "classes": entry["info"].get("train_classes", {}),
+        "timings": {"total_ms": total_ms, **(stages or {})},
+    }
 
 
 @app.post("/checkpoint_info")
@@ -1121,6 +1166,55 @@ def stop_benchmark(benchmark_id: int, grace: float = 10.0):
     log.info("stop outcome=%s returncode=%s", outcome, job.get("returncode"))
     return {"benchmark_id": benchmark_id, "status": _job_status(job),
             "outcome": outcome, "returncode": job.get("returncode")}
+
+
+@app.post("/match_table")
+def build_match_table(req: MatchTableRequest):
+    """Rebuild the per-detection match table for an eval that has no table yet.
+
+    The analytics artifact (``metrics.match_table``) is written at eval time,
+    so only evals run since that landed have one. This rebuilds it for the rest
+    from their saved ``*_predictions.pt`` plus the label files on disk — no
+    checkpoint load, no image decode, no GPU — which is why it can be
+    synchronous and does not queue behind a training job.
+
+    CPU-only, but serialized behind ``_export_lock`` like ``/promote_labels``:
+    it torch.loads a predictions file that can be hundreds of megabytes, and
+    two of those at once is the kind of thing that gets a container OOM-killed
+    mid-training.
+    """
+    log = _service_log()
+    predictions_path = Path(req.predictions_path)
+    if not predictions_path.exists():
+        log.error("match table rejected: predictions not found: %s", predictions_path)
+        raise HTTPException(status_code=400, detail=f"predictions not found: {predictions_path}")
+
+    with _export_lock:
+        try:
+            from match_backfill import backfill_match_table
+
+            summary = backfill_match_table(
+                req.predictions_path,
+                classes=req.classes,
+                prediction_classes=req.prediction_classes,
+                checkpoint_path=req.checkpoint_path,
+                labels_dir=req.labels_dir,
+                iou_thresholds=req.iou_thresholds,
+                score_threshold=req.score_threshold,
+                map_score_threshold=req.map_score_threshold,
+                operating_nms_threshold=req.operating_nms_threshold,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            log.warning("match table rejected: %s", exc)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:  # noqa: BLE001 - surface failures to the caller
+            log.exception("match table failed: %s", exc)
+            raise HTTPException(status_code=500, detail=f"match table failed: {exc}")
+
+    log.info("built match table %s (%s images, %s gt, %s predictions)",
+             summary["match_table_path"], summary["images"],
+             summary["ground_truth_boxes"], summary["predictions"])
+    return summary
 
 
 @app.post("/promote_labels")

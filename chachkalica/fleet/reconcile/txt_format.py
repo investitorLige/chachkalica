@@ -11,6 +11,12 @@ An "object" is the in-memory shape both sides speak:
 all coordinates normalized to [0, 1]. `bbox` is always present (computed from
 the polygon's extent when the source region is a polygon); `polygon` is None
 for plain bounding-box regions.
+
+Objects converted *from* a Label Studio result also carry `region_id` — the id
+LS gave the region. It goes nowhere near the txt (which has no room for it) and
+is None for objects parsed back off disk; its one job is to let the annotation
+tag sidecar attach a `perRegion` answer to the box it belongs to, since a
+`perRegion` result repeats its region's id. See `reconcile.tag_values`.
 """
 
 # Label Studio result `type` values we export. Anything else (e.g. the smart
@@ -67,7 +73,8 @@ def result_item_to_object(item: dict, name_to_index: dict[str, int]) -> dict | N
         w = value.get("width", 0.0) / 100.0
         h = value.get("height", 0.0) / 100.0
         # Rotation is dropped: the export formats are axis-aligned.
-        return {"class_id": class_id, "bbox": (x + w / 2, y + h / 2, w, h), "polygon": None}
+        return {"class_id": class_id, "bbox": (x + w / 2, y + h / 2, w, h), "polygon": None,
+                "region_id": item.get("id")}
 
     if region_type == _POLY:
         class_id = _label_index(value, _POLY, name_to_index)
@@ -82,7 +89,8 @@ def result_item_to_object(item: dict, name_to_index: dict[str, int]) -> dict | N
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
         bbox = ((min_x + max_x) / 2, (min_y + max_y) / 2, max_x - min_x, max_y - min_y)
-        return {"class_id": class_id, "bbox": bbox, "polygon": polygon}
+        return {"class_id": class_id, "bbox": bbox, "polygon": polygon,
+                "region_id": item.get("id")}
 
     return None
 

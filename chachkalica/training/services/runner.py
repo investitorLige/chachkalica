@@ -107,10 +107,20 @@ PREDICT_TIMEOUT = 180
 
 
 def predict_image(payload: dict, ts: TrainingSettings | None = None) -> dict:
-    """Run one image through a trained model synchronously; return {boxes, classes}.
+    """Run one image through a trained model synchronously; return
+    ``{boxes, classes, timings}``.
 
-    Used by the interactive model preview — the service keeps the model warm, so
-    only the first request per model/pipeline pays the load cost.
+    Used by the interactive model preview, video/camera inference and the dataset
+    inference runs — the service keeps the model warm, so only the first request
+    per model/pipeline pays the load cost.
+
+    ``timings`` is what the trainer measured around its own inference call:
+    ``total_ms`` always, plus a ``load_ms``/``infer_ms``/``format_ms`` split when
+    the payload asks for it (``stage_timings: True``; it costs a GPU sync per
+    stage boundary, so it is opt-in). **The key is absent on an older trainer
+    service** — a caller that reports speed must fall back to its own clock and
+    say which one it used, rather than presenting a round trip as the model's
+    frame time.
     """
     resp = requests.post(
         f"{base_url(ts)}/predict_image", json=payload, timeout=PREDICT_TIMEOUT)
@@ -152,6 +162,31 @@ def promote_labels(payload: dict, ts: TrainingSettings | None = None) -> dict:
             detail = str(body["detail"])
         raise RuntimeError(
             f"trainer /promote_labels returned HTTP {resp.status_code}: {detail}"
+        )
+    return resp.json()
+
+
+def build_match_table(payload: dict, ts: TrainingSettings | None = None) -> dict:
+    """Rebuild an eval's match table in the trainer, from predictions it already has.
+
+    Synchronous like ``promote_labels`` and for the same reason: the trainer
+    torch.loads the ``*_predictions.pt`` and re-reads the label files, but
+    loads no model and touches no GPU, so it does not queue behind a training
+    job. Shares ``PROMOTE_TIMEOUT`` — both are bounded by reading one large
+    predictions file off the shared filesystem.
+    """
+    resp = requests.post(
+        f"{base_url(ts)}/match_table", json=payload, timeout=PROMOTE_TIMEOUT)
+    if resp.status_code >= 400:
+        detail = resp.text
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and body.get("detail"):
+            detail = str(body["detail"])
+        raise RuntimeError(
+            f"trainer /match_table returned HTTP {resp.status_code}: {detail}"
         )
     return resp.json()
 

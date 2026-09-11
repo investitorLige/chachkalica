@@ -1,0 +1,32 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>
+  Create a Label Studio project for
+  {% if dataset %}<strong>{{ dataset.name }}</strong>{% else %}each dataset below{% endif %}
+  on all {{ annotators|length }} active annotator{{ annotators|length|pluralize }}:
+  {% for annotator in annotators %}<code>{{ annotator.username }}</code>{% if not forloop.last %}, {% endif %}{% endfor %}.
+</p>
+
+{% if not dataset %}
+  <ul>
+    {% for dataset in datasets %}<li>{{ dataset.name }}</li>{% endfor %}
+  </ul>
+{% endif %}
+
+<form action="" method="post" id="tag-editor">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="apply" value="1">
+
+  {% include "admin/fleet/_annotation_tag_intro.html" %}
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="{{ submit_label }}">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+{% endblock %}

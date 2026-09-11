@@ -6,7 +6,7 @@
   {% for dataset in datasets %}<li>{{ dataset.name }}</li>{% endfor %}
 </ul>
 
-<form action="" method="post">
+<form action="" method="post" id="tag-editor">
   {% csrf_token %}
   {% for pk in selected %}
     <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
@@ -19,10 +19,12 @@
     <select name="annotator" id="annotator" required>
       <option value="">— choose —</option>
       {% for annotator in annotators %}
-        <option value="{{ annotator.pk }}">{{ annotator.username }}</option>
+        <option value="{{ annotator.pk }}" {% if chosen_annotator == annotator.pk|stringformat:"s" %}selected{% endif %}>{{ annotator.username }}</option>
       {% endfor %}
     </select>
   </p>
+
+  {% include "admin/fleet/_annotation_tag_intro.html" %}
 
   <div class="submit-row">
     <input type="submit" class="default" value="Set up + sync">

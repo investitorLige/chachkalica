@@ -27,7 +27,13 @@ try:
     # Re-exported (not defined here) so bundle_export can reach it without
     # importing this module's torch — see chachak/config.py.
     from .config import _inference_score_threshold  # noqa: F401
-    from ._friendy import EVAL_HARD_IMAGES_FRACTION, _to_builtin, _write_hard_images, evaluate_detection
+    from ._friendy import (
+        EVAL_HARD_IMAGES_FRACTION,
+        _to_builtin,
+        _write_hard_images,
+        _write_match_table,
+        evaluate_detection,
+    )
     from .boxes import (
         crop_image,
         expand_box,
@@ -42,7 +48,13 @@ try:
     from .infer import infer_in_chunks
 except ImportError:  # run as a flat script
     from config import _inference_score_threshold  # noqa: F401
-    from _friendy import EVAL_HARD_IMAGES_FRACTION, _to_builtin, _write_hard_images, evaluate_detection
+    from _friendy import (
+        EVAL_HARD_IMAGES_FRACTION,
+        _to_builtin,
+        _write_hard_images,
+        _write_match_table,
+        evaluate_detection,
+    )
     from boxes import (
         crop_image,
         expand_box,
@@ -327,6 +339,22 @@ class Pipeline:
             eval_classes=eval_classes,
             score_threshold=self.config.score_threshold,
             top_k_fraction=EVAL_HARD_IMAGES_FRACTION,
+        )
+        # Same arguments as the evaluate_detection call above, so the table
+        # describes exactly the evaluation whose metrics are returned here.
+        _write_match_table(
+            prediction_path,
+            all_predictions,
+            all_targets,
+            records,
+            config=None,
+            num_classes=num_classes,
+            prediction_classes=prediction_classes,
+            target_classes=target_classes,
+            eval_classes=eval_classes,
+            iou_thresholds=self.config.iou_thresholds,
+            score_threshold=self.config.score_threshold,
+            map_score_threshold=self.config.map_score_threshold,
         )
         return {
             "prediction_path": prediction_path,

@@ -147,7 +147,114 @@ def parse_classes_file(classes_file: Path) -> tuple[list[str], list[str]]:
     return classes, tools
 
 
-def build_label_config(classes_file: Path) -> str:
+# ---------------------------
+# Annotation tags (extra, non-geometry controls)
+# ---------------------------
+# A "tag" is an attribute the annotator records alongside the geometry: a
+# frame-wide one (weather, shift, scene) asked once per image, or a box-wide
+# one (occlusion, blur, distance) asked again for every region. Both are plain
+# Label Studio controls; the only structural difference is `perRegion="true"`,
+# which moves the control out of the canvas and into the region details panel.
+TAG_FRAME = "frame"
+TAG_REGION = "region"
+
+# widget keyword -> (control tag, extra attributes). The whole checkbox/radio/
+# dropdown family is one `<Choices>` tag differing only by attribute, which is
+# exactly why the widget is stored as a keyword rather than a tag name.
+TAG_WIDGETS = {
+    "checkbox": ("Choices", ' choice="multiple"'),
+    "radio": ("Choices", ' choice="single"'),
+    "dropdown": ("Choices", ' choice="single" layout="select"'),
+    "multiselect": ("Choices", ' choice="multiple" layout="select"'),
+    "rating": ("Rating", ""),
+    "text": ("TextArea", ' editable="true" rows="2"'),
+}
+
+#: Widgets whose meaning is a fixed list of options — the ones that need
+#: `<Choice>` children, and so are the only ones for which an empty choice list
+#: is an error rather than simply irrelevant.
+CHOICE_WIDGETS = frozenset({"checkbox", "radio", "dropdown", "multiselect"})
+
+#: Control names the generated config already uses. A tag may not take one of
+#: these: two controls sharing a `name` is what Label Studio reads as one
+#: control, so a tag called `bbox` would silently merge into the box tool.
+RESERVED_CONTROL_NAMES = frozenset(
+    {"image"} | {name for _tag, name, _extra in LABEL_TOOLS.values()}
+)
+
+
+def tag_control_xml(spec: dict, *, indent: str = "  ") -> str:
+    """Render one tag spec as its Label Studio control element.
+
+    ``spec`` is the plain-dict form of an ``AnnotationTag`` (see
+    ``AnnotationTag.to_spec``); taking a dict rather than the model keeps this
+    module ORM-free like the rest of it.
+    """
+    widget = spec["widget"]
+    try:
+        tag, attrs = TAG_WIDGETS[widget]
+    except KeyError:
+        raise RuntimeError(
+            f"Unknown tag widget {widget!r}. "
+            f"Valid widgets: {', '.join(sorted(TAG_WIDGETS))}."
+        ) from None
+
+    if widget == "rating":
+        attrs = f' maxRating="{int(spec.get("max_rating") or 5)}"'
+
+    per_region = ' perRegion="true"' if spec.get("scope") == TAG_REGION else ""
+    required = ' required="true"' if spec.get("required") else ""
+    head = (
+        f'{indent}<{tag} name="{escape(str(spec["name"]))}" toName="image"'
+        f"{per_region}{attrs}{required}"
+    )
+
+    if widget not in CHOICE_WIDGETS:
+        return f"{head}/>"
+
+    options = [str(choice) for choice in (spec.get("choices") or [])]
+    if not options:
+        raise RuntimeError(f"Tag {spec['name']!r} is a {widget} but has no choices.")
+    body = "\n".join(f'{indent}  <Choice value="{escape(o)}"/>' for o in options)
+    return f"{head}>\n{body}\n{indent}</{tag}>"
+
+
+def tags_xml(specs) -> str:
+    """Render every tag spec into the two blocks that go inside the root View.
+
+    Frame-wide tags are wrapped in a bordered ``<View>`` with a section heading
+    and one ``<Header>`` per tag, because they render on the canvas underneath
+    the image and need to be told apart there.
+
+    Box-wide tags get no headers at all. ``perRegion`` controls are pulled out
+    of the canvas into the selected region's details panel, but ``<Header>`` is
+    not perRegion-aware — a header emitted next to one would stay behind on the
+    canvas as a floating caption for a control that isn't there. In the region
+    panel each control is labelled with its own ``name``, which is why a tag's
+    name is what the annotator reads.
+    """
+    specs = list(specs)
+    frame = [s for s in specs if s.get("scope") != TAG_REGION]
+    region = [s for s in specs if s.get("scope") == TAG_REGION]
+
+    blocks: list[str] = []
+    if frame:
+        rows = []
+        for spec in frame:
+            rows.append(f'    <Header value="{escape(str(spec["name"]))}" size="6"/>')
+            rows.append(tag_control_xml(spec, indent="    "))
+        inner = "\n".join(rows)
+        blocks.append(
+            '  <View style="border-top: 1px solid #ccc; margin-top: 12px; padding-top: 8px;">\n'
+            '    <Header value="Frame tags" size="4"/>\n'
+            f"{inner}\n"
+            "  </View>"
+        )
+    blocks.extend(tag_control_xml(spec) for spec in region)
+    return "\n".join(blocks)
+
+
+def build_label_config(classes_file: Path, tags=()) -> str:
     classes, tools = parse_classes_file(classes_file)
 
     labels_xml = "\n".join(
@@ -172,6 +279,9 @@ def build_label_config(classes_file: Path) -> str:
             f"{labels_xml}\n"
             f"  </{tag}>"
         )
+    tag_block = tags_xml(tags)
+    if tag_block:
+        blocks.append(tag_block)
     controls_xml = "\n".join(blocks)
 
     return f"""
@@ -218,6 +328,25 @@ def create_project(*, ls_url: str, api_token: str, title: str, label_config: str
     )
     response.raise_for_status()
     return response.json()["id"]
+
+
+def update_project_label_config(*, ls_url: str, api_token: str, project_id: int, label_config: str):
+    """Replace an existing project's labeling interface in place.
+
+    Used to push edited annotation tags onto projects that already exist, so a
+    tag added after setup reaches annotators without recreating the project (and
+    losing their work). Label Studio validates the new config against what has
+    already been annotated and rejects a change that would orphan existing
+    regions — adding controls is safe, removing one that is in use is not, and
+    the raised error carries LS's own explanation.
+    """
+    response = requests.patch(
+        f"{ls_url}/api/projects/{project_id}",
+        headers=_auth(api_token),
+        json={"label_config": label_config},
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def delete_project(*, ls_url: str, api_token: str, project_id: int):
@@ -424,11 +553,16 @@ def create_dataset_project(
     *, dataset_dir: Path, data_root: Path, classes_file: Path, ls_url: str,
     api_token: str, project_title: str, storage_type: str = "local",
     storage_root: str | None = None, labels_dir: Path | None = None,
+    tags=(),
 ) -> dict:
     """Create a Label Studio project and import image tasks from a dataset path.
 
     When ``labels_dir`` is given and exists, each task whose image has a matching
     label file gets those regions attached as predictions (pre-annotations).
+
+    ``tags`` are the dataset's extra annotation controls (see :func:`tags_xml`),
+    baked into the label config at creation. Editing them later does not reach a
+    project made here — that is what ``update_project_label_config`` is for.
 
     Idempotent: if a project with this title already exists, leave it untouched
     and return it (skipped=True) rather than re-importing tasks.
@@ -450,7 +584,7 @@ def create_dataset_project(
             "skipped": True,
         }
 
-    label_config = build_label_config(classes_file)
+    label_config = build_label_config(classes_file, tags)
     project_id = create_project(
         ls_url=ls_url, api_token=api_token, title=project_title, label_config=label_config
     )

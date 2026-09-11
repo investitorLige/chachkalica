@@ -1,0 +1,39 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<p>
+  Extra questions annotators answer on <strong>{{ dataset.name }}</strong>, on top of
+  drawing boxes and polygons. These are compiled into the labeling interface of every
+  Label Studio project created for this dataset.
+</p>
+
+<form action="" method="post" id="tag-editor">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="apply" value="1">
+
+  {% include "admin/fleet/_annotation_tag_sections.html" %}
+  {% include "admin/fleet/_annotation_tag_push.html" %}
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Save tags">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+
+<h2 style="margin-top: 24px;">Generated labeling interface</h2>
+<p class="help">
+  What a new project for this dataset gets today (classes and drawing tools come from
+  <code>classes.txt</code>). Reload after saving to see the tags in it — and check the
+  live preview in Label Studio's own <em>Settings → Labeling Interface</em> before
+  handing the project to annotators.
+</p>
+{% if preview_error %}
+  <p class="errornote">No preview: {{ preview_error }}</p>
+{% else %}
+  <pre style="background: #1f2937; color: #e5e7eb; padding: 12px; overflow-x: auto;">{{ preview }}</pre>
+{% endif %}
+{% endblock %}

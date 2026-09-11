@@ -32,8 +32,9 @@ class Command(BaseCommand):
                 self.stdout.write(f"{result['username']:20} {result['dataset']:14} {result['status']}")
                 continue
             warn = f"  ⚠ {len(result['errors'])} coco errors" if result["errors"] else ""
+            tagged = f"tagged={result['tagged_images']:<4}" if result.get("tagged_images") else ""
             self.stdout.write(
                 f"{result['username']:20} {result['dataset']:14} "
                 f"images={result['images']:<4} anns={result['annotations']:<4} "
-                f"pruned={result['pruned']:<3}-> {result['coco_path']}{warn}"
+                f"pruned={result['pruned']:<3}{tagged}-> {result['coco_path']}{warn}"
             )

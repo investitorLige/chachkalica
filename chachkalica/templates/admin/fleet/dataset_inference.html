@@ -1,0 +1,74 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block content %}
+<p>Run a model over <strong>{{ dataset.name }}</strong>&rsquo;s images and record what it
+costs per image.</p>
+<p class="help">Runs in the background — the report opens straight away and fills in as the
+worker gets through the images, and it keeps going whether or not the page stays open.</p>
+
+{% if not visible_to_trainer %}
+  <p class="errornote">
+    <code>{{ images_dir }}</code> is outside <code>{{ shared_data_root }}</code>, which is the
+    only tree the trainer can open: images are handed to it as paths, not copied. Move the
+    dataset under the data root — or point <em>source_dir</em> in Fleet settings at it —
+    before running a model on it.
+  </p>
+{% elif image_count %}
+  <p class="help">{{ image_count }} image(s) under <code>{{ images_dir }}</code>.</p>
+{% else %}
+  <p class="errornote">No images found under <code>{{ images_dir }}</code>.</p>
+{% endif %}
+
+{# Re-posts the action without a model_source, which lands back on step 1. #}
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <p><input type="submit" class="button" value="← Change model type"></p>
+</form>
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="model_source" value="{{ model_source }}">
+  <input type="hidden" name="apply" value="1">
+
+  {# The model + pipeline half, shared verbatim with the video inference forms —
+     same knobs, same prefill from the model's own recorded pipeline. Its
+     frame_stride row is left out here: a folder of images has no such thing. #}
+  {% include "admin/videos/_inference_fields.html" %}
+
+  <div class="form-row">
+    <label for="image_limit">Images to run:</label>
+    <input type="number" name="image_limit" id="image_limit" min="0" step="1"
+           value="{{ values.image_limit }}">
+    <p class="help">0 runs every image. A smaller number takes an <em>evenly spaced</em>
+    subset rather than the first N files, so the sample spans the whole dataset — the first
+    N files of a sorted dataset are usually one scene, and its resolution and crowd count
+    would then be what the timing measures.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="warmup">Warmup calls:</label>
+    <input type="number" name="warmup" id="warmup" min="0" step="1"
+           value="{{ values.warmup }}">
+    <p class="help">Untimed calls on the first image before the timed loop starts. Leave
+    this at 3 or more: the first call for a model loads it, and a TensorRT engine
+    deserializes its plan then too, neither of which is a frame time. Only set it to 0 if
+    you specifically want the load included.</p>
+  </div>
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Run inference">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+
+{% include "admin/videos/_inference_scripts.html" %}
+{% endblock %}

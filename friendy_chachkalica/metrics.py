@@ -1271,3 +1271,257 @@ def _f1(precision: float, recall: float) -> float:
     if denominator <= 0:
         return 0.0
     return float(2 * precision * recall / denominator)
+
+
+# --------------------------------------------------------------------------
+# Match table — the per-detection outcome dump that per-tag / per-slice
+# analytics are computed from outside this process.
+# --------------------------------------------------------------------------
+
+MATCH_TABLE_VERSION = 1
+
+
+def _remap_target_rows(target, id_to_name, eval_name_to_id):
+    """:func:`_remap_target`, but also returning which source rows survived.
+
+    A target box whose class name is absent from the eval space is dropped, so
+    after a remap a box's position no longer tells you which line of the label
+    file it came from. The match table joins per-box annotation tags on exactly
+    that line number, so it has to keep the original index rather than infer it.
+    """
+    if id_to_name is None:
+        return target, list(range(int(target['labels'].numel())))
+
+    kept_boxes = []
+    kept_labels = []
+    kept_rows = []
+    for row, (box, label) in enumerate(zip(target['boxes'], target['labels'])):
+        class_name = id_to_name.get(int(label))
+        if class_name not in eval_name_to_id:
+            continue
+        kept_boxes.append(box)
+        kept_labels.append(eval_name_to_id[class_name])
+        kept_rows.append(row)
+
+    boxes = torch.stack(kept_boxes) if kept_boxes else target['boxes'].new_zeros((0, 4))
+    return {
+        'boxes': boxes,
+        'labels': torch.tensor(kept_labels, dtype=torch.long),
+        'orig_size': target['orig_size'],
+    }, kept_rows
+
+
+def _best_same_class_gt(prediction, target) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per prediction: its highest-IoU ground-truth box *of its own class*.
+
+    Returns ``(best_iou, best_gt)`` with ``best_iou = -1`` and ``best_gt = -1``
+    for a prediction whose image holds no ground truth of its class. This is
+    the one threshold-independent quantity every metric in this module is built
+    on: :func:`_precompute_class_matching` computes it per class and
+    :func:`_micro_stats` computes it with a class mask, and they agree, because
+    restricting the argmax to one class is the same as masking the others out.
+    Computing it once here is what lets an arbitrary subset be re-scored later
+    without re-running the eval.
+    """
+    num_pred = int(prediction['labels'].numel())
+    if num_pred == 0:
+        return torch.empty((0,)), torch.empty((0,), dtype=torch.long)
+    if int(target['labels'].numel()) == 0:
+        return (torch.full((num_pred,), -1.0), torch.full((num_pred,), -1, dtype=torch.long))
+
+    ious = box_iou(prediction['boxes'], target['boxes'])
+    label_match = prediction['labels'][:, None] == target['labels'][None, :]
+    masked = torch.where(label_match, ious, ious.new_full((), -1.0))
+    best_iou, best_gt = torch.max(masked, dim=1)
+    # A prediction with no same-class ground truth has best_iou == -1; its
+    # best_gt index is then meaningless, so blank it rather than let a consumer
+    # join on it.
+    has_gt = best_iou >= 0
+    return best_iou, torch.where(has_gt, best_gt, torch.full_like(best_gt, -1))
+
+
+def _prediction_block(predictions, targets, gt_offsets) -> dict:
+    """Columnar per-prediction rows: image, class, score, iou, matched gt row."""
+    images: list[int] = []
+    classes: list[int] = []
+    scores: list[float] = []
+    ious: list[float] = []
+    gts: list[int] = []
+
+    for image_index, (prediction, target) in enumerate(zip(predictions, targets)):
+        count = int(prediction['labels'].numel())
+        if count == 0:
+            continue
+        best_iou, best_gt = _best_same_class_gt(prediction, target)
+        offset = gt_offsets[image_index]
+        images.extend([image_index] * count)
+        classes.extend(int(value) for value in prediction['labels'].tolist())
+        scores.extend(round(float(value), 6) for value in prediction['scores'].tolist())
+        # Six decimals, not fewer: an IoU is compared against the thresholds, so
+        # a coarser rounding lets a 0.4999996 overlap cross 0.5 and flip one
+        # prediction's verdict. The consumer cross-checks itself against the
+        # eval's stored mAP, and rounding noise is what would show up there.
+        ious.extend(round(float(value), 6) for value in best_iou.tolist())
+        gts.extend(
+            (offset + int(value)) if int(value) >= 0 else -1
+            for value in best_gt.tolist()
+        )
+
+    return {"image": images, "class": classes, "score": scores, "iou": ious, "gt": gts}
+
+
+def match_table(
+    predictions: Sequence[torch.Tensor],
+    targets: Sequence[Dict[str, Any]],
+    iou_thresholds: Optional[Iterable[float]] = None,
+    score_threshold: float = 0.001,
+    map_score_threshold: Optional[float] = None,
+    num_classes: Optional[int] = None,
+    prediction_classes: Optional[Dict[int, str]] = None,
+    target_classes: Optional[Dict[int, str]] = None,
+    eval_classes: Optional[Dict[int, str]] = None,
+    operating_nms_threshold: Optional[float] = None,
+    image_names: Optional[Sequence[Optional[str]]] = None,
+) -> Dict[str, Any]:
+    """Dump every prediction's and ground-truth box's match outcome.
+
+    ``evaluate_detection`` answers "how good is this model on this dataset";
+    this answers "which box did what", once, so that *any* later slice of the
+    dataset — frames tagged rainy, boxes tagged occluded, an arbitrary
+    intersection of both — can be scored without a second inference pass. The
+    arguments mirror ``evaluate_detection``'s so a caller hands both the same
+    thing and cannot accidentally describe a different evaluation.
+
+    What makes one dump enough for every subset: matching is **per image** and
+    threshold-independent up to the stored ``iou``. A prediction's verdict at
+    IoU *t* is "its best same-class ground-truth box overlaps at >= t, and no
+    higher-scoring prediction already claimed that box" — and both halves only
+    ever involve boxes inside the same image. Dropping images from the set
+    therefore cannot change any surviving prediction's verdict, and raising the
+    confidence cut cannot either, because matching runs in descending score
+    order. So a consumer re-sorting these rows by score and walking them
+    reproduces ``_class_stats_at_iou`` and ``_micro_stats`` exactly, for the
+    whole set or for any part of it.
+
+    Rows are emitted in image order, with each image's predictions in their
+    original order, which is the order ``_precompute_class_matching``
+    concatenates them in before its stable sort — so a consumer's stable sort
+    lands on the same tie order too.
+
+    Shape (all coordinates already gone; only outcomes remain)::
+
+        {"version": 1,
+         "iou_thresholds": [0.5, ...],
+         "score_threshold": 0.25,          # the headline operating point
+         "score_floor": 0.001,             # lowest score present in the rows
+         "operating_nms_threshold": null,
+         "classes": {"0": "person", ...},
+         "images": ["img01.jpg", ...],
+         "gt":   {"image": [...], "class": [...], "row": [...]},
+         "pred": {"image": [...], "class": [...], "score": [...],
+                  "iou": [...], "gt": [...]},
+         "pred_operating": {...} | null}
+
+    ``pred.gt`` indexes the ``gt`` arrays (or -1 for a prediction with no
+    same-class ground truth in its image), so the two tables join directly.
+    ``gt.row`` is the box's line in its label file, which is what the annotation
+    tag sidecar keys per-box answers on.
+
+    ``pred`` holds the AP set: raw, NMS-free, collected down to the AP score
+    floor. ``pred_operating`` is only present when the run used an operating
+    NMS threshold, in which case the operating-point metrics (precision,
+    recall, F1, prediction counts) are computed from that suppressed set
+    instead — the same split ``evaluate_detection`` makes internally. When it
+    is absent the two sets are identical and the one table serves both.
+    """
+    thresholds = [float(value) for value in (iou_thresholds or DEFAULT_IOU_THRESHOLDS)]
+    if not thresholds:
+        raise ValueError('iou_thresholds must contain at least one threshold')
+
+    operating_threshold = float(score_threshold)
+    ap_score_threshold = operating_threshold if map_score_threshold is None else float(map_score_threshold)
+
+    prepared_targets = [_prepare_target(target) for target in targets]
+    prepared_predictions = [
+        _prepare_prediction(prediction, target, ap_score_threshold)
+        for prediction, target in zip(predictions, prepared_targets)
+    ]
+
+    effective_eval_classes = eval_classes
+    if eval_classes is not None and prediction_classes is not None:
+        prediction_names = {str(name) for name in prediction_classes.values()}
+        effective_eval_classes = {
+            class_id: name
+            for class_id, name in eval_classes.items()
+            if str(name) in prediction_names
+        }
+
+    class_ids = _resolve_class_ids(
+        prepared_predictions, prepared_targets, num_classes,
+        eval_classes=effective_eval_classes,
+    )
+
+    gt_rows_per_image: list[list[int]] = [
+        list(range(int(target['labels'].numel()))) for target in prepared_targets
+    ]
+    if effective_eval_classes is not None:
+        eval_name_to_id = {str(name): int(class_id) for class_id, name in effective_eval_classes.items()}
+        prediction_id_to_name = _normalize_class_map(prediction_classes)
+        target_id_to_name = _normalize_class_map(target_classes)
+        prepared_predictions = [
+            _remap_prediction(prediction, prediction_id_to_name, eval_name_to_id)
+            for prediction in prepared_predictions
+        ]
+        remapped_targets = []
+        gt_rows_per_image = []
+        for target in prepared_targets:
+            remapped, kept_rows = _remap_target_rows(target, target_id_to_name, eval_name_to_id)
+            remapped_targets.append(remapped)
+            gt_rows_per_image.append(kept_rows)
+        prepared_targets = remapped_targets
+
+    gt_image: list[int] = []
+    gt_class: list[int] = []
+    gt_row: list[int] = []
+    gt_offsets: list[int] = []
+    for image_index, target in enumerate(prepared_targets):
+        gt_offsets.append(len(gt_image))
+        labels = [int(value) for value in target['labels'].tolist()]
+        gt_image.extend([image_index] * len(labels))
+        gt_class.extend(labels)
+        gt_row.extend(gt_rows_per_image[image_index])
+
+    pred_block = _prediction_block(prepared_predictions, prepared_targets, gt_offsets)
+
+    operating_block = None
+    if operating_nms_threshold is not None:
+        operating_predictions = [
+            _apply_operating_nms(prediction, operating_nms_threshold)
+            for prediction in prepared_predictions
+        ]
+        operating_block = _prediction_block(
+            operating_predictions, prepared_targets, gt_offsets
+        )
+
+    if image_names is None:
+        image_names = [None] * len(prepared_targets)
+    names = [
+        Path(str(name)).name if name else f"#{index}"
+        for index, name in enumerate(image_names)
+    ]
+
+    return {
+        "version": MATCH_TABLE_VERSION,
+        "iou_thresholds": thresholds,
+        "score_threshold": operating_threshold,
+        "score_floor": ap_score_threshold,
+        "operating_nms_threshold": operating_nms_threshold,
+        "classes": {
+            str(class_id): _class_name(effective_eval_classes, class_id)
+            for class_id in class_ids
+        },
+        "images": names,
+        "gt": {"image": gt_image, "class": gt_class, "row": gt_row},
+        "pred": pred_block,
+        "pred_operating": operating_block,
+    }

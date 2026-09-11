@@ -42,11 +42,14 @@ The cleanup command removes only the container. It does not delete the Docker vo
 - [Configuration](configuration.md)
 - [Commands](commands.md)
 - [Annotator Fleet](annotator-fleet.md)
+- [Annotation Tags](annotation-tags.md) — the extra questions annotators answer beyond the boxes: frame-wide and box-wide tags, compiled into every project's labeling interface
+- [Tag Analytics](tag-analytics.md) — re-score any eval over the slices its annotation tags define: per-tag tables, cross-tabs, and arbitrary intersections, with no second inference pass
 - [Camera Live Preview](camera-live-preview.md) — RTSP cameras + MJPEG preview via Redis
 - [Camera Live Inference](camera-live-inference.md) — running a model on a camera's live frames
 - [Pipeline Metadata](pipeline-metadata.md) — a model carries the pipeline it was trained through, in every format; every action prefills from it
 - [Infer Bundles](infer-bundles.md) — drop a self-contained bundle in `data/bundles` and run it from any inference form; what "Sync bundle" checks
 - [Build Nodes](build-nodes.md) — register other GPU machines and compile TensorRT engines/bundles on them, so a bundle is valid on the GPU it will actually run on
+- [Dataset Inference Runs](dataset-inference.md) — run any model format over a dataset's images and measure its real per-frame cost: the model's own clock, the round trip, and where the frame goes
 - [Bundle Benchmarks](bundle-benchmarks.md) — measure an exported bundle on real frames: latency percentiles, throughput, GPU memory, and where the frame budget actually goes
 - [Marketing Renders](marketing-videos.md) — the second inference action: styled, watchable boxes, a one-frame preview, and a delivery-sized file
 - [Marketing Studio](marketing-studio.md) — the same renderer as its own section: own video library, own bundle root, own presets, bundles only

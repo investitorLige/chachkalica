@@ -22,9 +22,7 @@ from django.urls import path, reverse
 from django.utils.html import format_html
 
 from fleet.admin import _status_badge as _job_status_badge
-from training import pipelines
-from training.models import TrainedModel
-from training.services import bundles, exports, pipeline_meta
+from training.services import exports, inference_form
 from videos import jobs
 from videos.models import (
     FrameExtractionJob, InferenceJob, MarketingVideo, RenderPreset, Video,
@@ -51,13 +49,11 @@ _QUALITY_CHOICES = [
 ]
 
 
-# Every input on the run-inference form: the shared pipeline metadata vocabulary
-# (training.services.pipeline_meta.FIELDS) plus `frame_stride`, which is a property
-# of this run rather than of the model. Deriving the tuple from FIELDS rather than
-# restating it means a knob added to the metadata shows up here automatically.
-_FORM_FIELDS = (*pipeline_meta.FIELDS, "frame_stride")
-
-_DEFAULT_SCORE_THRESHOLD = 0.5
+# The model + pipeline half of this form is shared with the dataset-inference
+# action (see training.services.inference_form) — the two must offer the same
+# knobs, since they run the same models through the same geometry. `frame_stride`
+# is this run's own, being a property of a video rather than of the model.
+_DEFAULT_SCORE_THRESHOLD = inference_form.DEFAULT_SCORE_THRESHOLD
 _DEFAULT_FRAME_STRIDE = 1
 
 
@@ -108,53 +104,20 @@ def _parse_float_in_range(raw: str, default, low: float, high: float):
     return value if low <= value <= high else None
 
 
-# Sentinel for the *optional* parsers below, which must tell "operator left it
-# blank" (a valid None) apart from "operator typed nonsense".
-_INVALID = object()
-
-
-def _parse_optional_float(raw: str, low: float, high: float):
-    """Parse an optional float in ``[low, high]``; blank -> ``None``, bad -> ``_INVALID``."""
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-    try:
-        value = float(raw)
-    except ValueError:
-        return _INVALID
-    return value if low <= value <= high else _INVALID
-
-
-def _parse_optional_int(raw: str, low: int, high: int):
-    """Parse an optional int in ``[low, high]``; blank -> ``None``, bad -> ``_INVALID``."""
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        return _INVALID
-    return value if low <= value <= high else _INVALID
+# The optional parsers and their blank/nonsense sentinel live in
+# training.services.inference_form, which the dataset-inference form parses with
+# too; re-exported here under their old names because this module is where
+# marketing_studio.admin imports them from.
+_INVALID = inference_form._INVALID
+_parse_optional_float = inference_form.parse_optional_float
+_parse_optional_int = inference_form.parse_optional_int
 
 
 def _form_values(defaults: dict, posted) -> dict:
-    """The values to render the step-2 form with.
-
-    A re-render after a validation warning keeps whatever the operator typed
-    (``posted`` wins); a first render uses the selected model's pipeline metadata,
-    so the page *arrives* configured the way the model was trained instead of
-    blank. ``chain`` is a list in the metadata and a comma-separated string in the
-    form.
-    """
-    if posted.get("apply"):
-        return {key: posted.get(key, "") for key in _FORM_FIELDS}
-
-    values = {key: defaults.get(key) for key in _FORM_FIELDS}
-    values["chain"] = ", ".join(defaults.get("chain") or [])
-    values["frame_stride"] = _DEFAULT_FRAME_STRIDE
-    if values.get("score_threshold") is None:
-        values["score_threshold"] = _DEFAULT_SCORE_THRESHOLD
-    return {key: "" if value is None else value for key, value in values.items()}
+    """The values to render the step-2 form with: the shared pipeline half plus
+    this form's own ``frame_stride``."""
+    return inference_form.form_values(
+        defaults, posted, extra={"frame_stride": _DEFAULT_FRAME_STRIDE})
 
 
 class VideoAddForm(forms.ModelForm):
@@ -481,12 +444,7 @@ class VideoAdmin(admin.ModelAdmin):
             return TemplateResponse(request, "admin/videos/run_inference_source.html", {
                 **base_context,
                 "title": f"{heading} — {video.name}",
-                "model_source_choices": InferenceJob.MODEL_SOURCE_CHOICES,
-                "default_model_source": InferenceJob.TRAINED,
-                "artifact_count": len(exports.list_artifacts()),
-                "exports_root": str(exports.exports_root()),
-                "bundle_count": len(bundles.list_bundles()),
-                "bundles_root": str(bundles.bundles_root()),
+                **inference_form.source_step_context(),
             })
 
         # ------------------------------------------------------- step 2: submit
@@ -509,86 +467,26 @@ class VideoAdmin(admin.ModelAdmin):
                 return None
 
         # ------------------------------------------ step 2: render the full form
-        # Both model lists are newest-first and the first entry is preselected, so
-        # the page arrives with a model chosen *and* its pipeline metadata filled
-        # in — the common case ("run this model the way it was trained") needs no
-        # selection at all. Picking a different model reapplies its own metadata
-        # client-side from the maps below.
-        artifacts = exports.list_artifacts()
-        is_exported = model_source == InferenceJob.EXPORTED
-        is_bundle = model_source == InferenceJob.BUNDLE
-        bundle_list = bundles.list_bundles() if is_bundle else []
-        trained_models = list(
-            TrainedModel.objects
-            .select_related("source_run_result__run__experiment")
-            .order_by("-created_at", "name")
-        )
-        trained_defaults = {
-            str(tm.pk): pipeline_meta.for_trained_model(tm) for tm in trained_models
-        }
-        # An artifact with neither a ".pipeline.json" sidecar nor a catalogued model
-        # behind it has nothing on record (see exports.read_pipeline_defaults) and is
-        # simply left out of the map — selecting it leaves the form as it stands.
-        artifact_defaults = {
-            a["relpath"]: d
-            for a in artifacts
-            for d in [exports.read_pipeline_defaults(a["relpath"])] if d
-        }
-
-        if is_bundle:
-            # No preselection and no prefill: a bundle's geometry arrives via the
-            # explicit "Sync bundle" press, which is also the only thing that
-            # reports whether the bundle loads here (bundles.validate). Landing on
-            # a preselected bundle with its fields already filled would imply that
-            # check had happened.
-            selected = request.POST.get("bundle_path") or ""
-            defaults = pipeline_meta.raw()
-        elif is_exported:
-            selected = request.POST.get("artifact_path") or (
-                artifacts[0]["relpath"] if artifacts else "")
-            defaults = artifact_defaults.get(selected) or pipeline_meta.raw()
-        else:
-            selected = request.POST.get("trained_model") or (
-                str(trained_models[0].pk) if trained_models else "")
-            defaults = trained_defaults.get(selected) or pipeline_meta.raw()
-
+        # The model lists, their pipeline prefills and the pipeline vocabulary are
+        # the shared half of every serving form (training.services.inference_form);
+        # this action adds the video and its own frame_stride around them.
+        model_ctx = inference_form.model_context(model_source, request.POST)
+        selected = model_ctx["selected_model"]
         context = {
             **base_context,
             "title": f"{heading} — {video.name}",
-            "model_source": model_source,
-            "is_exported": is_exported,
-            "is_bundle": is_bundle,
-            "trained_models": trained_models,
-            # Passed as dicts, not pre-serialized: the template renders them with
-            # ``json_script``, which escapes the HTML-significant characters
-            # ``json.dumps`` does not. Model names, artifact filenames and detector
-            # paths all reach these maps, and a ``</script>`` in any of them would
-            # otherwise close the script element early.
-            "trained_defaults": trained_defaults,
-            "artifacts": artifacts,
-            "artifact_defaults": artifact_defaults,
-            "bundles": bundle_list,
-            "bundles_root": str(bundles.bundles_root()) if is_bundle else "",
-            "bundle_sync_url": reverse("bundle-sync"),
-            "selected_model": selected,
-            "values": _form_values(defaults, request.POST),
-            "default_score_threshold": _DEFAULT_SCORE_THRESHOLD,
-            "exports_root": str(exports.exports_root()),
-            "pipeline_choices": InferenceJob.PIPELINE_CHOICES,
-            "detector_pipelines": " ".join(sorted(pipelines.DETECTOR_PIPELINES)),
-            "tiling_pipelines": " ".join([
-                pipelines.BATCH_DETECT, pipelines.BATCH_PEOPLE, pipelines.CHAIN]),
-            "chain_pipelines": pipelines.CHAIN,
-            # Every pipeline merges several per-frame predictions back together;
-            # only "raw" has nothing to merge.
-            "merging_pipelines": " ".join(
-                value for value, _label in pipelines.PIPELINE_CHOICES),
+            **model_ctx,
+            **inference_form.pipeline_context(),
+            "values": _form_values(model_ctx["defaults"], request.POST),
+            "show_frame_stride": True,
         }
+
         if not marketing:
             return TemplateResponse(request, "admin/videos/run_inference.html", context)
 
-        classes = self._class_names_by_model(model_source, trained_models, artifacts,
-                                             bundle_list)
+        classes = self._class_names_by_model(
+            model_source, model_ctx["trained_models"], model_ctx["artifacts"],
+            model_ctx["bundles"])
         context.update(self._style_context(request, classes.get(selected) or []))
         # Keyed by the same string the model <select> posts, so the Look section's
         # "label every box as" dropdown can refill itself when a different model
@@ -681,75 +579,19 @@ class VideoAdmin(admin.ModelAdmin):
         ``marketing`` the Look section is parsed too, onto ``render_style`` — the
         one field that separates the two actions' output.
         """
-        trained_model = None
-        artifact_path = ""
-        bundle_path = ""
-        if model_source == InferenceJob.EXPORTED:
-            artifact_path = (request.POST.get("artifact_path") or "").strip()
-            if not artifact_path:
-                return None, "Choose an exported artifact."
-        elif model_source == InferenceJob.BUNDLE:
-            bundle_path = (request.POST.get("bundle_path") or "").strip()
-            if not bundle_path:
-                return None, "Choose a bundle."
-            # Structural checks only — the load test belongs to the "Sync bundle"
-            # button, where the operator asked for it; submitting a job must not
-            # take the trainer's GPU lock.
-            result = bundles.validate(bundle_path)
-            if not result["ok"]:
-                failures = "; ".join(
-                    f"{c['label']}: {c['detail']}"
-                    for c in result["checks"] if c["status"] == "fail"
-                )
-                return None, f"{bundle_path} is not usable — {failures}"
-        else:
-            trained_model = TrainedModel.objects.filter(
-                pk=request.POST.get("trained_model") or None
-            ).first()
-            if trained_model is None:
-                return None, "Choose a trained model."
-
-        pipeline = request.POST.get("pipeline") or InferenceJob.RAW
-        if pipeline not in dict(InferenceJob.PIPELINE_CHOICES):
-            return None, f"Unknown pipeline {pipeline!r}."
-
-        score_threshold = _parse_float_in_range(
-            request.POST.get("score_threshold"), default=0.5, low=0.0, high=1.0)
-        if score_threshold is None:
-            return None, "Score threshold must be between 0 and 1."
+        # Which model, and the geometry it runs through: the shared half of every
+        # serving form, parsed and pruned in one place
+        # (training.services.inference_form).
+        model_fields, error = inference_form.parse_model_source(request.POST, model_source)
+        if error:
+            return None, error
+        knobs, error = inference_form.parse_pipeline_fields(request.POST)
+        if error:
+            return None, error
 
         frame_stride = _parse_positive_int(request.POST.get("frame_stride"), default=1)
         if frame_stride is None:
             return None, "Frame stride must be a positive integer."
-
-        numbers = {}
-        for field, raw, low, high, label in [
-            ("detector_expand_ratio", request.POST.get("detector_expand_ratio"),
-             0.0, 10.0, "Person-box expand ratio must be between 0 and 10."),
-            ("tile_width_pct", request.POST.get("tile_width_pct"),
-             0.0001, 100.0, "Tile width % must be in (0, 100]."),
-            ("tile_height_pct", request.POST.get("tile_height_pct"),
-             0.0001, 100.0, "Tile height % must be in (0, 100]."),
-            ("overlap", request.POST.get("overlap"),
-             0.0, 0.99, "Tile overlap must be in [0, 1)."),
-            ("merge_nms_iou", request.POST.get("merge_nms_iou"),
-             0.0, 1.0, "Merge NMS IoU must be between 0 and 1."),
-            ("detector_min_box_size", request.POST.get("detector_min_box_size"),
-             0.0, 100000.0, "Person-crop minimum size must be 0 or more pixels."),
-        ]:
-            value = _parse_optional_float(raw, low, high)
-            if value is _INVALID:
-                return None, label
-            numbers[field] = value
-
-        tile_size_px = _parse_optional_int(request.POST.get("tile_size_px"), 1, 100000)
-        if tile_size_px is _INVALID:
-            return None, "Tile size must be a positive number of pixels."
-
-        chain = [
-            part.strip() for part in (request.POST.get("chain") or "").split(",")
-            if part.strip()
-        ]
 
         style = {}
         if marketing:
@@ -757,46 +599,14 @@ class VideoAdmin(admin.ModelAdmin):
             if style_error:
                 return None, style_error
 
-        # The form hides irrelevant rows with CSS, which still submits them — drop
-        # the ones the chosen pipeline can't use so the saved row is an honest
-        # record of what actually ran. 'chain' can contain anything, so it keeps
-        # every knob.
-        detector_checkpoint = (request.POST.get("detector_checkpoint") or "").strip()
-        uses_detector = pipeline in pipelines.DETECTOR_PIPELINES or pipeline == pipelines.CHAIN
-        uses_tiling = pipeline in (
-            pipelines.BATCH_DETECT, pipelines.BATCH_PEOPLE, pipelines.CHAIN)
-        if not uses_detector:
-            detector_checkpoint = ""
-            numbers["detector_expand_ratio"] = None
-            numbers["detector_min_box_size"] = None
-        if not uses_tiling:
-            tile_size_px = None
-            numbers["tile_width_pct"] = None
-            numbers["tile_height_pct"] = None
-            numbers["overlap"] = None
-        # merge_nms_iou applies to every pipeline that produces several predictions
-        # per frame to reconcile — that is, all of them except "raw", which runs the
-        # model once on the whole frame and has nothing to merge.
-        if pipeline == InferenceJob.RAW:
-            numbers["merge_nms_iou"] = None
-        if pipeline != pipelines.CHAIN:
-            chain = []
-
         job = InferenceJob(
             video=video,
             model_source=model_source,
-            trained_model=trained_model,
-            artifact_path=artifact_path,
-            bundle_path=bundle_path,
-            score_threshold=score_threshold,
             frame_stride=frame_stride,
-            pipeline=pipeline,
-            detector_checkpoint=detector_checkpoint,
-            tile_size_px=tile_size_px,
-            chain=chain,
             render_style=style,
             output_filename=inference.unique_output_filename(video.name),
-            **numbers,
+            **model_fields,
+            **knobs,
         )
 
         # A bundle's geometry is the bundle's, not the form's: whatever was posted

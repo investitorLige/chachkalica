@@ -1,9 +1,15 @@
-"""Image loading must be pixel-identical wherever the scaling happens.
+"""Image loading must be pixel-identical wherever the scaling happens, and the
+per-call timing must stay opt-in.
 
 ``_load_image_tensor`` transfers the decoded uint8 buffer and then does the
 permute/scale on the target device, rather than scaling on the host and
 transferring float32 — a quarter of the bytes, and the divide moves off the CPU.
 That is only safe because the result is bit-identical, which is what these assert.
+
+The second group covers ``timings``: the trainer's ``/predict_image`` passes a
+dict through to have the stages measured (which is where the admin's
+dataset-inference fps comes from), and a caller that passes nothing must get the
+same boxes with no synchronization added.
 
 Run from the chachak directory:  python -m unittest tests.test_preview
 """
@@ -74,6 +80,56 @@ class LoadImageTensorTest(unittest.TestCase):
 
         self.assertTrue(on_cuda.is_cuda)
         self.assertTrue(torch.equal(on_cuda.cpu(), on_cpu))
+
+
+class _StubPipeline:
+    """Returns one fixed detection, ignoring its input — the timing path is what
+    is under test, not a model."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def process_batch(self, images, targets):
+        self.calls += 1
+        # [cx, cy, w, h, confidence, class_id], normalized — Friendy's layout.
+        return [torch.tensor([[0.5, 0.5, 0.2, 0.2, 0.9, 0.0]])]
+
+
+class PredictOneTimingTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path, _array = _write_image(self._tmp.name)
+        self.info = {"train_classes": {0: "helmet"}}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_boxes_are_unchanged_when_no_timings_dict_is_passed(self):
+        boxes = preview.predict_one(_StubPipeline(), self.info, self.path, "cpu")
+
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0]["class_name"], "helmet")
+        self.assertAlmostEqual(boxes[0]["confidence"], 0.9, places=5)
+
+    def test_a_timings_dict_is_filled_with_the_three_stages(self):
+        timings = {}
+
+        boxes = preview.predict_one(
+            _StubPipeline(), self.info, self.path, "cpu", timings=timings)
+
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(set(timings), {"load_ms", "infer_ms", "format_ms"})
+        self.assertTrue(all(value >= 0 for value in timings.values()))
+
+    def test_the_score_threshold_still_filters_inside_the_timed_stage(self):
+        timings = {}
+
+        boxes = preview.predict_one(
+            _StubPipeline(), self.info, self.path, "cpu",
+            score_threshold=0.95, timings=timings)
+
+        self.assertEqual(boxes, [])
+        self.assertIn("infer_ms", timings)
 
 
 if __name__ == "__main__":

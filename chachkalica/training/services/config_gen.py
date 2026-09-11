@@ -588,6 +588,69 @@ def build_promote_payload(eval_obj, kind: str, score_threshold: float) -> dict:
     return payload
 
 
+#: The match-table artifact each eval kind writes, next to its predictions.
+MATCH_TABLE_FILE = {"pipeline": "predictions_matches.json", "base": "eval_matches.json"}
+
+
+def build_match_table_payload(eval_obj, kind: str) -> dict:
+    """Assemble the trainer ``/match_table`` payload to backfill one eval's table.
+
+    The match table (``metrics.match_table``) is written at eval time, so an
+    eval that finished before that existed has none and cannot be sliced by
+    annotation tag. Rebuilding it needs no model and no GPU — only the
+    predictions the eval already saved and the labels on disk.
+
+    Every threshold is taken from the eval's **stored metrics** where it
+    recorded one, falling back to the row's own fields. The metrics are what
+    the eval actually ran with (``operating_nms_threshold`` in particular is
+    derived inside the trainer from the model's params and never appears on the
+    request), and a table built with different thresholds would describe a
+    different evaluation than the metrics printed beside it.
+    """
+    ds = eval_obj.dataset
+    if not eval_obj.output_dir:
+        raise ValueError(f"{eval_obj}: no output dir — run the eval first.")
+    try:
+        predictions_file = PREDICTIONS_FILE[kind]
+    except KeyError:
+        raise ValueError(f"Unknown eval kind {kind!r}") from None
+
+    predictions_path = Path(eval_obj.output_dir) / predictions_file
+    if not predictions_path.exists():
+        raise ValueError(
+            f"{eval_obj}: {predictions_path.name} is missing — its predictions were "
+            "cleaned up or the run never finished, so there is nothing to rebuild from."
+        )
+
+    metrics = eval_obj.metrics if isinstance(eval_obj.metrics, dict) else {}
+    classes = dataset_classes(ds)
+    payload = {
+        "predictions_path": str(predictions_path),
+        "classes": classes,
+        "iou_thresholds": metrics.get("iou_thresholds") or default_iou_thresholds(),
+        "score_threshold": float(eval_obj.score_threshold),
+        "map_score_threshold": float(eval_obj.map_score_threshold),
+        "operating_nms_threshold": metrics.get("operating_nms_threshold"),
+    }
+
+    labels = resolve_label_dir(
+        ds, eval_obj.label_source,
+        getattr(eval_obj, "annotator", None),
+        getattr(eval_obj, "explicit_labels_path", "") or "",
+    )
+    if labels is not None:
+        payload["labels_dir"] = str(labels)
+
+    if getattr(eval_obj, "is_combined", False):
+        payload["prediction_classes"] = classes
+    else:
+        tm = eval_obj.trained_model
+        if not tm.checkpoint_path:
+            raise ValueError(f"{tm.name}: no checkpoint path to read train classes from.")
+        payload["checkpoint_path"] = tm.checkpoint_path
+    return payload
+
+
 def build_predict_request(
     model_checkpoint: str,
     pipeline: str,

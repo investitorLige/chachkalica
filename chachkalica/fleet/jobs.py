@@ -10,7 +10,10 @@ Admin actions and management commands enqueue these via ``django_rq``.
 
 from django.utils import timezone
 
-from fleet.models import Annotator, Dataset, GroundingSamRun, Project
+from fleet.models import (
+    Annotator, Dataset, DatasetInferenceRun, GroundingSamRun, Project,
+)
+from fleet.services import dataset_inference as dataset_inference_svc
 from fleet.services import datasets as datasets_svc
 from fleet.services import grounding_sam as grounding_sam_svc
 from fleet.services import merge as merge_svc
@@ -30,6 +33,14 @@ PRUNE_INTRA_DUPLICATES_JOB_TIMEOUT = 3600
 # per deletion. Sized off the intra-duplicate timeout anyway: copying tens of
 # thousands of full-resolution frames to the backup dir is slow on its own.
 PRUNE_OVERLAP_SELECTION_JOB_TIMEOUT = PRUNE_INTRA_DUPLICATES_JOB_TIMEOUT
+
+# One model call per image, on a GPU shared with training and every other
+# inference surface, and a run may cover thousands of images. The queue's 900s
+# DEFAULT_TIMEOUT is nowhere near that; sized like the video inference job
+# (videos.jobs.INFERENCE_JOB_TIMEOUT), doubled, because a dataset run's images
+# are full-resolution frames and a person-crop pipeline runs the model several
+# times per image.
+DATASET_INFERENCE_JOB_TIMEOUT = 7200
 
 
 def _mark_running(obj, action: str | None):
@@ -108,6 +119,27 @@ def setup_and_sync_project(dataset_id: int, annotator_id: int) -> dict:
     return setup_result
 
 
+def apply_dataset_tags(dataset_id: int) -> dict:
+    """Push a dataset's edited annotation tags onto its existing LS projects.
+
+    Marks each ``Project`` row with the per-project outcome, so a container that
+    was down (or an LS rejection) is visible on the Projects page rather than
+    only in the job log.
+    """
+    dataset = Dataset.objects.get(pk=dataset_id)
+    results = datasets_svc.apply_tags_to_projects(dataset)
+
+    by_username = {entry["username"]: entry for entry in results}
+    for project in dataset.projects.select_related("annotator"):
+        entry = by_username.get(project.annotator.username)
+        if entry is None:
+            continue
+        status = entry["status"]
+        ok = status == "updated"
+        _mark_done(project, "ok" if ok else "error", "" if ok else status)
+    return {"dataset": dataset.name, "projects": results}
+
+
 def generate_grounding_sam_labels(run_id: int) -> dict:
     """Auto-label a dataset's unlabeled images via the Grounding SAM backend.
 
@@ -130,6 +162,41 @@ def generate_grounding_sam_labels(run_id: int) -> dict:
         run.save(update_fields=["status", "error", "finished_at"])
         raise
     run.status = GroundingSamRun.OK
+    run.finished_at = timezone.now()
+    run.save(update_fields=["status", "finished_at"])
+    return result
+
+
+def run_dataset_inference(run_id: int) -> dict:
+    """Run a model over a dataset's images and record what it measured.
+
+    Status transitions live here (queued -> running -> ok/error/cancelled) and
+    the per-image progress + timing counters are written by the service as it
+    goes, so the report can be watched while it runs.
+
+    A cancel is not a failure: the operator pressed Stop, and the images already
+    measured keep their numbers — the run lands on ``cancelled`` with whatever it
+    got through.
+    """
+    run = DatasetInferenceRun.objects.select_related("trained_model").get(pk=run_id)
+    run.status = DatasetInferenceRun.RUNNING
+    run.started_at = timezone.now()
+    run.last_error = ""
+    run.save(update_fields=["status", "started_at", "last_error"])
+
+    try:
+        result = dataset_inference_svc.run_model_on_dataset(run)
+    except Exception as exc:
+        run.refresh_from_db()
+        run.status = DatasetInferenceRun.ERROR
+        run.last_error = str(exc)
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "last_error", "finished_at"])
+        raise
+
+    run.refresh_from_db()
+    run.status = (DatasetInferenceRun.CANCELLED if result["cancelled"]
+                  else DatasetInferenceRun.OK)
     run.finished_at = timezone.now()
     run.save(update_fields=["status", "finished_at"])
     return result

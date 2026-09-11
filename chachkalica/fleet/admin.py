@@ -15,6 +15,7 @@ import django_rq
 from django import forms
 from django.contrib import admin, messages
 from django.contrib.admin.helpers import ACTION_CHECKBOX_NAME
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.http import FileResponse, Http404, HttpResponse, JsonResponse
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
@@ -25,15 +26,22 @@ from django.utils.http import urlencode
 
 from admin_sections.scoping import scope_queryset
 from fleet import jobs
-from fleet.models import Annotator, Dataset, FleetSettings, GroundingSamRun, Project
+from fleet.models import (
+    AnnotationTag, Annotator, Dataset, DatasetInferenceResult, DatasetInferenceRun,
+    FleetSettings, GroundingSamRun, Project,
+)
 from fleet.services import analytics as analytics_svc
+from fleet.services import annotation_tags as annotation_tags_svc
 from fleet.services import data_quality_solve
+from fleet.services import dataset_inference
 from fleet.services import datasets as datasets_svc
 from fleet.services import lsapi
 from fleet.services import merge as merge_svc
 from fleet.services import overlap as overlap_svc
 from fleet.services import split as split_svc
 from fleet.services.paths import source_root
+from training.services import inference_form
+from videos.services import inference
 
 _STATUS_COLORS = {
     "ok": "#22c55e",
@@ -55,6 +63,23 @@ _OVERLAP_MAX_CARDS = 1500
 #: similar frames apart at a glance, small enough that a few hundred cards
 #: aren't a multi-gigabyte page load.
 _OVERLAP_THUMB_WIDTH = 220
+
+#: How many images a dataset inference run measures by default. Enough for a
+#: stable median (and a p90 that means something) without tying up the GPU for
+#: an afternoon on a 79k-image dataset; 0 in the form means all of them.
+_DEFAULT_IMAGE_LIMIT = 200
+
+#: Untimed calls before the timed loop. Three is enough to get past a model load
+#: and a TensorRT plan deserialization, both of which are one-off and neither of
+#: which is a frame time.
+_DEFAULT_WARMUP = 3
+
+#: Width the dataset inference report asks for its thumbnails at, and how many
+#: rows one page of it renders. A run may hold thousands of images; the report is
+#: for reading the timing distribution and spot-checking detections, not for
+#: flipping through the whole dataset.
+_RUN_THUMB_WIDTH = 260
+_RUN_ROW_LIMIT = 300
 
 
 def _queue():
@@ -83,6 +108,86 @@ def _status_badge(value: str):
     return format_html(
         '<b style="color:{};">●</b> {}', color, value
     )
+
+
+def _stage_rows(timings: dict) -> list[dict]:
+    """The per-stage table for a run's report, biggest share first.
+
+    Read as *shares* of the frame, not as absolutes: attributing stages needs a
+    sync at every boundary, which inflates the total it measures — the same
+    caveat the bundle benchmark's stage pass carries, and the reason the report
+    prints the share beside the millisecond mean rather than only the latter.
+    """
+    shares = (timings or {}).get("stage_share") or {}
+    means = (timings or {}).get("stage_ms_mean") or {}
+    rows = [
+        {
+            # "preprocess_ms" -> "preprocess": the trainer names its stages with
+            # the unit attached (they arrive as timing keys), which reads as
+            # noise once the column header says milliseconds.
+            "name": stage[:-3] if stage.endswith("_ms") else stage,
+            "share": share,
+            "percent": round(100 * share, 1),
+            "mean_ms": means.get(stage),
+        }
+        for stage, share in shares.items()
+    ]
+    return sorted(rows, key=lambda r: r["share"], reverse=True)
+
+
+def _run_geometry_rows(run) -> list[tuple[str, object]]:
+    """``(label, value)`` for the pipeline knobs this run actually used.
+
+    Only the knobs the run's pipeline uses are listed — a raw run has no tile
+    size and printing a blank one invites the reader to wonder what it was. Blank
+    means "chachak's default", which is what the value column says.
+    """
+    from training import pipelines
+
+    uses_detector = pipelines.needs_detector(run.pipeline, run.chain) or \
+        run.pipeline == pipelines.CHAIN
+    uses_tiling = run.pipeline in (
+        pipelines.BATCH_DETECT, pipelines.BATCH_PEOPLE, pipelines.CHAIN)
+
+    rows: list[tuple[str, object]] = [("pipeline", run.pipeline)]
+    if run.pipeline == pipelines.CHAIN:
+        rows.append(("chain", ", ".join(run.chain or [])))
+    if uses_detector:
+        rows += [
+            ("detector checkpoint", run.detector_checkpoint),
+            ("person-box expand ratio", run.detector_expand_ratio),
+            ("person-crop minimum size (px)", run.detector_min_box_size),
+        ]
+    if uses_tiling:
+        rows += [
+            ("tile size (px)", run.tile_size_px),
+            ("tile width %", run.tile_width_pct),
+            ("tile height %", run.tile_height_pct),
+            ("tile overlap", run.overlap),
+        ]
+    if run.pipeline != run.RAW:
+        rows.append(("merge NMS IoU", run.merge_nms_iou))
+    rows += [
+        ("score threshold", run.score_threshold),
+        ("images", f"{run.image_limit or 'all'}"),
+        ("warmup calls", run.warmup),
+    ]
+    return [(label, "chachak default" if value is None or value == "" else value)
+            for label, value in rows]
+
+
+def _dataset_run_form_values(defaults: dict, posted) -> dict:
+    """The values to render the dataset-run form with: the shared pipeline half
+    (prefilled from the model's own metadata) plus this form's own two knobs.
+
+    ``image_limit``/``warmup`` are properties of the *measurement*, not of the
+    model, so they never come from a model's pipeline metadata — same split as
+    the video form's ``frame_stride``.
+    """
+    return inference_form.form_values(defaults, posted, extra={
+        "image_limit": _DEFAULT_IMAGE_LIMIT,
+        "warmup": _DEFAULT_WARMUP,
+    })
 
 
 @admin.register(FleetSettings)
@@ -202,6 +307,45 @@ class DatasetAdminForm(forms.ModelForm):
             return []
 
 
+def _tag_row(tag) -> dict:
+    """One saved tag in the shape the editor template renders a row from —
+    the same shape ``annotation_tags.posted_rows`` produces, so a form that
+    failed validation redraws exactly what was typed instead of the stale
+    database state."""
+    return {
+        "scope": tag.scope,
+        "name": tag.name,
+        "widget": tag.widget,
+        "choices": tag.cleaned_choices(),
+        "max_rating": tag.max_rating,
+        "required": tag.required,
+    }
+
+
+def _tag_editor_context(dataset, rows=None) -> dict:
+    """Everything ``_annotation_tag_sections.html`` needs to draw the editor.
+
+    ``rows`` is the posted set when a save failed validation (so the page
+    redraws what was typed rather than the stale database state) and None
+    otherwise. Row indices are re-densified here: they only have to be unique
+    within one page, and the two rendered tables post as one flat list.
+    """
+    indexed = rows if rows is not None else [_tag_row(tag) for tag in dataset.tags.all()]
+    for index, row in enumerate(indexed):
+        row["index"] = index
+    return {
+        "frame_rows": [r for r in indexed if r["scope"] != AnnotationTag.REGION],
+        "region_rows": [r for r in indexed if r["scope"] == AnnotationTag.REGION],
+        "next_index": len(indexed),
+        "scope_frame": AnnotationTag.FRAME,
+        "scope_region": AnnotationTag.REGION,
+        "widget_choices": AnnotationTag.WIDGET_CHOICES,
+        "choice_widgets": json.dumps(sorted(lsapi.CHOICE_WIDGETS)),
+        "rating_widget": AnnotationTag.RATING,
+        "project_count": dataset.projects.count(),
+    }
+
+
 def _preview_bounded_index(request, count):
     """Parse a 0-based ``?index=`` and bound it to ``[0, count)`` or 404."""
     if count <= 0:
@@ -253,6 +397,8 @@ class DatasetAdmin(admin.ModelAdmin):
     readonly_fields = ["has_labels"]
     search_fields = ["name"]
     actions = [
+        "run_model_inference",
+        "edit_annotation_tags",
         "setup_for_all_active",
         "sync_all_projects",
         "setup_sync_one_annotator",
@@ -282,19 +428,165 @@ class DatasetAdmin(admin.ModelAdmin):
         super().save_model(request, obj, form, change)
         datasets_svc.detect_labels(obj)
 
+    def _save_posted_tags(self, request, dataset):
+        """Save the tag editor's rows onto a dataset.
+
+        Returns ``(ok, rows)``: on success ``rows`` is None so the caller
+        redraws from the database, on failure it is the posted set so the
+        operator's typing survives the error. Every message is already on the
+        request by the time this returns.
+        """
+        rows = annotation_tags_svc.posted_rows(request.POST)
+        try:
+            annotation_tags_svc.save_tags(dataset, rows)
+        except DjangoValidationError as exc:
+            for message in exc.messages:
+                self.message_user(request, message, level=messages.ERROR)
+            return False, rows
+
+        count = len(rows)
+        self.message_user(
+            request,
+            f"Saved {count} annotation tag{'' if count == 1 else 's'} on "
+            f"{dataset.name!r}. New projects get them automatically.",
+        )
+        return True, None
+
+    def _push_tags_to_projects(self, request, dataset):
+        """Queue the rewrite of every existing project's labeling interface.
+
+        Setting a dataset up again cannot do this itself: project creation is
+        idempotent on the title, so an existing project is skipped rather than
+        rebuilt, and an edited tag would only reach annotators set up from here
+        on.
+        """
+        projects = dataset.projects.count()
+        if not projects:
+            self.message_user(
+                request,
+                f"{dataset.name!r} has no Label Studio projects yet — nothing to push to.",
+                level=messages.WARNING,
+            )
+            return
+        _queue().enqueue(jobs.apply_dataset_tags, dataset.id)
+        for project in dataset.projects.all():
+            project.last_status = "queued"
+            project.last_run_at = timezone.now()
+            project.save(update_fields=["last_status", "last_run_at"])
+        self.message_user(
+            request,
+            f"Pushing the new interface onto {projects} existing project(s) — "
+            "watch the Projects page for the outcome.",
+        )
+
+    @admin.action(description="Edit annotation tags (frame-wide / box-wide)…")
+    def edit_annotation_tags(self, request, queryset):
+        """Edit a dataset's tags on their own, without setting anything up.
+
+        The same editor is embedded in both setup actions, which is where tags
+        are normally written; this is the way back to them afterwards — to add
+        one mid-project and push it onto the projects annotators are already
+        working in.
+        """
+        datasets = list(queryset)
+        if len(datasets) != 1:
+            self.message_user(
+                request, "Select exactly one dataset to edit its tags.", level=messages.WARNING
+            )
+            return None
+        dataset = datasets[0]
+
+        rows = None
+        if request.POST.get("apply"):
+            ok, rows = self._save_posted_tags(request, dataset)
+            if ok and request.POST.get("push_existing"):
+                self._push_tags_to_projects(request, dataset)
+
+        # Preview the interface a project would get. A dataset whose classes.txt
+        # is missing can still have its tags edited — only the preview is lost.
+        try:
+            preview = datasets_svc.dataset_label_config(dataset)
+            preview_error = ""
+        except (RuntimeError, FileNotFoundError, OSError) as exc:
+            preview, preview_error = "", str(exc)
+
+        context = {
+            **self.admin_site.each_context(request),
+            **_tag_editor_context(dataset, rows),
+            "title": f"Annotation tags — {dataset.name}",
+            "dataset": dataset,
+            "preview": preview,
+            "preview_error": preview_error,
+            "action": "edit_annotation_tags",
+            "selected": [str(dataset.pk)],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+        }
+        return TemplateResponse(request, "admin/fleet/annotation_tags.html", context)
+
     @admin.action(description="Set up selected dataset(s) for all active annotators")
     def setup_for_all_active(self, request, queryset):
-        queue = _queue()
-        active = list(Annotator.objects.filter(status=Annotator.ACTIVE))
+        """Create every active annotator's project for the selected dataset(s).
+
+        Confirms first rather than firing straight off, because this is the
+        moment the labeling interface is decided: a project bakes in the
+        dataset's annotation tags when it is created, and creation is
+        idempotent on the project title, so a tag added later needs an explicit
+        push to reach it. The confirmation page is therefore the tag editor —
+        the questions annotators will answer, settled before the projects that
+        ask them exist.
+
+        The editor needs one dataset to edit; select several and the page lists
+        what each already carries and sets them up unchanged.
+        """
+        datasets = list(queryset)
+        active = list(Annotator.objects.filter(status=Annotator.ACTIVE).order_by("username"))
         if not active:
-            self.message_user(request, "No active annotators to set up.", level="warning")
-            return
-        count = 0
-        for dataset in queryset:
-            for annotator in active:
-                queue.enqueue(jobs.setup_project, dataset.id, annotator.id)
-                count += 1
-        self.message_user(request, f"{count} setup job(s) queued (datasets × active annotators).")
+            self.message_user(request, "No active annotators to set up.", level=messages.WARNING)
+            return None
+
+        # Tags belong to one dataset; with several selected there is no single
+        # set to edit, so the page falls back to showing each one's.
+        single = datasets[0] if len(datasets) == 1 else None
+
+        rows = None
+        if request.POST.get("apply"):
+            saved = True
+            if single is not None:
+                saved, rows = self._save_posted_tags(request, single)
+                if saved and request.POST.get("push_existing"):
+                    self._push_tags_to_projects(request, single)
+            if saved:
+                queue = _queue()
+                count = 0
+                for dataset in datasets:
+                    for annotator in active:
+                        queue.enqueue(jobs.setup_project, dataset.id, annotator.id)
+                        count += 1
+                self.message_user(
+                    request, f"{count} setup job(s) queued (datasets × active annotators)."
+                )
+                return None
+            # Invalid tags: nothing was queued and nothing was saved. Fall
+            # through and redraw so the operator can fix the row — setting the
+            # projects up now would bake in the interface they were editing.
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Set up for all active annotators",
+            "datasets": datasets,
+            "dataset": single,
+            "annotators": active,
+            "tag_summaries": None if single else [
+                {"dataset": d, "tags": list(d.tags.all())} for d in datasets
+            ],
+            "action": "setup_for_all_active",
+            "selected": [str(d.pk) for d in datasets],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+            "submit_label": "Set up projects",
+        }
+        if single is not None:
+            context.update(_tag_editor_context(single, rows))
+        return TemplateResponse(request, "admin/fleet/setup_datasets.html", context)
 
     @admin.action(description="Sync all projects of selected dataset(s)")
     def sync_all_projects(self, request, queryset):
@@ -309,21 +601,37 @@ class DatasetAdmin(admin.ModelAdmin):
 
     @admin.action(description="Set up + sync selected dataset(s) for one annotator…")
     def setup_sync_one_annotator(self, request, queryset):
+        """Set up, then sync, for a single chosen annotator.
+
+        Carries the same tag editor as the all-annotators action, for the same
+        reason: this is a project-creation path, and a project's labeling
+        interface is fixed the moment it is created.
+        """
         datasets = list(queryset)
+        single = datasets[0] if len(datasets) == 1 else None
+
+        rows = None
         if request.POST.get("apply"):
             annotator = Annotator.objects.filter(pk=request.POST.get("annotator")).first()
             if annotator is None:
                 self.message_user(request, "Choose an annotator.", level=messages.WARNING)
                 return None
-            queue = _queue()
-            for dataset in datasets:
-                queue.enqueue(jobs.setup_and_sync_project, dataset.id, annotator.id)
-            self.message_user(
-                request,
-                f"{len(datasets)} setup+sync job(s) queued for {annotator.username} — "
-                "refresh the Projects page to see progress.",
-            )
-            return None
+            saved = True
+            if single is not None:
+                saved, rows = self._save_posted_tags(request, single)
+                if saved and request.POST.get("push_existing"):
+                    self._push_tags_to_projects(request, single)
+            if saved:
+                queue = _queue()
+                for dataset in datasets:
+                    queue.enqueue(jobs.setup_and_sync_project, dataset.id, annotator.id)
+                self.message_user(
+                    request,
+                    f"{len(datasets)} setup+sync job(s) queued for {annotator.username} — "
+                    "refresh the Projects page to see progress.",
+                )
+                return None
+            # Invalid tags — redraw rather than set up against a half-edited set.
 
         active = list(Annotator.objects.filter(status=Annotator.ACTIVE).order_by("username"))
         if not active:
@@ -333,11 +641,18 @@ class DatasetAdmin(admin.ModelAdmin):
             **self.admin_site.each_context(request),
             "title": "Set up + sync for one annotator",
             "datasets": datasets,
+            "dataset": single,
             "annotators": active,
+            "chosen_annotator": request.POST.get("annotator") or "",
+            "tag_summaries": None if single else [
+                {"dataset": d, "tags": list(d.tags.all())} for d in datasets
+            ],
             "action": "setup_sync_one_annotator",
             "selected": [str(d.pk) for d in datasets],
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
         }
+        if single is not None:
+            context.update(_tag_editor_context(single, rows))
         return TemplateResponse(request, "admin/fleet/pick_annotator.html", context)
 
     @admin.action(description="Promote an annotator's annotations to source labels…")
@@ -363,10 +678,12 @@ class DatasetAdmin(admin.ModelAdmin):
                 except (FileNotFoundError, OSError) as exc:
                     self.message_user(request, f"{dataset.name}: {exc}", level=messages.ERROR)
                     continue
+                tags_note = (" Tag answers (annotation_tags.json) came across too."
+                             if result["tags_promoted"] else "")
                 self.message_user(
                     request,
                     f"{dataset.name}: promoted {result['moved']} label file(s) from "
-                    f"{annotator.username} to {result['dest']}.",
+                    f"{annotator.username} to {result['dest']}.{tags_note}",
                 )
             return None
 
@@ -449,6 +766,156 @@ class DatasetAdmin(admin.ModelAdmin):
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
         }
         return TemplateResponse(request, "admin/fleet/generate_grounding_sam.html", context)
+
+    @admin.action(description="Run model inference…")
+    def run_model_inference(self, request, queryset):
+        """Run one model over this dataset's images and measure how fast it is.
+
+        The same two-step wizard as the video action ("Run model inference…" on
+        Videos), over a folder instead of a clip: step 1 picks where the model
+        comes from — trained catalogue, exported ``.onnx``/``.engine``, or an
+        infer bundle — and step 2 configures that model plus the pipeline the
+        images go through, arriving prefilled from the model's own recorded
+        pipeline (see ``training.services.pipeline_meta``).
+
+        It exists because the trained-models tab's preview viewer only runs a
+        catalogued ``.pt``, while what gets deployed is an exported artifact or a
+        bundle — and "how many frames a second does *that* do, on real frames,
+        through the pipeline it will be served with" is the question this
+        answers. The measured numbers live on the run (Fleet > Dataset inference
+        runs), which is where this redirects.
+
+        Both halves of the form — the model list and the pipeline knobs — are
+        built and parsed by ``training.services.inference_form``, the same code
+        the video action uses, so the two forms cannot drift apart.
+        """
+        if queryset.count() != 1:
+            self.message_user(request, "Select exactly one dataset to run a model on.",
+                              level=messages.WARNING)
+            return None
+        dataset = queryset.first()
+        directory = dataset_inference.dataset_dir(dataset.name)
+
+        base_context = {
+            **self.admin_site.each_context(request),
+            "dataset": dataset,
+            "action": "run_model_inference",
+            "selected": [str(dataset.pk)],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+        }
+
+        # ------------------------------------------------- step 1: model source
+        model_source = request.POST.get("model_source") or ""
+        if model_source not in dict(DatasetInferenceRun.MODEL_SOURCE_CHOICES):
+            if request.POST.get("configure") or request.POST.get("apply"):
+                self.message_user(request, "Choose which kind of model to run.",
+                                  level=messages.WARNING)
+            return TemplateResponse(
+                request, "admin/fleet/dataset_inference_source.html", {
+                    **base_context,
+                    "title": f"Run model inference — {dataset.name}",
+                    **inference_form.source_step_context(),
+                })
+
+        # ------------------------------------------------------- step 2: submit
+        if request.POST.get("apply"):
+            run, error = self._build_dataset_inference_run(request, dataset, model_source)
+            if error:
+                self.message_user(request, error, level=messages.WARNING)
+            else:
+                run.save()
+                _queue().enqueue(jobs.run_dataset_inference, run.id,
+                                 job_timeout=jobs.DATASET_INFERENCE_JOB_TIMEOUT)
+                return redirect(
+                    reverse("admin:fleet_datasetinferencerun_report") + f"?run={run.pk}"
+                )
+
+        # ------------------------------------------ step 2: render the full form
+        image_count = len(dataset_inference.select_images(directory, 0)) \
+            if directory.is_dir() else 0
+        model_ctx = inference_form.model_context(model_source, request.POST)
+        context = {
+            **base_context,
+            "title": f"Run model inference — {dataset.name}",
+            **model_ctx,
+            **inference_form.pipeline_context(),
+            "values": _dataset_run_form_values(model_ctx["defaults"], request.POST),
+            "image_count": image_count,
+            "images_dir": str(lsapi.image_source_dir(directory))
+                          if directory.is_dir() else str(directory),
+            "visible_to_trainer": dataset_inference.visible_to_trainer(directory),
+            "shared_data_root": str(dataset_inference.shared_data_root()),
+        }
+        return TemplateResponse(request, "admin/fleet/dataset_inference.html", context)
+
+    def _build_dataset_inference_run(self, request, dataset, model_source):
+        """Validate the step-2 POST into an unsaved :class:`DatasetInferenceRun`.
+
+        Returns ``(run, None)`` or ``(None, message)`` on the first problem found,
+        so the caller can re-render the form with a warning. The checks a dataset
+        run adds over a video's are about the images being *reachable*: a run is
+        pointless if the directory is empty, and impossible if the trainer cannot
+        see it (images are handed over as paths, never copied).
+        """
+        model_fields, error = inference_form.parse_model_source(request.POST, model_source)
+        if error:
+            return None, error
+        knobs, error = inference_form.parse_pipeline_fields(request.POST)
+        if error:
+            return None, error
+
+        # 0 means "every image", so this one is not the positive-int parser.
+        image_limit = inference_form.parse_optional_int(
+            request.POST.get("image_limit"), 0, 1000000)
+        if image_limit is inference_form._INVALID:
+            return None, "Image limit must be 0 (all images) or more."
+        warmup = inference_form.parse_optional_int(request.POST.get("warmup"), 0, 1000)
+        if warmup is inference_form._INVALID:
+            return None, "Warmup calls must be 0 or more."
+
+        directory = dataset_inference.dataset_dir(dataset.name)
+        if not directory.is_dir():
+            return None, f"{dataset.name}: no dataset directory at {directory}."
+        if not dataset_inference.visible_to_trainer(directory):
+            return None, (
+                f"{directory} is outside {dataset_inference.shared_data_root()}, which "
+                f"is the only tree the trainer can open — images are handed to it as "
+                f"paths, not copied. Move the dataset under the data root (or point "
+                f"source_dir there) to run a model on it."
+            )
+        if not dataset_inference.select_images(directory, 0):
+            return None, f"{dataset.name}: no images found under {directory}."
+
+        run = DatasetInferenceRun(
+            dataset=dataset,
+            dataset_name_snapshot=dataset.name,
+            model_source=model_source,
+            image_limit=0 if image_limit is None else image_limit,
+            warmup=3 if warmup is None else warmup,
+            **model_fields,
+            **knobs,
+        )
+
+        # A bundle's geometry is the bundle's, not the form's — the server-side
+        # half of the locked fields on the form, re-read from the manifest so a
+        # stale page still runs what the bundle says today.
+        try:
+            run.sync_bundle()
+        except ValueError as exc:
+            return None, str(exc)
+
+        # Pre-flight the exact payload the run will send, so a missing artifact,
+        # an out-of-root path or a detector-less person pipeline is reported here
+        # rather than as a failed job.
+        try:
+            inference.build_predict_payload(run)
+        except RuntimeError as exc:
+            return None, str(exc)
+
+        # Snapshotted after sync_bundle, so a bundle run records the bundle it
+        # actually resolved.
+        run.model_label_snapshot = run.model_label()
+        return run, None
 
     @admin.action(description="Merge selected datasets into a new dataset…")
     def merge_selected(self, request, queryset):
@@ -1134,3 +1601,231 @@ class GroundingSamRunAdmin(admin.ModelAdmin):
     @admin.display(description="progress")
     def progress(self, obj):
         return f"{obj.images_processed}/{obj.images_total}"
+
+
+@admin.register(DatasetInferenceRun)
+class DatasetInferenceRunAdmin(admin.ModelAdmin):
+    """The Dataset inference runs tab: every "Run model inference…", each opening
+    a timing report.
+
+    A tab rather than something hanging off the dataset's page, for the reason
+    the VLM dataset runs are one: the point of making a run is usually to compare
+    it with another (this engine against that ONNX, fp16 against fp32, this tile
+    size against that one), and comparing wants a list. The changelist therefore
+    carries the two headline numbers — fps and median latency — so a comparison
+    often needs no report opened at all.
+
+    Rows are not editable: every field is either a snapshot of what ran or a
+    measurement of what happened.
+    """
+
+    list_display = ["dataset_name_snapshot", "model_label_column", "pipeline",
+                    "status_badge", "progress", "fps_column", "p50_column",
+                    "detections_total", "errors_count", "created_at", "report_link"]
+    list_display_links = None
+    list_filter = ["status", "model_source", "pipeline", "trained_model"]
+    search_fields = ["dataset_name_snapshot", "model_label_snapshot",
+                     "artifact_path", "bundle_path"]
+    date_hierarchy = "created_at"
+
+    def has_add_permission(self, request):
+        """Runs come from the Datasets tab's action, never from an add form."""
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related("dataset", "trained_model")
+
+    # --------------------------------------------------------------- displays
+    @admin.display(description="model")
+    def model_label_column(self, obj):
+        return obj.model_label()
+
+    @admin.display(description="status", ordering="status")
+    def status_badge(self, obj):
+        return _status_badge(obj.status)
+
+    @admin.display(description="images")
+    def progress(self, obj):
+        if obj.images_total:
+            return f"{obj.images_processed}/{obj.images_total}"
+        return str(obj.images_processed)
+
+    @admin.display(description="fps", ordering="fps")
+    def fps_column(self, obj):
+        """Model fps, marked when it is really the round trip.
+
+        A run measured against a trainer that reports no per-call timing has only
+        the HTTP round trip to divide into a second, and that is a slower number
+        for a reason that has nothing to do with the model — so it is labelled
+        rather than shown as if it were the same measurement.
+        """
+        if obj.fps is None:
+            return "—"
+        if (obj.timings or {}).get("timing_source") == "request":
+            return format_html("<b>{}</b> <span style='color:#666'>(round trip)</span>",
+                               f"{obj.fps:.1f}")
+        return format_html("<b>{}</b>", f"{obj.fps:.1f}")
+
+    @admin.display(description="p50 ms", ordering="p50_ms")
+    def p50_column(self, obj):
+        return f"{obj.p50_ms:.1f}" if obj.p50_ms is not None else "—"
+
+    @admin.display(description="")
+    def report_link(self, obj):
+        url = reverse("admin:fleet_datasetinferencerun_report") + f"?run={obj.pk}"
+        return format_html('<a class="button" href="{}">open report</a>', url)
+
+    # ------------------------------------------------------------------- urls
+    def get_urls(self):
+        custom = [
+            path("report/", self.admin_site.admin_view(self.report_view),
+                 name="fleet_datasetinferencerun_report"),
+            path("report-progress/", self.admin_site.admin_view(self.progress_view),
+                 name="fleet_datasetinferencerun_progress"),
+            path("report-cancel/", self.admin_site.admin_view(self.cancel_view),
+                 name="fleet_datasetinferencerun_cancel"),
+            path("report-image/", self.admin_site.admin_view(self.image_view),
+                 name="fleet_datasetinferencerun_image"),
+        ]
+        return custom + super().get_urls()
+
+    def _get_run(self, request) -> DatasetInferenceRun:
+        run = DatasetInferenceRun.objects.select_related("dataset", "trained_model").filter(
+            pk=request.GET.get("run") or request.POST.get("run")).first()
+        if run is None:
+            raise Http404("unknown dataset inference run")
+        return run
+
+    def report_view(self, request):
+        """The run's report: what ran, what it measured, and the images.
+
+        A finished run renders entirely server-side; a live one renders what
+        exists so far and lets the JS extend it from the last ``seq``. The poll
+        is not a heartbeat — the run keeps going whether or not anyone is
+        looking, and Stop is the only thing that ends it early.
+        """
+        run = self._get_run(request)
+        only_detections = request.GET.get("only") == "detections"
+
+        results = run.results.all()
+        if only_detections:
+            results = results.filter(detections__gt=0)
+        rows = list(results[:_RUN_ROW_LIMIT])
+
+        timings = run.timings or {}
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"{run.model_label()} on {run.dataset_name_snapshot}",
+            "run": run,
+            "rows": rows,
+            "shown": len(rows),
+            "total_rows": results.count(),
+            "row_limit": _RUN_ROW_LIMIT,
+            "thumb_width": _RUN_THUMB_WIDTH,
+            "only_detections": only_detections,
+            # A filtered slice must not be appended to by the live poll: an
+            # image that detected nothing does not belong in it.
+            "live_append": not only_detections,
+            "last_seq": rows[-1].seq if rows and not only_detections else 0,
+            "is_terminal": run.is_terminal(),
+            "timings": timings,
+            "stage_rows": _stage_rows(timings),
+            "geometry": _run_geometry_rows(run),
+            "progress_url": reverse("admin:fleet_datasetinferencerun_progress") + f"?run={run.pk}",
+            "cancel_url": reverse("admin:fleet_datasetinferencerun_cancel") + f"?run={run.pk}",
+            "image_url": reverse("admin:fleet_datasetinferencerun_image"),
+            "report_url": reverse("admin:fleet_datasetinferencerun_report") + f"?run={run.pk}",
+            "back_url": reverse("admin:fleet_datasetinferencerun_changelist"),
+        }
+        return TemplateResponse(request, "admin/fleet/dataset_inference_report.html",
+                                context)
+
+    def progress_view(self, request):
+        """Counters, the headline timings, and the results since ``after``."""
+        run = self._get_run(request)
+        try:
+            after = int(request.GET.get("after", 0))
+        except (TypeError, ValueError):
+            after = 0
+
+        rows = run.results.filter(seq__gt=after).order_by("seq")[:_RUN_ROW_LIMIT]
+        timings = run.timings or {}
+        return JsonResponse({
+            "run": {
+                "status": run.status,
+                "images_processed": run.images_processed,
+                "images_total": run.images_total,
+                "errors_count": run.errors_count,
+                "detections_total": run.detections_total,
+                "last_error": run.last_error,
+                "terminal": run.is_terminal(),
+                "fps": run.fps,
+                "p50_ms": run.p50_ms,
+                "timing_source": timings.get("timing_source"),
+            },
+            "results": [
+                {
+                    "pk": row.pk,
+                    "seq": row.seq,
+                    "image": row.image_filename,
+                    "detections": row.detections,
+                    "model_ms": row.model_ms,
+                    "request_ms": row.request_ms,
+                    "error": row.error,
+                }
+                for row in rows
+            ],
+        })
+
+    def cancel_view(self, request):
+        """Ask a running job to stop after its current image.
+
+        POST-only so the CSRF middleware protects it. A cancelled run keeps the
+        images it already measured — they are paid for, and their numbers are
+        still true of the model.
+        """
+        if request.method != "POST":
+            raise Http404("POST only")
+        run = self._get_run(request)
+        if not run.is_terminal():
+            run.status = DatasetInferenceRun.CANCEL_REQUESTED
+            run.save(update_fields=["status"])
+            self.message_user(request, "Stopping after the current image.")
+        return redirect(reverse("admin:fleet_datasetinferencerun_report") + f"?run={run.pk}")
+
+    def image_view(self, request):
+        """One result's image: a thumbnail by default, its boxes drawn with ``?boxes=1``.
+
+        Resolved by result row rather than by an index into the dataset, so a page
+        of thumbnails costs one stat each instead of a directory listing each, and
+        the containment check in
+        :func:`fleet.services.dataset_inference.result_image_path` keeps a stored
+        filename from addressing anything outside its own dataset.
+
+        The thumbnails ask for the plain file (re-encoded small) and the
+        click-through asks for the annotated full-size copy, so a page of them
+        does not pay to decode and redraw every image — the same split the VLM
+        dataset report uses.
+        """
+        result = DatasetInferenceResult.objects.select_related("run").filter(
+            pk=request.GET.get("result")).first()
+        if result is None:
+            raise Http404("unknown result")
+
+        try:
+            path = dataset_inference.result_image_path(result)
+        except ValueError:
+            raise Http404("image outside its dataset")
+        except FileNotFoundError:
+            raise Http404("image not found on disk")
+
+        if not request.GET.get("boxes"):
+            return _thumbnail_response(path, _RUN_THUMB_WIDTH)
+        try:
+            return HttpResponse(dataset_inference.render_result(result),
+                                content_type="image/jpeg")
+        except RuntimeError as exc:
+            raise Http404(str(exc))

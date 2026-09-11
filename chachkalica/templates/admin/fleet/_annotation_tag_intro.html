@@ -1,0 +1,39 @@
+{# The tag editor as it appears on a project-setup page: the same sections and
+   push opt-in, plus the framing that only makes sense there — that this is the
+   last easy moment to decide the interface, and that tags are per dataset so a
+   multi-dataset selection can only be shown, not edited. #}
+{% if dataset %}
+  <h2 style="margin-top: 20px;">Annotation tags</h2>
+  <p class="help">
+    The extra questions annotators answer on <strong>{{ dataset.name }}</strong>, beyond
+    drawing boxes and polygons. They are compiled into the labeling interface of every
+    project created below — and a project's interface is fixed when it is created, so
+    this is the moment to settle them. Leave both sections empty for boxes only.
+  </p>
+
+  {% include "admin/fleet/_annotation_tag_sections.html" %}
+  {% include "admin/fleet/_annotation_tag_push.html" %}
+{% else %}
+  <h2 style="margin-top: 20px;">Annotation tags</h2>
+  <p class="help">
+    Tags belong to one dataset, so with several selected they can only be shown here.
+    Each dataset is set up with the tags it already carries; to edit them, run this
+    action (or <em>Edit annotation tags…</em>) on one dataset at a time.
+  </p>
+  <table>
+    <thead><tr><th>Dataset</th><th>Frame-wide</th><th>Box-wide</th></tr></thead>
+    <tbody>
+      {% for summary in tag_summaries %}
+        <tr>
+          <td>{{ summary.dataset.name }}</td>
+          <td>
+            {% for tag in summary.tags %}{% if tag.scope != "region" %}<code>{{ tag.name }}</code> {% endif %}{% empty %}—{% endfor %}
+          </td>
+          <td>
+            {% for tag in summary.tags %}{% if tag.scope == "region" %}<code>{{ tag.name }}</code> {% endif %}{% empty %}—{% endfor %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}

@@ -1,0 +1,131 @@
+{# The tag editor's two sections, its row template and its JS — everything
+   between the surrounding <form> tags, so the standalone editor and the two
+   project-setup pages all offer the same controls and post the same fields.
+   The including page owns the form, the submit row, and the intro copy. #}
+<fieldset class="module aligned" style="padding-bottom: 8px;">
+  <h2>Frame-wide tags</h2>
+  <p class="help" style="padding-left: 0;">
+    Asked once for the whole image — weather, shift, scene type. They render under
+    the image with their name as a heading.
+  </p>
+  <table class="tag-table" data-scope="{{ scope_frame }}">
+    <thead>
+      <tr>
+        <th style="width: 22%;">Tag name</th>
+        <th style="width: 22%;">Widget</th>
+        <th>Options</th>
+        <th style="width: 8%;">Required</th>
+        <th style="width: 5%;"></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in frame_rows %}{% include "admin/fleet/_annotation_tag_row.html" %}{% endfor %}
+    </tbody>
+  </table>
+  <p><button type="button" class="button tag-add" data-scope="{{ scope_frame }}">+ Add frame tag</button></p>
+</fieldset>
+
+<fieldset class="module aligned" style="padding-bottom: 8px;">
+  <h2>Box-wide tags</h2>
+  <p class="help" style="padding-left: 0;">
+    Asked again for every region drawn — occlusion, blur, distance. Label Studio
+    moves these out of the canvas into the panel for the selected region, and labels
+    each one with the <em>tag name</em>, so name them for the annotator to read.
+  </p>
+  <table class="tag-table" data-scope="{{ scope_region }}">
+    <thead>
+      <tr>
+        <th style="width: 22%;">Tag name</th>
+        <th style="width: 22%;">Widget</th>
+        <th>Options</th>
+        <th style="width: 8%;">Required</th>
+        <th style="width: 5%;"></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in region_rows %}{% include "admin/fleet/_annotation_tag_row.html" %}{% endfor %}
+    </tbody>
+  </table>
+  <p><button type="button" class="button tag-add" data-scope="{{ scope_region }}">+ Add box tag</button></p>
+</fieldset>
+
+<template id="tag-row-template">
+  <tr class="tag-row">
+    <td>
+      <input type="hidden" name="tag-__i__-scope" value="__scope__">
+      <input type="text" name="tag-__i__-name" size="18"
+             pattern="[A-Za-z][A-Za-z0-9_-]*"
+             title="Start with a letter; letters, digits, '_' and '-' only." required>
+    </td>
+    <td>
+      <select name="tag-__i__-widget" class="tag-widget">
+        {% for value, label in widget_choices %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+      </select>
+    </td>
+    <td>
+      <input type="text" name="tag-__i__-choices" class="tag-choices" style="width: 100%;"
+             placeholder="none, low, moderate, high">
+      <input type="number" name="tag-__i__-max_rating" class="tag-max-rating"
+             min="1" max="10" value="5" style="display: none;">
+    </td>
+    <td><input type="checkbox" name="tag-__i__-required" value="1"></td>
+    <td><button type="button" class="button tag-remove" title="Remove">&times;</button></td>
+  </tr>
+</template>
+
+<script>
+(function () {
+  var nextIndex = {{ next_index }};
+  var CHOICE_WIDGETS = {{ choice_widgets|safe }};
+  var RATING_WIDGET = "{{ rating_widget }}";
+  var template = document.getElementById("tag-row-template");
+  var form = document.getElementById("tag-editor");
+
+  // Each widget uses a different half of the Options cell: the Choices family
+  // needs an option list, a rating needs a star count, free text needs neither.
+  // The hidden half is also un-required, or the browser would block the submit
+  // on a field nobody can see to fill in.
+  function syncRow(row) {
+    var widget = row.querySelector(".tag-widget").value;
+    var choices = row.querySelector(".tag-choices");
+    var rating = row.querySelector(".tag-max-rating");
+    var isChoice = CHOICE_WIDGETS.indexOf(widget) !== -1;
+    choices.style.display = isChoice ? "" : "none";
+    choices.required = isChoice;
+    rating.style.display = widget === RATING_WIDGET ? "" : "none";
+  }
+
+  function addRow(scope, tbody) {
+    var html = template.innerHTML
+      .split("__i__").join(String(nextIndex++))
+      .split("__scope__").join(scope);
+    var host = document.createElement("tbody");
+    host.innerHTML = html;
+    var row = host.querySelector("tr");
+    tbody.appendChild(row);
+    syncRow(row);
+    row.querySelector("input[type=text]").focus();
+  }
+
+  document.querySelectorAll(".tag-add").forEach(function (button) {
+    button.addEventListener("click", function () {
+      var table = document.querySelector('.tag-table[data-scope="' + button.dataset.scope + '"]');
+      addRow(button.dataset.scope, table.querySelector("tbody"));
+    });
+  });
+
+  form.addEventListener("click", function (event) {
+    if (event.target.classList.contains("tag-remove")) {
+      event.target.closest("tr").remove();
+    }
+  });
+
+  form.addEventListener("change", function (event) {
+    if (event.target.classList.contains("tag-widget")) {
+      syncRow(event.target.closest("tr"));
+    }
+  });
+
+  document.querySelectorAll(".tag-row").forEach(syncRow);
+})();
+</script>
