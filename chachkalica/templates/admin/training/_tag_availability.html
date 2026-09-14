@@ -1,0 +1,54 @@
+{% comment %}
+The "what can this eval be sliced by" panel, shared verbatim by both evaluate
+forms. It is rendered server-side in one place — the model-side form fetches
+this same HTML over admin/datasets/tags/ rather than rebuilding it in JS — so
+the two surfaces cannot drift into describing the same thing differently.
+{% endcomment %}
+<div class="tag-availability">
+  {% if availability.labels_error %}
+    <p class="help errornote">{{ availability.labels_error }}</p>
+  {% else %}
+    <p class="help">
+      Tag answers are read from <code>{{ availability.labels_dir }}</code> — the labels this
+      eval will score against. Choosing a different <em>label source</em> or annotator above
+      means a different set of answers, so what this eval can be sliced by is decided here.
+    </p>
+  {% endif %}
+
+  {% if availability.declared %}
+    <table class="tag-availability-table">
+      <thead><tr><th>annotation tag</th><th>scope</th><th>status</th></tr></thead>
+      <tbody>
+        {% for tag in availability.declared %}
+          <tr>
+            <td><strong>{{ tag.name }}</strong>
+              {% if tag.choices %}<span class="help"> — {{ tag.choices|join:", " }}</span>{% endif %}
+            </td>
+            <td>{{ tag.scope }}</td>
+            <td class="state-{{ tag.state }}">{{ tag.detail }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="help">
+      This dataset declares no annotation tags. The computed ones below still apply — and
+      tags can be added at any time from <em>Datasets → Edit annotation tags</em>, then
+      synced, without re-running this eval.
+    </p>
+  {% endif %}
+
+  <p class="help">Computed from the eval itself &mdash; no annotation needed, on any dataset.</p>
+  <table class="tag-availability-table">
+    <thead><tr><th>computed tag</th><th>scope</th><th>what it measures</th></tr></thead>
+    <tbody>
+      {% for tag in availability.auto %}
+        <tr>
+          <td><strong>{{ tag.label }}</strong></td>
+          <td>{{ tag.scope }}</td>
+          <td>{{ tag.detail }}{% if tag.needs %} <span class="help">Needs {{ tag.needs }}</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>

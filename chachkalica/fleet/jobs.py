@@ -11,11 +11,12 @@ Admin actions and management commands enqueue these via ``django_rq``.
 from django.utils import timezone
 
 from fleet.models import (
-    Annotator, Dataset, DatasetInferenceRun, GroundingSamRun, Project,
+    Annotator, Dataset, DatasetInferenceRun, DatasetMeasureRun, GroundingSamRun, Project,
 )
 from fleet.services import dataset_inference as dataset_inference_svc
 from fleet.services import datasets as datasets_svc
 from fleet.services import grounding_sam as grounding_sam_svc
+from fleet.services import measures as measures_svc
 from fleet.services import merge as merge_svc
 from fleet.services import overlap as overlap_svc
 from fleet.services import provisioning, sync as sync_svc
@@ -162,6 +163,32 @@ def generate_grounding_sam_labels(run_id: int) -> dict:
         run.save(update_fields=["status", "error", "finished_at"])
         raise
     run.status = GroundingSamRun.OK
+    run.finished_at = timezone.now()
+    run.save(update_fields=["status", "finished_at"])
+    return result
+
+
+def measure_dataset_images(run_id: int) -> dict:
+    """Measure every image in a dataset and cache the result beside it.
+
+    Status transitions live here (queued -> running -> ok/error); the per-image
+    counters are written by the service as it walks, so a long pass can be
+    watched rather than only awaited. Nothing about this needs a model, a GPU or
+    the trainer — it is a decode and a histogram per frame.
+    """
+    run = DatasetMeasureRun.objects.get(pk=run_id)
+    run.status = DatasetMeasureRun.RUNNING
+    run.started_at = timezone.now()
+    run.save(update_fields=["status", "started_at"])
+    try:
+        result = measures_svc.measure_dataset(run.dataset, run=run)
+    except Exception as exc:
+        run.status = DatasetMeasureRun.ERROR
+        run.error = str(exc)
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "error", "finished_at"])
+        raise
+    run.status = DatasetMeasureRun.OK
     run.finished_at = timezone.now()
     run.save(update_fields=["status", "finished_at"])
     return result

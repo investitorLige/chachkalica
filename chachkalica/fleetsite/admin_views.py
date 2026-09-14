@@ -1,6 +1,6 @@
 """Standalone admin pages and endpoints that aren't tied to a single model.
 
-Two of them:
+Four of them:
 
 - the TRT/ONNX/PT benchmark console: a read-only dark "instrument console"
   rendering the results of ``inferlica/benchmark`` (run in the trainer
@@ -16,6 +16,10 @@ Two of them:
 - :func:`class_sync_view`, the same idea for the "Check classes" button on the
   dataset-eval form: it compares the selected model's class space against the
   dataset's and proposes a translation between them.
+- :func:`dataset_tags_view`, which renders the "what can this eval be sliced by"
+  panel for both evaluate forms. Same reason it is here: the model-side form
+  starts from a checkpoint and the dataset-side one from a dataset, and neither
+  owns the panel.
 """
 
 from __future__ import annotations
@@ -27,7 +31,8 @@ from django.conf import settings
 from django.contrib import admin
 from django.http import Http404, JsonResponse
 from django.template.response import TemplateResponse
-from django.views.decorators.http import require_POST
+from django.template.loader import render_to_string
+from django.views.decorators.http import require_GET, require_POST
 
 BENCH_DIR = Path(settings.BASE_DIR) / "data" / "benchmarks"
 
@@ -169,3 +174,39 @@ def class_sync_view(request):
         return JsonResponse(class_sync.report(model_source, request.POST, dataset_classes))
     except Exception as exc:  # noqa: BLE001 - surfaced in the checklist
         return JsonResponse({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+
+
+@require_GET
+def dataset_tags_view(request):
+    """Render the tag-availability panel for one dataset and label source.
+
+    ``?dataset=<pk>&label_source=&annotator=&explicit_labels_path=`` returns
+    ``{"html": ...}``. It hands back **rendered HTML, not data**, on purpose: the
+    dataset-side form includes the same partial directly, so returning JSON here
+    would mean one panel built by a Django template and an identical-looking one
+    built by a JS string-concatenator, free to drift apart. One renderer, two
+    callers.
+
+    GET because it only reads, which also keeps it out of CSRF's way on a form
+    that has not been submitted yet.
+    """
+    from fleet.models import Annotator, Dataset
+    from training.services import tag_availability
+
+    dataset = Dataset.objects.filter(pk=request.GET.get("dataset") or None).first()
+    if dataset is None:
+        return JsonResponse({"error": "Choose a dataset to see its tags."}, status=400)
+    annotator = Annotator.objects.filter(pk=request.GET.get("annotator") or None).first()
+
+    try:
+        availability = tag_availability.availability(
+            dataset,
+            request.GET.get("label_source") or "",
+            annotator,
+            request.GET.get("explicit_labels_path") or "",
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced in the panel, not a 500
+        return JsonResponse({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+
+    return JsonResponse({"html": render_to_string(
+        "admin/training/_tag_availability.html", {"availability": availability})})

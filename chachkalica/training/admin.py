@@ -1035,6 +1035,9 @@ class TrainedModelAdmin(admin.ModelAdmin):
             "action": "evaluate",
             "selected": [str(m.pk) for m in models],
             "action_checkbox_name": ACTION_CHECKBOX_NAME,
+            # The dataset is picked on this form, so the "Sliceable by" panel is
+            # filled in by JS once there is one to describe.
+            "tag_availability_url": reverse("dataset-tags"),
         }
         return TemplateResponse(request, "admin/training/evaluate_model.html", context)
 

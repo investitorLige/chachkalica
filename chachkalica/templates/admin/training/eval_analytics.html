@@ -48,6 +48,13 @@
   .ev-cmp .hard-links { list-style: none; margin: 0; padding: 0; }
   .ev-cmp .hard-links li { padding: 6px 0; border-bottom: 1px solid #e0e0e0; }
   .ev-cmp .hard-links .button { margin-left: 10px; }
+  .tagcmp-controls { margin: 10px 0; display: flex; gap: 14px; align-items: center;
+                     flex-wrap: wrap; }
+  .tagcmp-controls label { font-size: 12px; color: #555; }
+  #tagcmp td.absent { color: #bbb; font-style: italic; }
+  #tagcmp .pop { color: #888; font-size: 11px; }
+  #tagcmp .warn { border-left: 4px solid #b8860b; background: #fff8e1; color: #4a3a00;
+                  padding: 8px 12px; margin: 8px 0; font-size: 12px; }
 </style>
 {% endblock %}
 
@@ -79,10 +86,15 @@
   </tbody>
 </table>
 
-<h2>Worst images</h2>
-<p class="note">Each eval's worst-scoring images by difficulty (missed detections, false
-   positives, wrong class, and loose boxes) — the same ranking training's "hardest val
-   images" viewer uses, sized to the worst 10% of the eval's images rather than a fixed count.</p>
+<h2>Per-eval detail</h2>
+<p class="note">
+  <strong>Worst images</strong> ranks an eval's own frames by difficulty (missed detections,
+  false positives, wrong class, loose boxes) — the same ranking training's "hardest val
+  images" viewer uses, sized to the worst 10% rather than a fixed count.
+  <strong>Tag analytics</strong> re-scores the same eval over slices of its dataset —
+  by annotation tag, and by measures computed from the eval itself such as how crowded the
+  frame is or how big the box is. Neither re-runs the model.
+</p>
 <ul class="hard-links">
   {% for col in columns %}
     <li>
@@ -94,6 +106,8 @@
       {% endif %}
       {% if col.tag_analytics_url %}
         <a class="button" href="{{ col.tag_analytics_url }}">Tag analytics</a>
+      {% else %}
+        <span class="note">— {{ col.tag_analytics_note }}</span>
       {% endif %}
     </li>
   {% endfor %}
@@ -144,6 +158,22 @@
   {% endfor %}
   </div>
 {% endif %}
+
+<details id="tagcmp" data-url="{{ tag_compare_url }}" data-evals="{{ eval_tokens }}">
+  <summary><h2 style="display:inline-block">Per-tag comparison</h2></summary>
+  <p class="note">
+    The same evals, cut by one tag at a time &mdash; which model wins on night frames, on
+    small boxes, on crowded scenes. Nothing is re-run; each column is re-scored from the
+    match outcomes it already recorded. Loaded on demand, because every column has to parse
+    its own match table.
+  </p>
+  <div class="tagcmp-controls">
+    <label for="tagcmp-tag">tag</label> <select id="tagcmp-tag"></select>
+    <label for="tagcmp-metric">metric</label> <select id="tagcmp-metric"></select>
+    <button type="button" class="button" id="tagcmp-go">Compare</button>
+  </div>
+  <div id="tagcmp-out"></div>
+</details>
 
 {% if class_rows %}
   <h2>Per-class AP</h2>
@@ -255,6 +285,94 @@
 
     slider.addEventListener("input", update);
     update();
+  });
+})();
+
+// ---------------------------------------------------------------- per-tag
+// The tag comparison grid. Everything here is fetched, never precomputed: each
+// column has to parse its own match table, so a section most visits never open
+// must not be on the page-load path.
+(function () {
+  "use strict";
+  const root = document.getElementById("tagcmp");
+  if (!root) { return; }
+  const tagSelect = document.getElementById("tagcmp-tag");
+  const metricSelect = document.getElementById("tagcmp-metric");
+  const out = document.getElementById("tagcmp-out");
+  const base = root.dataset.url + "?evals=" + encodeURIComponent(root.dataset.evals);
+  let tags = [], frameMetrics = [], boxMetrics = [], loaded = false;
+
+  const fill = (select, options) => {
+    select.innerHTML = "";
+    options.forEach(([value, label]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      select.appendChild(option);
+    });
+  };
+  const number = value => value === null || value === undefined
+    ? "\u2014" : Number(value).toFixed(4);
+
+  function refreshMetrics() {
+    const tag = tags.find(t => t.name === tagSelect.value);
+    const wanted = tag && tag.kind === "box" ? boxMetrics : frameMetrics;
+    const previous = metricSelect.value;
+    fill(metricSelect, wanted);
+    if (wanted.some(([value]) => value === previous)) { metricSelect.value = previous; }
+  }
+
+  function render(data) {
+    if (data.error) { out.textContent = data.error; return; }
+    const warnings = (data.warnings || []).concat(data.notes || []);
+    const head = data.columns.map(column =>
+      `<th>${column.label}${column.absent ? " <span class=\"pop\">(no such tag)</span>" : ""}</th>`).join("");
+    const body = data.rows.map(row => {
+      const cells = row.cells.map(cell => cell.absent
+        ? '<td class="absent">n/a</td>'
+        : `<td${cell.is_best ? ' class="best"' : ""}>${number(cell.value)}`
+          + `<div class="pop">${cell.population} ${data.population_label}</div></td>`).join("");
+      return `<tr><td class="rowlabel">${row.value}</td>${cells}</tr>`;
+    }).join("");
+    out.innerHTML =
+      warnings.map(w => `<div class="warn">${w}</div>`).join("")
+      + `<table><thead><tr><th class="rowlabel">${data.label} &mdash; `
+      + `${data.metric_label}</th>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  }
+
+  function loadTags() {
+    if (loaded) { return; }
+    loaded = true;
+    out.textContent = "Loading\u2026";
+    fetch(base + "&mode=tags", {credentials: "same-origin"})
+      .then(r => r.json())
+      .then(data => {
+        out.textContent = "";
+        if (data.error) { out.textContent = data.error; return; }
+        tags = data.tags || [];
+        frameMetrics = data.frame_metrics || [];
+        boxMetrics = data.box_metrics || [];
+        if (!tags.length) {
+          out.textContent = "None of these evals can be sliced by a tag yet.";
+          return;
+        }
+        fill(tagSelect, tags.map(t => [t.name,
+          t.label + (t.kind === "box" ? "  (box-wide)" : "")
+                  + (t.source === "auto" ? "  \u00b7 computed" : "")]));
+        refreshMetrics();
+      })
+      .catch(error => { out.textContent = "Could not load the tag list: " + error; });
+  }
+
+  root.addEventListener("toggle", () => { if (root.open) { loadTags(); } });
+  tagSelect.addEventListener("change", refreshMetrics);
+  document.getElementById("tagcmp-go").addEventListener("click", () => {
+    if (!tagSelect.value) { return; }
+    out.textContent = "Scoring\u2026";
+    const query = new URLSearchParams({tag: tagSelect.value, metric: metricSelect.value});
+    fetch(base + "&" + query.toString(), {credentials: "same-origin"})
+      .then(r => r.json()).then(render)
+      .catch(error => { out.textContent = "Could not score the slices: " + error; });
   });
 })();
 </script>

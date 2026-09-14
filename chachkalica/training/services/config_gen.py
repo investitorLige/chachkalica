@@ -452,6 +452,92 @@ def write_eval_request(eval_run, ts: TrainingSettings | None = None) -> tuple[Pa
     return request_path, text
 
 
+#: The posture bundle the box-measure pass scores with, relative to the bundles
+#: root. Pinned rather than chosen per run: the postures it emits are the tag's
+#: vocabulary, so swapping engines mid-dataset would silently mix two of them.
+DEFAULT_POSE_BUNDLE = "rtmo-posture-bundle/models/rtmo.engine"
+
+
+def measures_request_paths(run, ts: TrainingSettings | None = None):
+    ts = ts or TrainingSettings.load()
+    stem = f"measures-{run.pk}"
+    return _resolve(ts.configs_root) / f"{stem}.yaml", _resolve(ts.runs_root) / stem
+
+
+def resolve_person_source(dataset, label_source, annotator, explicit_labels_path,
+                          pipeline: str = "", chain=None, detector_checkpoint: str = ""):
+    """Where the person boxes for a box-measure pass should come from.
+
+    Resolved here rather than trainer-side because the two facts it turns on --
+    whether the pipeline runs a detector, and what this dataset's classes are --
+    both live in the app.
+
+    1. a pipeline with a person detector: use that detector, so "person size"
+       means the crop the model actually saw;
+    2. otherwise a dataset that labels people: use those boxes, which needs no
+       extra model and is exactly true;
+    3. otherwise the posture engine's own boxes -- it is a person detector too,
+       which is worth using rather than declaring the tag unavailable.
+    """
+    if pipeline and pipelines.needs_detector(pipeline, chain or []):
+        return {
+            "kind": "detector",
+            # Relative to the Django project root, while the YAML this lands in
+            # lives under configs_root -- same resolve the pipeline block does.
+            "checkpoint": str(_resolve(
+                detector_checkpoint or DEFAULT_PERSON_DETECTOR_CHECKPOINT)),
+        }
+    names = {str(name).lower() for name in dataset_classes(dataset)}
+    if names & {"person", "people", "pedestrian"}:
+        return {"kind": "ground_truth"}
+    return {"kind": "rtmo"}
+
+
+def build_measures_request(run, output_dir: Path, ts: TrainingSettings | None = None) -> dict:
+    """The request YAML for one box-measure pass."""
+    ts = ts or TrainingSettings.load()
+    labels_dir = resolve_label_dir(
+        run.dataset, run.label_source, run.annotator, run.explicit_labels_path or "")
+    if labels_dir is None:
+        raise ValueError(
+            "Box measures are keyed by a label file's rows, so this pass needs a "
+            "label source — pick source labels, an annotator, or an explicit path.")
+    source = resolve_person_source(
+        run.dataset, run.label_source, run.annotator, run.explicit_labels_path or "")
+    engine = _resolve(ts.bundles_root) / DEFAULT_POSE_BUNDLE
+    if not engine.exists():
+        raise FileNotFoundError(
+            f"The posture engine is not where it was expected ({engine}). "
+            "Box measures need the rtmo-posture-bundle under the bundles root.")
+    return {
+        "name": f"measures-{run.pk}",
+        "images": str(lsapi.image_source_dir(source_root() / run.dataset.name)),
+        "labels": str(labels_dir),
+        "classes": dataset_classes(run.dataset),
+        "output_dir": str(output_dir),
+        "person_source": source,
+        "pose": {"engine": str(engine), "score_threshold": 0.4},
+        "device": ts.default_device,
+    }
+
+
+def write_measures_request(run, ts: TrainingSettings | None = None) -> tuple[Path, str]:
+    """Generate the box-measure request YAML and persist its paths on the row."""
+    ts = ts or TrainingSettings.load()
+    request_path, output_dir = measures_request_paths(run, ts)
+    data = build_measures_request(run, output_dir, ts)
+    text = yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
+    request_path.parent.mkdir(parents=True, exist_ok=True)
+    request_path.write_text(text, encoding="utf-8")
+    run.request_yaml_path = str(request_path)
+    run.output_dir = str(output_dir)
+    run.labels_dir_snapshot = data["labels"]
+    run.person_source = data["person_source"]["kind"]
+    run.save(update_fields=["request_yaml_path", "output_dir",
+                            "labels_dir_snapshot", "person_source"])
+    return request_path, text
+
+
 def pipeline_request_paths(pe, ts: TrainingSettings | None = None):
     ts = ts or TrainingSettings.load()
     stem = f"pipeline-{pe.pk}"

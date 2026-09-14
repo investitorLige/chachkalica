@@ -6,8 +6,10 @@ from pathlib import Path
 import torch
 
 from friendy_chachkalica.metrics import (
+    MATCH_TABLE_VERSION,
     _matrix_from_confusion_data,
     evaluate_detection,
+    match_table,
     remap_raw_predictions_to_eval_classes,
     select_hard_images,
 )
@@ -340,3 +342,64 @@ class SelectHardImagesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MatchTableGeometryTests(unittest.TestCase):
+    """The per-box extents version 2 records, and the row they belong to.
+
+    The match table is joined to per-box annotation tags by row number, so a
+    geometry column that drifts from ``gt.row`` would attribute a box's size to
+    a different box -- silently, and only on the images where a class was
+    dropped by the eval-class remap.
+    """
+
+    #: 640x480 frame; the middle box is a dog, which the eval space below drops.
+    TARGETS = [{
+        "boxes": torch.tensor([
+            [0.0, 0.0, 64.0, 48.0],      # row 0, person, 10% x 10%
+            [100.0, 100.0, 420.0, 340.0],  # row 1, dog -- dropped
+            [0.0, 0.0, 192.0, 240.0],    # row 2, person, 30% x 50%
+        ]),
+        "labels": torch.tensor([0, 1, 0]),
+        "orig_size": torch.tensor([480, 640]),
+    }]
+    NO_PREDICTIONS = [torch.zeros((0, 6))]
+
+    def _table(self, targets=None):
+        return match_table(
+            self.NO_PREDICTIONS, targets or self.TARGETS,
+            iou_thresholds=[0.5], score_threshold=0.25, map_score_threshold=0.001,
+            prediction_classes={0: "person"},
+            target_classes={0: "person", 1: "dog"},
+            eval_classes={0: "person"},
+            image_names=["frame.jpg"],
+        )
+
+    def test_the_table_announces_the_version_that_carries_geometry(self):
+        self.assertEqual(self._table()["version"], MATCH_TABLE_VERSION)
+        self.assertEqual(MATCH_TABLE_VERSION, 2)
+
+    def test_extents_follow_the_surviving_rows_not_the_original_order(self):
+        gt = self._table()["gt"]
+
+        # Rows 0 and 2 survive the remap; row 1 was a dog.
+        self.assertEqual(gt["row"], [0, 2])
+        # If the geometry were read before the remap, the second entry would be
+        # the dog's 0.5 x 0.5 rather than row 2's 0.3 x 0.5.
+        self.assertEqual(gt["w"], [0.1, 0.3])
+        self.assertEqual(gt["h"], [0.1, 0.5])
+
+    def test_every_ground_truth_column_stays_the_same_length(self):
+        gt = self._table()["gt"]
+
+        lengths = {name: len(column) for name, column in gt.items()}
+        self.assertEqual(len(set(lengths.values())), 1, lengths)
+
+    def test_a_frame_of_unknown_size_says_unknown_rather_than_dividing_by_zero(self):
+        # match_backfill hands back (0, 0) for a record that never stored one.
+        targets = [{**self.TARGETS[0], "orig_size": torch.tensor([0, 0])}]
+
+        gt = self._table(targets)["gt"]
+
+        self.assertTrue(all(value == -1.0 for value in gt["w"]))
+        self.assertTrue(all(value == -1.0 for value in gt["h"]))

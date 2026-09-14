@@ -1,4 +1,5 @@
 {% extends "admin/base_site.html" %}
+{% load static %}
 
 {% block content %}
 {% if is_combined %}
@@ -169,12 +170,24 @@ only that pipeline's fields are shown.</p>
     <em>Label source</em> is set to “explicit path”.</p>
   </div>
 
+  {# Under the fields that decide it, not next to the dataset picker: the panel
+     is about the *labels*, and label source and annotator move it just as much
+     as the dataset does. #}
+  <div class="form-row" id="tag-availability"
+       data-tag-panel="{{ tag_availability_url }}">
+    <label>Sliceable by:</label>
+    <div data-tag-panel-report></div>
+    <p class="help">What Tag analytics will be able to cut this eval by once it finishes.
+    Computed tags need no annotation at all.</p>
+  </div>
+
   <div class="submit-row">
     <input type="submit" class="default" value="Queue evaluation">
     <a href="../" class="button cancel-link">Cancel</a>
   </div>
 </form>
 
+<script src="{% static 'training/eval_tag_panel.js' %}"></script>
 <script>
   // Show only the fields the selected pipeline uses; a blank pipeline (regular
   // eval) hides all pipeline-specific rows. Rows opt in via data-pipelines.

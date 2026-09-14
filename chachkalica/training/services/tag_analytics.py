@@ -51,10 +51,91 @@ from fleet.reconcile import tag_values
 #: ``predictions_matches.json`` for a chachak pipeline eval.
 MATCH_TABLE_SUFFIX = "_matches.json"
 
+#: Match table versions this build can read. Version 2 added ``gt.w``/``gt.h``
+#: (each box's extent as a fraction of its frame); version 1 carries no
+#: geometry and simply leaves the size tag unavailable, which is a sentence on
+#: the page rather than a refusal to render it.
+SUPPORTED_MATCH_TABLE_VERSIONS = (1, 2)
+
 #: The bucket an image or box with no answer for a tag falls into. Named, not
 #: dropped: "the model is worse on the frames nobody tagged" is a finding about
 #: the annotation job, and silently excluding them would hide it.
 UNANSWERED = "(unanswered)"
+
+#: The bucket a measured tag's image or box falls into when nothing measured
+#: it. Distinct from UNANSWERED: nobody was ever asked, so "the annotators
+#: skipped these" would be the wrong story.
+UNMEASURED = "(not measured)"
+
+#: The computed tags, named in one place. The ``auto:`` prefix cannot collide
+#: with an annotator's tag: ``fleet.AnnotationTag.NAME_PATTERN`` forbids ":", so
+#: this is collision-proof by construction rather than by convention -- which
+#: matters, because the masks are keyed by name and a collision would silently
+#: merge a measured slice into an answered one.
+CROWDING_TAG = "auto:crowding"
+BOX_SIZE_TAG = "auto:box size"
+BRIGHTNESS_TAG = "auto:brightness"
+CONTRAST_TAG = "auto:contrast"
+POSE_TAG = "auto:pose"
+PERSON_SIZE_TAG = "auto:person size"
+
+#: The bucket a box gets when the pass ran and found nobody around it. Kept
+#: distinct from UNMEASURED, which means the pass never looked: "the posture
+#: model could not see a person here" is an observation, and usually the
+#: interesting one.
+NO_PERSON = "(no person)"
+
+#: Measured tags that come from the dataset's image-measures sidecar, mapped to
+#: the key they are stored under there.
+IMAGE_MEASURE_TAGS = [
+    (BRIGHTNESS_TAG, "brightness", "brightness", "mean luma of the frame, 0-255"),
+    (CONTRAST_TAG, "contrast", "contrast",
+     "the frame's 5th-95th percentile luma spread, 0-255"),
+]
+
+#: What the computed tags are, for the surfaces that have to describe them
+#: before any eval exists -- the evaluate forms. Kept beside the builders below
+#: so the description and the thing described cannot drift apart.
+AUTO_TAG_CATALOGUE = [
+    {
+        "name": CROWDING_TAG, "label": "crowding", "scope": tag_values.FRAME,
+        "detail": "How many ground-truth boxes share the frame.",
+        "needs": "",
+    },
+    {
+        "name": BOX_SIZE_TAG, "label": "box size", "scope": tag_values.REGION,
+        "detail": "Each ground-truth box's linear size as a fraction of its frame.",
+        "needs": "a match table that records box geometry -- written by every "
+                 "eval from now on; an older eval needs 'Build tag analytics data'.",
+    },
+    {
+        "name": BRIGHTNESS_TAG, "label": "brightness", "scope": tag_values.FRAME,
+        "detail": "How bright the frame is, as mean luma.",
+        "needs": "one 'Measure image statistics' pass over the dataset.",
+    },
+    {
+        "name": PERSON_SIZE_TAG, "label": "person size", "scope": tag_values.REGION,
+        "detail": "How big the person this box belongs to is, as a fraction of "
+                  "the frame.",
+        "needs": "one 'Measure box statistics' pass over this label set.",
+    },
+    {
+        "name": POSE_TAG, "label": "pose", "scope": tag_values.REGION,
+        "detail": "What the person this box belongs to is doing -- standing, "
+                  "sitting or lying.",
+        "needs": "one 'Measure box statistics' pass over this label set.",
+    },
+    {
+        "name": CONTRAST_TAG, "label": "contrast", "scope": tag_values.FRAME,
+        "detail": "How much tonal range the frame has -- low means washed out, "
+                  "fogged or badly exposed.",
+        "needs": "one 'Measure image statistics' pass over the dataset.",
+    },
+]
+
+#: Buckets a continuous measure is cut into. Three, because low/medium/high is
+#: the coarsest split that can show a trend rather than only a contrast.
+TERCILE_LABELS = ("low", "medium", "high")
 
 #: Free-text tags can have as many distinct answers as there are images, which
 #: is not a grouping. Only the most common ones become groups.
@@ -100,6 +181,7 @@ class MatchTable:
     """
 
     path: Path
+    version: int
     iou_thresholds: list[float]
     score_threshold: float
     score_floor: float
@@ -110,6 +192,10 @@ class MatchTable:
     gt_image: np.ndarray
     gt_class: np.ndarray
     gt_row: np.ndarray
+    #: Box extent as a fraction of its frame, ``-1`` where the table does not
+    #: know it (a version 1 table, or a record that never stored a frame size).
+    gt_w: np.ndarray
+    gt_h: np.ndarray
 
     # AP set: raw, NMS-free, down to the score floor.
     pred_image: np.ndarray
@@ -134,6 +220,15 @@ class MatchTable:
     @property
     def num_images(self) -> int:
         return len(self.images)
+
+    @property
+    def has_geometry(self) -> bool:
+        """Whether box sizes can be read off this table at all.
+
+        False for a version 1 table, and for a version 2 one whose every box
+        came from a record with no frame size to divide by.
+        """
+        return bool(self.gt_w.size) and bool(np.any(self.gt_w >= 0))
 
     @property
     def num_gt(self) -> int:
@@ -166,7 +261,7 @@ def _stable_score_order(scores: np.ndarray) -> np.ndarray:
 def _load_table(path: str, _stamp: tuple) -> MatchTable:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     version = data.get("version")
-    if version != 1:
+    if version not in SUPPORTED_MATCH_TABLE_VERSIONS:
         raise ValueError(
             f"{path}: match table version {version!r} is not supported by this build."
         )
@@ -182,17 +277,38 @@ def _load_table(path: str, _stamp: tuple) -> MatchTable:
         op_image, op_class, op_score, op_iou, op_gt = _columns(operating)
         operating_is_ap = False
 
+    gt = data["gt"]
+    gt_image = np.asarray(gt["image"], dtype=np.int64)
+    gt_class = np.asarray(gt["class"], dtype=np.int64)
+    gt_row = np.asarray(gt["row"], dtype=np.int64)
+    if "w" in gt and "h" in gt:
+        gt_w = np.asarray(gt["w"], dtype=np.float64)
+        gt_h = np.asarray(gt["h"], dtype=np.float64)
+    else:
+        gt_w = np.full(gt_image.size, -1.0)
+        gt_h = np.full(gt_image.size, -1.0)
+    # The ground-truth columns are read positionally: a short one would pair a
+    # class with another box's row and quietly mis-tag every box after it, so
+    # check the lengths rather than let zip() walk off the end of the shortest.
+    for name, column in (("class", gt_class), ("row", gt_row),
+                         ("w", gt_w), ("h", gt_h)):
+        if column.size != gt_image.size:
+            raise ValueError(
+                f"{path}: gt.{name} has {column.size} entries but gt.image has "
+                f"{gt_image.size} -- the table is truncated or hand-edited."
+            )
+
     return MatchTable(
         path=Path(path),
+        version=int(version),
         iou_thresholds=[float(value) for value in data["iou_thresholds"]],
         score_threshold=float(data["score_threshold"]),
         score_floor=float(data.get("score_floor", data["score_threshold"])),
         backfilled=bool(data.get("backfilled")),
         classes={int(key): (value or str(key)) for key, value in (data.get("classes") or {}).items()},
         images=[str(name) for name in data["images"]],
-        gt_image=np.asarray(data["gt"]["image"], dtype=np.int64),
-        gt_class=np.asarray(data["gt"]["class"], dtype=np.int64),
-        gt_row=np.asarray(data["gt"]["row"], dtype=np.int64),
+        gt_image=gt_image, gt_class=gt_class, gt_row=gt_row,
+        gt_w=gt_w, gt_h=gt_h,
         pred_image=pred_image, pred_class=pred_class, pred_score=pred_score,
         pred_iou=pred_iou, pred_gt=pred_gt,
         op_image=op_image, op_class=op_class, op_score=op_score,
@@ -201,7 +317,7 @@ def _load_table(path: str, _stamp: tuple) -> MatchTable:
     )
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=16)
 def _cached_table(path: str, stamp: tuple) -> MatchTable:
     return _load_table(path, stamp)
 
@@ -217,18 +333,56 @@ def load_table(path: str | Path) -> MatchTable:
     return _cached_table(str(path), (stat.st_mtime_ns, stat.st_size))
 
 
-def load_tag_document(labels_dir: str | Path | None) -> dict | None:
-    """The ``annotation_tags.json`` sitting in a label directory, or None."""
-    if not labels_dir:
-        return None
-    path = tag_values.tags_path(labels_dir)
-    if not path.exists():
-        return None
+@lru_cache(maxsize=4)
+def _cached_document(path: str, stamp: tuple) -> dict | None:
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return document if isinstance(document, dict) else None
+
+
+BOX_MEASURES_FILENAME = "auto_measures.json"
+
+
+def load_box_measures(labels_dir: str | Path | None) -> dict | None:
+    """The box-measure sidecar in a label directory, or None.
+
+    Lives beside the labels rather than beside the images, and for the same
+    reason ``annotation_tags.json`` does: its rows are line numbers in *those*
+    ``.txt`` files, so it is only meaningful next to them.
+    """
+    if not labels_dir:
+        return None
+    path = Path(labels_dir) / BOX_MEASURES_FILENAME
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    document = _cached_document(str(path), (stat.st_mtime_ns, stat.st_size))
+    return document if isinstance(document, dict) else None
+
+
+def load_tag_document(labels_dir: str | Path | None) -> dict | None:
+    """The ``annotation_tags.json`` sitting in a label directory, or None.
+
+    Memoized on the file's identity the way :func:`load_table` is, and for the
+    same reason at a larger scale: the sidecar for a 13k-image dataset is
+    several MB of JSON, and it is now read on every tag-analytics render *and*
+    on every keystroke-driven refresh of the evaluate forms' tag panel. Keyed by
+    (path, mtime, size) so a re-sync is picked up rather than served stale.
+
+    The cached document is shared between callers, so treat it as read-only --
+    every consumer here copies before it changes anything.
+    """
+    if not labels_dir:
+        return None
+    path = tag_values.tags_path(labels_dir)
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return _cached_document(str(path), (stat.st_mtime_ns, stat.st_size))
 
 
 # --------------------------------------------------------------------------
@@ -266,9 +420,38 @@ class TagDefinition:
     total: int = 0
     truncated: bool = False
 
+    #: Display name. Empty means "use ``name``"; a computed tag sets it to the
+    #: half of its name the reader cares about (``auto:crowding`` -> crowding).
+    label: str = ""
+    #: Where this tag's answers come from. ``annotator`` was answered by a
+    #: person, ``auto`` was measured, ``declared`` is defined on the dataset but
+    #: has no answers here at all.
+    source: str = "annotator"
+    #: ``ok`` when the tag can slice. Anything else is a reason the page prints
+    #: instead of a table, so a tag never simply vanishes.
+    status: str = "ok"
+    status_detail: str = ""
+    #: Where a measured tag's buckets were cut, as
+    #: ``[{"value", "min", "max", "count", "share"}]``. Printed under the tag,
+    #: because a bucket named "low" means nothing without the number behind it.
+    cuts: list[dict] = field(default_factory=list)
+    unit: str = ""
+    #: The bucket unanswered/unmeasured entries land in — UNANSWERED for a tag a
+    #: person fills in, UNMEASURED for one a machine does.
+    missing_label: str = UNANSWERED
+
     @property
     def is_frame(self) -> bool:
         return self.scope != tag_values.REGION
+
+    @property
+    def display(self) -> str:
+        return self.label or self.name
+
+    @property
+    def usable(self) -> bool:
+        """Whether this tag can actually slice anything on this eval."""
+        return self.status == "ok" and bool(self.values)
 
 
 @dataclass
@@ -281,12 +464,90 @@ class TagIndex:
     matched_images: int
     unmatched_images: int
     row_mismatches: int
+    #: Images the measures sidecar could not be joined to because their basename
+    #: occurs under more than one subdirectory. Reported rather than guessed.
+    ambiguous_filenames: int = 0
 
     def tag(self, name: str) -> TagDefinition | None:
         for definition in self.tags:
             if definition.name == name:
                 return definition
         return None
+
+
+def tercile_buckets(values, valid=None) -> dict:
+    """Split a continuous measure into up to three ordered, non-empty buckets.
+
+    Returns ``{"assignment", "labels", "cuts", "degenerate"}``. ``assignment``
+    indexes ``labels``, or is ``-1`` where the measure has no value.
+
+    Cuts fall *between* distinct values, never through a tie -- "1 box" cannot
+    be simultaneously low and medium. That matters far more than it sounds,
+    because the measures worth slicing by are often discrete: on a dataset where
+    80% of frames hold exactly one box the 33rd and 66th percentiles are both
+    1.0, so a naive tercile leaves the middle bucket empty and the page renders
+    a blank row that reads like a bug. Cutting between distinct values instead
+    gives low={1}, medium={2}, high={3 or more} -- three populated buckets that
+    describe themselves.
+
+    On a genuinely continuous measure every value is distinct, the candidate
+    cuts are a fine grid, and this lands where ``np.quantile(v, [1/3, 2/3])``
+    lands. So it is the percentile cut generalised to survive ties, not a
+    different rule.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    valid = np.ones(values.shape, dtype=bool) if valid is None else np.asarray(valid, dtype=bool)
+    assignment = np.full(values.shape, -1, dtype=np.int8)
+
+    sample = values[valid]
+    if sample.size == 0:
+        return {"assignment": assignment, "labels": [], "cuts": [], "degenerate": "empty"}
+
+    distinct, counts = np.unique(sample, return_counts=True)
+    if distinct.size == 1:
+        assignment[valid] = 0
+        labels = [TERCILE_LABELS[0]]
+        return {
+            "assignment": assignment,
+            "labels": labels,
+            "cuts": [{"value": labels[0], "min": None, "max": float(distinct[0]),
+                      "count": int(counts[0]), "share": 1.0}],
+            "degenerate": "constant",
+        }
+
+    # Cumulative share at each distinct value; a cut "after distinct[i]" puts
+    # cum[i] of the population below it, so pick the i closest to each target.
+    cum = np.cumsum(counts) / counts.sum()
+    low_index = int(np.argmin(np.abs(cum[:-1] - 1.0 / 3.0)))
+    remaining = np.arange(low_index + 1, distinct.size - 1)
+    if remaining.size:
+        high_index = int(remaining[np.argmin(np.abs(cum[remaining] - 2.0 / 3.0))])
+        edges = [float(distinct[low_index]), float(distinct[high_index])]
+        labels = list(TERCILE_LABELS)
+        degenerate = ""
+    else:
+        # Only one place left to cut. Two named buckets beat three with an empty
+        # one in the middle, so skip "medium" rather than render nothing in it.
+        edges = [float(distinct[low_index])]
+        labels = [TERCILE_LABELS[0], TERCILE_LABELS[-1]]
+        degenerate = "two"
+
+    # side="left" makes each edge the inclusive top of its bucket.
+    assignment[valid] = np.searchsorted(edges, sample, side="left").astype(np.int8)
+
+    cuts = []
+    for position, label in enumerate(labels):
+        selected = assignment == position
+        count = int(np.count_nonzero(selected))
+        cuts.append({
+            "value": label,
+            "min": edges[position - 1] if position else None,
+            "max": edges[position] if position < len(edges) else None,
+            "count": count,
+            "share": count / int(sample.size),
+        })
+    return {"assignment": assignment, "labels": labels, "cuts": cuts,
+            "degenerate": degenerate}
 
 
 def _order_values(definition: TagDefinition, declared: list[str]) -> None:
@@ -302,12 +563,18 @@ def _order_values(definition: TagDefinition, declared: list[str]) -> None:
     ordered: list[str] = []
     for value in declared:
         value = str(value)
-        if value in definition.counts and value not in seen:
-            ordered.append(value)
-            seen.add(value)
+        if value in seen:
+            continue
+        # A declared option nobody ever picked becomes a zero row rather than
+        # nothing at all: "no annotator marked a single frame 'heavy'" is a
+        # finding about the labelling job, and dropping it hides it.
+        definition.counts.setdefault(value, 0)
+        ordered.append(value)
+        seen.add(value)
 
     extras = sorted(
-        (value for value in definition.counts if value not in seen and value != UNANSWERED),
+        (value for value in definition.counts
+         if value not in seen and value != definition.missing_label),
         key=lambda value: (-definition.counts[value], value),
     )
     limit = MAX_TEXT_VALUES if definition.widget == "text" else len(extras)
@@ -315,12 +582,324 @@ def _order_values(definition: TagDefinition, declared: list[str]) -> None:
         definition.truncated = True
     ordered.extend(extras[:limit])
 
-    if definition.counts.get(UNANSWERED):
-        ordered.append(UNANSWERED)
+    if definition.counts.get(definition.missing_label):
+        ordered.append(definition.missing_label)
     definition.values = ordered
 
 
-def build_tag_index(table: MatchTable, document: dict) -> TagIndex:
+def _measured_tag(*, name, label, unit, scope, values, valid) -> tuple[TagDefinition, dict]:
+    """One computed tag: bucket a raw measure and build its masks.
+
+    Measured tags carry no annotator answers, so their "missing" bucket is
+    UNMEASURED rather than UNANSWERED -- nobody was asked, so saying the
+    annotators skipped these would be the wrong story.
+    """
+    definition = TagDefinition(
+        name=name, scope=scope, widget="radio", label=label,
+        source="auto", unit=unit, missing_label=UNMEASURED,
+    )
+    result = tercile_buckets(values, valid)
+    assignment = result["assignment"]
+    definition.cuts = result["cuts"]
+    definition.total = int(assignment.size)
+    definition.answered = int(np.count_nonzero(assignment >= 0))
+
+    masks: dict[tuple[str, str], np.ndarray] = {}
+    ordered: list[str] = []
+    for position, bucket in enumerate(result["labels"]):
+        mask = assignment == position
+        masks[(name, bucket)] = mask
+        definition.counts[bucket] = int(np.count_nonzero(mask))
+        ordered.append(bucket)
+
+    missing = assignment < 0
+    if bool(missing.any()):
+        masks[(name, UNMEASURED)] = missing
+        definition.counts[UNMEASURED] = int(np.count_nonzero(missing))
+        ordered.append(UNMEASURED)
+    definition.values = ordered
+
+    if result["degenerate"] == "empty":
+        definition.status = "no_data"
+        definition.status_detail = "Nothing here carries this measure."
+    elif result["degenerate"] == "constant":
+        # One bucket is not a slice. Say so rather than render a single row
+        # holding 100% of the dataset, which looks like a result.
+        definition.status = "collapsed"
+        definition.status_detail = (
+            "Every entry has the same value, so this measure cannot split "
+            "this dataset into anything."
+        )
+    elif result["degenerate"] == "two":
+        definition.status_detail = (
+            "This measure takes too few distinct values here to cut in three, "
+            "so it is split in two."
+        )
+    return definition, masks
+
+
+def _crowding_tag(table: MatchTable) -> tuple[TagDefinition, dict]:
+    """How many ground-truth boxes share the frame.
+
+    Needs no sidecar and no second pass -- the match table already has one row
+    per ground-truth box, so counting them per image is the whole measure. That
+    is what lets tag analytics slice an eval of a dataset nobody has tagged.
+
+    A frame with no ground truth counts 0 and stays in the population: it is a
+    real frame, it is where false positives live, and folding it into "not
+    measured" would hide the most interesting slice on the page.
+    """
+    counts = np.bincount(table.gt_image, minlength=table.num_images).astype(np.float64)
+    return _measured_tag(
+        name=CROWDING_TAG, label="crowding",
+        unit="ground-truth boxes this eval scored in the frame",
+        scope=tag_values.FRAME, values=counts,
+        valid=np.ones(counts.shape, dtype=bool),
+    )
+
+
+def _box_size_tag(table: MatchTable) -> tuple[TagDefinition, dict]:
+    """How big each ground-truth box is relative to its frame.
+
+    The linear fraction (sqrt of the area fraction), not the area fraction:
+    halving a box's size should read as half, and area falls by four.
+    """
+    valid = (table.gt_w >= 0) & (table.gt_h >= 0)
+    values = np.sqrt(np.clip(table.gt_w, 0.0, None) * np.clip(table.gt_h, 0.0, None))
+    return _measured_tag(
+        name=BOX_SIZE_TAG, label="box size",
+        unit="the box's linear size as a fraction of the frame",
+        scope=tag_values.REGION, values=values, valid=valid,
+    )
+
+
+#: Why a computed tag is not available, in the operator's terms -- each names
+#: the action that fixes it rather than only the artifact that is missing.
+NO_BOX_MEASURES_DETAIL = (
+    "The boxes in this label set have not been measured. Run 'Measure box "
+    "statistics' -- it runs a person detector and the posture engine over the "
+    "frames once, and every eval scored against these labels picks it up."
+)
+
+NO_MEASURES_DETAIL = (
+    "This dataset's images have not been measured. Run 'Measure image "
+    "statistics' on the dataset -- one pass over the frames, no GPU and no "
+    "re-inference, and every eval of it (including ones already finished) picks "
+    "the result up."
+)
+
+NO_GEOMETRY_DETAIL = (
+    "This eval's match table records no box geometry (it predates it). Select "
+    "the eval and run 'Build tag analytics data' -- it rebuilds the table "
+    "from the predictions already on disk, with no GPU and no re-inference."
+)
+
+
+DECLARED_NOT_SYNCED_DETAIL = (
+    "Defined on this dataset, but absent from the tag answers this eval scored "
+    "against -- it was added or renamed after the last sync. Push the tags to "
+    "the annotator's projects and sync them."
+)
+
+NO_ANSWERS_DETAIL = (
+    "Synced, but no image this eval scored carries an answer for it yet."
+)
+
+
+def _measures_by_basename(document: dict) -> tuple[dict, set]:
+    """The sidecar's per-image values, keyed the only way a table can join.
+
+    The sidecar keys by path relative to the images directory, because that is
+    what uniquely identifies a frame; a match table records only basenames
+    (``metrics.match_table`` stores ``Path(name).name``). A basename that occurs
+    under two subdirectories therefore cannot be attributed to either, so the
+    producer lists those and they are refused here rather than guessed at --
+    the same posture the per-box row check takes.
+    """
+    collisions = set(document.get("basename_collisions") or [])
+    by_name = {}
+    for relative, values in (document.get("images") or {}).items():
+        name = str(relative).rsplit("/", 1)[-1]
+        if name not in collisions:
+            by_name[name] = values
+    return by_name, collisions
+
+
+def _categorical_tag(*, name, label, scope, values, choices, total) -> tuple:
+    """A measured tag whose values are named outcomes rather than a range."""
+    definition = TagDefinition(
+        name=name, label=label, scope=scope, widget="radio",
+        source="auto", missing_label=UNMEASURED)
+    definition.total = int(total)
+    definition.answered = sum(1 for value in values if value is not None)
+
+    masks = {}
+    for choice in choices:
+        mask = np.array([value == choice for value in values], dtype=bool)
+        masks[(name, choice)] = mask
+        definition.counts[choice] = int(np.count_nonzero(mask))
+    missing = np.array([value is None for value in values], dtype=bool)
+    if bool(missing.any()):
+        masks[(name, UNMEASURED)] = missing
+        definition.counts[UNMEASURED] = int(np.count_nonzero(missing))
+
+    _order_values(definition, [str(choice) for choice in choices])
+    if definition.answered == 0:
+        definition.status = "no_data"
+        definition.status_detail = "Nothing here carries this measure."
+    return definition, masks
+
+
+def _box_measure_tags(table: MatchTable, document: dict) -> tuple[list, dict, int]:
+    """Box-scope tags from the box-measure sidecar.
+
+    Joined on (image, row) and checked against the class id recorded beside the
+    row -- the same drift guard the annotation-tag join uses, for the same
+    reason: a relabel moves the rows under the sidecar, and attributing a pose
+    to the box that now sits on that line is worse than attributing none.
+    """
+    gt_position = {
+        (int(image), int(row)): position
+        for position, (image, row) in enumerate(zip(table.gt_image, table.gt_row))
+    }
+    image_index = {name: index for index, name in enumerate(table.images)}
+
+    poses: list = [None] * table.num_gt
+    ratios = np.zeros(table.num_gt, dtype=np.float64)
+    ratio_valid = np.zeros(table.num_gt, dtype=bool)
+    mismatches = 0
+
+    for filename, entry in (document.get("images") or {}).items():
+        index = image_index.get(filename)
+        if index is None:
+            continue
+        boxes = entry.get("boxes") or []
+        positions, drifted = [], False
+        for box in boxes:
+            position = gt_position.get((index, int(box.get("row", -1))))
+            if position is None or int(table.gt_class[position]) != int(box.get("class_id", -1)):
+                drifted = position is not None or drifted
+                positions.append(None)
+                continue
+            positions.append(position)
+        if drifted:
+            mismatches += 1
+            continue
+        for box, position in zip(boxes, positions):
+            if position is None:
+                continue
+            values = box.get("values") or {}
+            pose = values.get("pose")
+            if pose:
+                poses[position] = str(pose)
+            ratio = values.get("person size ratio")
+            if isinstance(ratio, (int, float)) and not isinstance(ratio, bool):
+                ratios[position] = float(ratio)
+                ratio_valid[position] = True
+
+    declared = []
+    for measure in (document.get("measures") or []):
+        if measure.get("name") == "pose":
+            declared = [str(choice) for choice in (measure.get("choices") or [])]
+    if not declared:
+        declared = sorted({pose for pose in poses if pose})
+
+    definitions, masks = [], {}
+    pose_definition, pose_masks = _categorical_tag(
+        name=POSE_TAG, label="pose", scope=tag_values.REGION,
+        values=poses, choices=declared, total=table.num_gt)
+    definitions.append(pose_definition)
+    masks.update(pose_masks)
+
+    size_definition, size_masks = _measured_tag(
+        name=PERSON_SIZE_TAG, label="person size",
+        unit="the person's area as a fraction of the frame",
+        scope=tag_values.REGION, values=ratios, valid=ratio_valid)
+    definitions.append(size_definition)
+    masks.update(size_masks)
+    return definitions, masks, mismatches
+
+
+def _image_measure_tags(table: MatchTable, document: dict) -> tuple[list, dict, int]:
+    """Frame tags for every measure the sidecar carries."""
+    by_name, collisions = _measures_by_basename(document)
+    ambiguous = sum(1 for name in table.images if name in collisions)
+
+    definitions, masks = [], {}
+    for name, key, label, unit in IMAGE_MEASURE_TAGS:
+        values = np.zeros(table.num_images, dtype=np.float64)
+        valid = np.zeros(table.num_images, dtype=bool)
+        for index, image in enumerate(table.images):
+            entry = by_name.get(image)
+            value = entry.get(key) if isinstance(entry, dict) else None
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                values[index] = float(value)
+                valid[index] = True
+        definition, measure_masks = _measured_tag(
+            name=name, label=label, unit=unit, scope=tag_values.FRAME,
+            values=values, valid=valid)
+        definitions.append(definition)
+        masks.update(measure_masks)
+    return definitions, masks, ambiguous
+
+
+def build_auto_tags(table: MatchTable, measures: dict | None = None,
+                    box_measures: dict | None = None) -> tuple[list[TagDefinition], dict, dict]:
+    """Every tag this eval can be sliced by without anyone having annotated it."""
+    definitions: list[TagDefinition] = []
+    image_masks: dict[tuple[str, str], np.ndarray] = {}
+    gt_masks: dict[tuple[str, str], np.ndarray] = {}
+
+    crowding, masks = _crowding_tag(table)
+    definitions.append(crowding)
+    image_masks.update(masks)
+
+    if table.has_geometry:
+        box_size, masks = _box_size_tag(table)
+        gt_masks.update(masks)
+    else:
+        box_size = TagDefinition(
+            name=BOX_SIZE_TAG, label="box size", scope=tag_values.REGION,
+            widget="radio", source="auto", missing_label=UNMEASURED,
+            status="unavailable", status_detail=NO_GEOMETRY_DETAIL,
+        )
+    definitions.append(box_size)
+
+    if box_measures:
+        box_definitions, box_masks, _drift = _box_measure_tags(table, box_measures)
+        definitions.extend(box_definitions)
+        gt_masks.update(box_masks)
+    else:
+        for name, label in ((POSE_TAG, "pose"), (PERSON_SIZE_TAG, "person size")):
+            definitions.append(TagDefinition(
+                name=name, label=label, scope=tag_values.REGION, widget="radio",
+                source="auto", missing_label=UNMEASURED,
+                status="unavailable", status_detail=NO_BOX_MEASURES_DETAIL))
+
+    ambiguous = 0
+    if measures:
+        measure_definitions, measure_masks, ambiguous = _image_measure_tags(table, measures)
+        definitions.extend(measure_definitions)
+        image_masks.update(measure_masks)
+    else:
+        for name, _key, label, unit in IMAGE_MEASURE_TAGS:
+            definitions.append(TagDefinition(
+                name=name, label=label, scope=tag_values.FRAME, widget="radio",
+                source="auto", unit=unit, missing_label=UNMEASURED,
+                status="unavailable", status_detail=NO_MEASURES_DETAIL))
+    return definitions, image_masks, gt_masks, ambiguous
+
+
+def build_tag_index(
+    table: MatchTable,
+    document: dict | None = None,
+    *,
+    declared_specs: list[dict] | None = None,
+    measures: dict | None = None,
+    box_measures: dict | None = None,
+    reasons: dict[str, str] | None = None,
+    auto: bool = True,
+) -> TagIndex:
     """Turn the tag sidecar into masks aligned with the match table's rows.
 
     The join is by image basename (the sidecar keys images the way Label Studio
@@ -331,7 +910,27 @@ def build_tag_index(table: MatchTable, document: dict) -> TagIndex:
     drops that image's box tags and is counted, rather than quietly attributing
     an answer to the wrong box.
     """
+    document = document or {}
+    reasons = reasons or {}
     declared = {str(spec["name"]): spec for spec in (document.get("tags") or [])}
+
+    # Tags defined on the dataset but absent from the sidecar were the ones that
+    # genuinely could not be seen here: the sidecar is written at sync time, so a
+    # tag added or renamed since then carries no answers and never became a
+    # definition at all. They are listed now, with the reason and the fix.
+    unsynced: set[str] = set()
+    for spec in (declared_specs or []):
+        name = str(spec.get("name") or "")
+        if not name:
+            continue
+        if name in declared:
+            # The admin is live truth for the option list; the sidecar only
+            # records what the tag looked like at the last sync.
+            declared[name] = {**declared[name], **{k: v for k, v in spec.items() if v}}
+        else:
+            declared[name] = spec
+            unsynced.add(name)
+
     entries = document.get("images") or {}
 
     definitions: dict[str, TagDefinition] = {
@@ -414,7 +1013,7 @@ def build_tag_index(table: MatchTable, document: dict) -> TagIndex:
                 mask[np.asarray(indices, dtype=np.int64)] = True
                 image_masks[(name, value)] = mask
                 definition.counts[value] = int(mask.sum())
-            if definition.answered < definition.total:
+            if 0 < definition.answered < definition.total:
                 mask = np.ones(table.num_images, dtype=bool)
                 if frame_answered[name]:
                     mask[np.asarray(sorted(frame_answered[name]), dtype=np.int64)] = False
@@ -430,19 +1029,54 @@ def build_tag_index(table: MatchTable, document: dict) -> TagIndex:
                 mask[np.asarray(indices, dtype=np.int64)] = True
                 gt_masks[(name, value)] = mask
                 definition.counts[value] = int(mask.sum())
-            if definition.answered < definition.total:
+            if 0 < definition.answered < definition.total:
                 mask = np.ones(table.num_gt, dtype=bool)
                 if box_answered[name]:
                     mask[np.asarray(sorted(box_answered[name]), dtype=np.int64)] = False
                 gt_masks[(name, UNANSWERED)] = mask
                 definition.counts[UNANSWERED] = int(mask.sum())
 
+        if definition.answered == 0:
+            # Nothing answered it, so there is no slice to show -- but the tag
+            # still gets a row on the page saying so. Rendering one
+            # "(unanswered)" table covering the whole dataset would be worse
+            # than useless: N tags would each claim a full-width result.
+            definition.status = "unsynced" if name in unsynced else "no_answers"
+            definition.status_detail = reasons.get(name) or (
+                DECLARED_NOT_SYNCED_DETAIL if name in unsynced else NO_ANSWERS_DETAIL
+            )
+            definition.values = []
+            continue
+
         _order_values(definition, [str(v) for v in (declared[name].get("choices") or [])])
 
+        # Every value the page renders has to be sliceable: resolve_clauses
+        # looks a value up by mask and refuses one it cannot find, so a declared
+        # option nobody picked would render a row that then 400s when clicked.
+        # One shared all-false array -- masks are only ever read, never mutated.
+        masks = image_masks if definition.is_frame else gt_masks
+        empty = np.zeros(
+            table.num_images if definition.is_frame else table.num_gt, dtype=bool)
+        for value in definition.values:
+            masks.setdefault((name, value), empty)
+
+    ambiguous_filenames = 0
+    if auto:
+        auto_definitions, auto_image_masks, auto_gt_masks, ambiguous_filenames = (
+            build_auto_tags(table, measures, box_measures))
+        image_masks.update(auto_image_masks)
+        gt_masks.update(auto_gt_masks)
+        for definition in auto_definitions:
+            definitions[definition.name] = definition
+
+    # Everything is kept. A tag that cannot slice carries its reason instead of
+    # disappearing -- "which tags could I have used here" is the question this
+    # page exists to answer, and a silent drop answers it wrong.
     order = {tag_values.FRAME: 0, tag_values.REGION: 1}
+    source_order = {"annotator": 0, "auto": 1}
     tags = sorted(
-        (d for d in definitions.values() if d.values),
-        key=lambda d: (order.get(d.scope, 0), d.name),
+        definitions.values(),
+        key=lambda d: (order.get(d.scope, 0), source_order.get(d.source, 0), d.name),
     )
     return TagIndex(
         tags=tags,
@@ -451,6 +1085,7 @@ def build_tag_index(table: MatchTable, document: dict) -> TagIndex:
         matched_images=matched_images,
         unmatched_images=len(entries) - matched_images,
         row_mismatches=row_mismatches,
+        ambiguous_filenames=ambiguous_filenames,
     )
 
 
@@ -783,13 +1418,33 @@ def tag_breakdown(table: MatchTable, index: TagIndex, definition: TagDefinition)
 
     rows = [_row(table, index, definition, value) for value in definition.values]
     for row in rows:
-        row["delta"] = row.get(key, 0.0) - overall.get(key, 0.0)
+        # A value nothing falls into has no score, only zeros. Flag it so the
+        # page prints dashes: a row reading "mAP50 0.0000" looks like a model
+        # that failed, not like a bucket nobody used.
+        row["empty"] = (row["images"] if definition.is_frame else row["gt"]) == 0
+        # A frame slice holding no ground truth has no mAP and no recall: both
+        # are means over an empty set, which comes out 0.0 and reads as a
+        # catastrophic score rather than an undefined one. Empty frames are
+        # real, and the predictions they attract are worth seeing, so the row
+        # stays -- the metrics that need a denominator do not. (The crowding
+        # tag makes this bucket guaranteed rather than incidental.)
+        row["no_ground_truth"] = (
+            definition.is_frame and not row["empty"] and row["gt"] == 0)
+        row["delta"] = (
+            None if row["empty"] or row["no_ground_truth"]
+            else row.get(key, 0.0) - overall.get(key, 0.0))
 
     return {
         "name": definition.name,
+        "label": definition.display,
         "scope": definition.scope,
         "widget": definition.widget,
         "kind": "frame" if definition.is_frame else "box",
+        "source": definition.source,
+        "unit": definition.unit,
+        "cuts": definition.cuts,
+        "status": definition.status,
+        "status_detail": definition.status_detail,
         "answered": definition.answered,
         "total": definition.total,
         "truncated": definition.truncated,
@@ -859,6 +1514,114 @@ def cross_tab(table: MatchTable, index: TagIndex, tag_a: str, tag_b: str, metric
     }
 
 
+def comparable_tags(columns) -> list[dict]:
+    """Every tag at least one of the compared evals can be sliced by.
+
+    The union, not the intersection: compared evals may be on different datasets
+    (the compare page has always allowed that), and a tag only one of them
+    carries is still worth looking at — the others simply say so.
+    """
+    seen: dict[str, dict] = {}
+    for column in columns:
+        for definition in column["index"].tags:
+            if not definition.usable or definition.name in seen:
+                continue
+            seen[definition.name] = {
+                "name": definition.name, "label": definition.display,
+                "kind": "frame" if definition.is_frame else "box",
+                "source": definition.source,
+            }
+    return list(seen.values())
+
+
+def _comparability_warnings(columns) -> list[str]:
+    """Ways these evals are not really comparable, per slice.
+
+    The overall table can get away without these; a per-slice number cannot. A
+    gap on one bucket is small enough to be explained by a threshold difference,
+    and a reader who is not told will explain it with the model instead.
+    """
+    warnings = []
+    datasets = {column.get("dataset") for column in columns if column.get("dataset")}
+    if len(datasets) > 1:
+        warnings.append(
+            "These evals are on different datasets (" + ", ".join(sorted(datasets))
+            + "), so a measured tag's buckets were cut over different populations "
+              "and 'high' does not mean the same thing in each column.")
+    thresholds = {column["table"].score_threshold for column in columns}
+    if len(thresholds) > 1:
+        warnings.append(
+            "They were scored at different operating confidences ("
+            + ", ".join(f"{value:g}" for value in sorted(thresholds))
+            + "), so a precision or recall gap may be the threshold rather than the model.")
+    ious = {tuple(column["table"].iou_thresholds) for column in columns}
+    if len(ious) > 1:
+        warnings.append("They used different IoU thresholds, so mAP50-95 is not "
+                        "comparable between these columns.")
+    return warnings
+
+
+def compare_tag(columns, tag: str, metric: str) -> dict:
+    """One metric over one tag's values, with a column per compared eval.
+
+    ``columns`` is ``[{"label", "dataset", "table", "index"}, ...]``. A column
+    whose eval does not carry the tag renders as an explicit gap rather than
+    being dropped, so a four-way comparison never silently becomes a two-way one.
+    """
+    present = [c for c in columns
+               if c["index"].tag(tag) is not None and c["index"].tag(tag).usable]
+    if not present:
+        raise UnknownClause(f"none of the compared evals can be sliced by {tag}")
+
+    first = present[0]["index"].tag(tag)
+    allowed = dict(FRAME_METRICS if first.is_frame else BOX_METRICS)
+    if metric not in allowed:
+        metric = "map50" if first.is_frame else "recall"
+
+    # The first column that has the tag sets the row order; anything only a
+    # later column carries follows, so the grid reads like its breakdown table.
+    values: list[str] = []
+    for column in present:
+        for value in column["index"].tag(tag).values:
+            if value not in values:
+                values.append(value)
+
+    rows = []
+    for value in values:
+        cells = []
+        for column in columns:
+            definition = column["index"].tag(tag)
+            if definition is None or not definition.usable or value not in definition.values:
+                cells.append({"value": None, "population": None, "absent": True})
+                continue
+            entry = slice_metrics(column["table"], column["index"], [(tag, value)])
+            population = entry["images"] if entry["kind"] == "frame" else entry["gt"]
+            cells.append({
+                "value": entry.get(metric) if population else None,
+                "population": population, "absent": False,
+            })
+        numbers = [c["value"] for c in cells if c["value"] is not None]
+        best = max(numbers) if len(numbers) > 1 and len(set(numbers)) > 1 else None
+        for cell in cells:
+            cell["is_best"] = best is not None and cell["value"] == best
+        rows.append({"value": value, "cells": cells})
+
+    return {
+        "tag": tag, "label": first.display, "metric": metric,
+        "metric_label": allowed[metric],
+        "kind": "frame" if first.is_frame else "box",
+        "population_label": "images" if first.is_frame else "boxes",
+        "columns": [{
+            "label": column["label"],
+            "absent": column["index"].tag(tag) is None
+                      or not column["index"].tag(tag).usable,
+        } for column in columns],
+        "rows": rows,
+        "metrics": FRAME_METRICS if first.is_frame else BOX_METRICS,
+        "warnings": _comparability_warnings(columns),
+    }
+
+
 def _reproduction_check(computed: dict, stored: dict | None) -> dict | None:
     """Compare the unfiltered slice against the eval's own stored metrics.
 
@@ -892,30 +1655,52 @@ def report(table: MatchTable, index: TagIndex, stored_metrics: dict | None = Non
     overall_frame = image_slice_metrics(table, np.ones(table.num_images, dtype=bool))
     overall_box = gt_slice_metrics(table, np.ones(table.num_gt, dtype=bool))
 
-    breakdowns = [tag_breakdown(table, index, definition) for definition in index.tags]
-    frame_tags = [d.name for d in index.tags if d.is_frame]
-    box_tags = [d.name for d in index.tags if not d.is_frame]
+    # Only tags that can actually slice get a table. The rest are listed with
+    # the reason they cannot, which is the half of the picture this page used
+    # to leave out entirely.
+    usable = [d for d in index.tags if d.usable]
+    breakdowns = [tag_breakdown(table, index, definition) for definition in usable]
+    frame_tags = [d.name for d in usable if d.is_frame]
+    box_tags = [d.name for d in usable if not d.is_frame]
+    tags_without_data = [
+        {
+            "name": d.name, "label": d.display,
+            "kind": "frame" if d.is_frame else "box",
+            "source": d.source, "status": d.status, "detail": d.status_detail,
+        }
+        for d in index.tags if not d.usable
+    ]
 
     return {
         "overall": overall_frame,
         "overall_boxes": overall_box,
         "breakdowns": breakdowns,
+        "tags_without_data": tags_without_data,
         "frame_tags": frame_tags,
         "box_tags": box_tags,
         "tags": [
             {
-                "name": d.name, "kind": "frame" if d.is_frame else "box",
+                "name": d.name, "label": d.display,
+                "kind": "frame" if d.is_frame else "box",
+                "source": d.source, "usable": d.usable,
                 "values": d.values, "counts": d.counts,
                 "answered": d.answered, "total": d.total,
             }
-            for d in index.tags
+            for d in usable
         ],
+        "tag_sources": {
+            "annotator": sum(1 for d in index.tags if d.source == "annotator"),
+            "computed": sum(1 for d in index.tags if d.source == "auto"),
+            "without_data": len(tags_without_data),
+        },
         "coverage": {
             "images": table.num_images,
             "gt": table.num_gt,
             "images_with_tags": index.matched_images,
             "images_not_in_eval": index.unmatched_images,
             "row_mismatches": index.row_mismatches,
+            "ambiguous_filenames": index.ambiguous_filenames,
+            "match_table_version": table.version,
         },
         "score_threshold": table.score_threshold,
         "score_floor": table.score_floor,

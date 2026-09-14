@@ -213,6 +213,54 @@ def _mark_pipeline(pe, status: str, *, error: str = "", finished: bool = False):
     pe.save(update_fields=["status", "last_error", "finished_at"])
 
 
+def build_box_measures(run_id: int) -> dict:
+    """Measure a label set's boxes in the trainer, then record what it found.
+
+    Same shape as :func:`run_eval` — launch, poll, finalize — because it is the
+    same kind of work: a spawned trainer job whose progress the app can only
+    learn by asking. The measurements themselves land in the sidecar next to the
+    labels; the counters copied onto the row are just so the pass can be watched.
+    """
+    from fleet.models import DatasetMeasureRun
+
+    run = DatasetMeasureRun.objects.get(pk=run_id)
+    run.status = DatasetMeasureRun.RUNNING
+    run.started_at = timezone.now()
+    run.save(update_fields=["status", "started_at"])
+    try:
+        runner.launch_measures(run.pk, run.request_yaml_path)
+        waited = 0
+        while waited < MAX_WAIT:
+            time.sleep(POLL_INTERVAL)
+            waited += POLL_INTERVAL
+            status = runner.fetch_measures_status(run.pk)
+            progress = status.get("progress") or {}
+            if progress:
+                run.images_total = progress.get("images", run.images_total)
+                run.images_processed = progress.get("images_done", run.images_processed)
+                run.boxes_measured = progress.get("boxes", run.boxes_measured)
+                run.boxes_without_person = progress.get(
+                    "without_person", run.boxes_without_person)
+                run.save(update_fields=["images_total", "images_processed",
+                                        "boxes_measured", "boxes_without_person"])
+            state = status.get("status")
+            if state in ("finished", "unknown"):
+                break
+            if state == "failed":
+                raise RuntimeError(
+                    status.get("log_tail") or "the measuring pass failed; see the trainer log")
+    except Exception as exc:
+        run.status = DatasetMeasureRun.ERROR
+        run.error = str(exc)
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "error", "finished_at"])
+        raise
+    run.status = DatasetMeasureRun.OK
+    run.finished_at = timezone.now()
+    run.save(update_fields=["status", "finished_at"])
+    return {"run": run.pk, "boxes": run.boxes_measured}
+
+
 def run_pipeline_eval(pe_id: int) -> dict:
     """Drive one chachak pipeline eval through the trainer service's /pipeline."""
     from eval_pipelines.models import PipelineEvalRun

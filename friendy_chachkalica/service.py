@@ -169,6 +169,11 @@ class EvalRequest(BaseModel):
     request_path: str
 
 
+class MeasuresRequest(BaseModel):
+    measures_id: int
+    request_path: str
+
+
 class PipelineRequest(BaseModel):
     pipeline_id: int
     request_path: str
@@ -573,6 +578,58 @@ def eval_status(eval_id: int):
     if job is None:
         raise HTTPException(status_code=404, detail="unknown eval_id")
     return {"eval_id": eval_id, **_status_payload(job)}
+
+
+@app.post("/measures")
+def build_measures(req: MeasuresRequest):
+    """Measure a dataset's ground-truth boxes (person size, posture).
+
+    Spawned, not run inline, for the reason ``/eval`` is: the posture engine's
+    profile is a static batch of one, so a 13k-frame dataset is minutes of GPU
+    time. Holding a request open for that would block the warm-model predict
+    path behind it, give no progress and no way to stop it.
+    """
+    log = _eval_log(req.measures_id)
+    request_path = Path(req.request_path)
+    if not request_path.exists():
+        raise HTTPException(status_code=400,
+                            detail=f"measures request not found: {request_path}")
+
+    with _lock:
+        key = f"measures-{req.measures_id}"
+        existing = _jobs.get(key)
+        if existing and _job_status(existing) == "running":
+            return {"measures_id": req.measures_id, "status": "running",
+                    "pid": existing["pid"]}
+        if _active_count() >= MAX_CONCURRENT:
+            raise HTTPException(status_code=409, detail="trainer busy: another job is active")
+
+        try:
+            output_dir = Path(yaml.safe_load(request_path.read_text())["output_dir"])
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"bad measures request: {exc}")
+
+        cmd = [sys.executable, "ml/build_measures.py", str(request_path)]
+        job = _spawn(key, cmd, output_dir)
+        log.info("launched measures: pid=%s request=%s output_dir=%s",
+                 job["pid"], request_path, output_dir)
+        return {"measures_id": req.measures_id, "status": "running", "pid": job["pid"]}
+
+
+@app.get("/measures/{measures_id}")
+def measures_status(measures_id: int):
+    job = _jobs.get(f"measures-{measures_id}")
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown measures_id")
+    payload = {"measures_id": measures_id, **_status_payload(job)}
+    # The trainer has no database, so the pass reports progress by rewriting a
+    # small file; this hands the latest one back with the status.
+    progress_file = Path(job["output_dir"]) / "progress.json"
+    try:
+        payload["progress"] = json.loads(progress_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        payload["progress"] = None
+    return payload
 
 
 @app.post("/pipeline")

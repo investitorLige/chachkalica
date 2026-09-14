@@ -12,6 +12,7 @@ from fleetsite.admin_views import (
     benchmark_console_view,
     bundle_sync_view,
     class_sync_view,
+    dataset_tags_view,
 )
 
 admin.site.site_header = "Chachkalica Fleet"
@@ -38,6 +39,12 @@ urlpatterns = [
         "admin/classes/sync/",
         admin.site.admin_view(class_sync_view),
         name="class-sync",
+    ),
+    # The tag-availability panel both evaluate forms show; same rules as above.
+    path(
+        "admin/datasets/tags/",
+        admin.site.admin_view(dataset_tags_view),
+        name="dataset-tags",
     ),
     # Every project's own blank admin front — /admin/s/<slug>/, one row in
     # AdminSection per front, no code change or redeploy to add one — is NOT

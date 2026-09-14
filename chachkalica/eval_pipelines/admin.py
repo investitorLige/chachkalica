@@ -22,11 +22,17 @@ from django.http import FileResponse, Http404, HttpResponseRedirect, JsonRespons
 from django.template.loader import render_to_string
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
+from django.utils.decorators import method_decorator
+from django.views.decorators.http import require_POST
 from django.utils.http import urlencode
 from django.utils.safestring import mark_safe
 
+from fleet import admin as fleet_admin
+from fleet import jobs as fleet_jobs
 from fleet.admin import _status_badge
+from fleet.models import DatasetMeasureRun
 from fleet.services import datasets as datasets_svc
+from fleet.services import measures as measures_svc
 from fleet.services.paths import source_root
 from training import jobs
 from training.admin import _hard_image_path_from_request, _hard_image_token, _preview_index
@@ -62,13 +68,23 @@ def _hard_images_artifact(output_dir):
     return matches[0] if matches else None
 
 
+#: Said on the compare page when an eval has no match table, in place of the
+#: Tag analytics button. Naming the action beats omitting the button silently,
+#: which is indistinguishable from the feature not existing.
+NO_MATCH_TABLE_NOTE = (
+    "no match table — run “Build tag analytics data” on this eval to slice it"
+)
+
+
 def _attach_eval_links(columns):
     """Add the per-eval viewer links to each compare-page column, in place.
 
-    ``hard_images_url`` and ``tag_analytics_url`` are None when that eval has no
-    artifact behind them — an eval predating the feature, or one whose dataset
-    carries no tags — so the template can simply omit the link rather than
-    offer a page that would 404.
+    ``hard_images_url`` is None when that eval wrote no worst-images artifact.
+    ``tag_analytics_url`` now hangs on the match table alone, which is genuinely
+    the page's one requirement: tag analytics renders from the match outcomes and
+    reports whatever else is missing rather than refusing. Previously this gate
+    was right by accident and wrong in effect — a missing tag sidecar still let
+    the button through, and the page it led to then declined to render.
     """
     for column in columns:
         query = urlencode({"kind": column["kind"], "eval": column["orig_id"]})
@@ -80,6 +96,7 @@ def _attach_eval_links(columns):
         column["tag_analytics_url"] = (
             reverse("admin:eval_pipelines_combinedeval_tag_analytics") + "?" + query
         ) if has_matches else None
+        column["tag_analytics_note"] = "" if has_matches else NO_MATCH_TABLE_NOTE
     return columns
 
 
@@ -131,6 +148,11 @@ def _analyze(model_admin, request, queryset, title):
     context = {
         **model_admin.admin_site.each_context(request),
         "title": title,
+        # How the per-tag section addresses these same evals: the kind/orig_id
+        # pair every column already carries, so no new identity is invented.
+        "eval_tokens": ",".join(
+            f"{column['kind']}:{column['orig_id']}" for column in compared["columns"]),
+        "tag_compare_url": reverse("admin:eval_pipelines_combinedeval_tag_compare"),
         **compared,
     }
     return TemplateResponse(request, "admin/training/eval_analytics.html", context)
@@ -288,6 +310,17 @@ def _tag_analytics_url(eval_obj, kind: str) -> str:
     )
 
 
+#: Ceiling on a compare request. Each column parses its own match table, so a
+#: hand-edited URL asking for 200 is a way to make the box read them all.
+MAX_COMPARE_COLUMNS = 12
+
+
+def _eval_by_kind(kind: str, pk):
+    """One eval addressed as ``base:12`` / ``pipeline:7`` is."""
+    model = PipelineEvalRun if kind == CombinedEval.PIPELINE else EvalRun
+    return model.objects.filter(pk=pk).first()
+
+
 def _resolve_eval_for_tags(request):
     """The real ``EvalRun``/``PipelineEvalRun`` a tag-analytics URL points at.
 
@@ -304,13 +337,15 @@ def _resolve_eval_for_tags(request):
 
 
 def _load_tag_analysis(eval_obj):
-    """``(table, index)`` for an eval, or a string saying what is missing.
+    """``((table, index, sources), None)`` for an eval, or ``(None, fatal)``.
 
-    Two artifacts have to meet: the eval's own match table (written by the
-    trainer, or rebuilt by the "Build tag analytics data" action) and the
-    dataset's tag answers (written into the label directory by ``fleet sync``).
-    Either one absent is an ordinary state with a specific fix, so this returns
-    the explanation rather than raising — the page prints it.
+    The match table is the one hard requirement: without it there are no images,
+    no ground-truth rows and nothing to score, so its absence is the only thing
+    that blanks the page. Everything else — the annotator's tag answers, and in
+    time the measured sidecar — costs some tags and not the page, so it comes
+    back as a *source* row naming what is missing and what produces it. That is
+    the difference between "tag analytics needs annotators" and "tag analytics
+    works on every eval, and here is what would make it say more".
     """
     artifact = tag_analytics.match_table_artifact(getattr(eval_obj, "output_dir", ""))
     if artifact is None:
@@ -321,27 +356,106 @@ def _load_tag_analysis(eval_obj):
             "re-inference)."
         )
     try:
+        table = tag_analytics.load_table(artifact)
+    except (OSError, ValueError) as exc:
+        return None, f"Could not read {artifact.name}: {exc}"
+
+    detail = f"{artifact.name}, version {table.version}"
+    if table.backfilled:
+        detail += ", rebuilt from the saved predictions"
+    sources = [{
+        "key": "match_table", "label": "Match outcomes",
+        "state": "ok" if table.has_geometry else "partial",
+        "detail": detail if table.has_geometry else
+                  detail + " — no per-box geometry, so the box-size tag is unavailable",
+        "path": str(artifact),
+    }]
+
+    labels_dir = None
+    try:
         labels_dir = config_gen.resolve_label_dir(
             eval_obj.dataset, eval_obj.label_source,
             getattr(eval_obj, "annotator", None),
             getattr(eval_obj, "explicit_labels_path", "") or "",
         )
     except ValueError as exc:
-        return None, f"Cannot locate this eval's labels: {exc}"
+        sources.append({"key": "annotator_tags", "label": "Annotator answers",
+                        "state": "missing", "path": "",
+                        "detail": f"Cannot locate this eval's labels: {exc}"})
 
-    document = tag_analytics.load_tag_document(labels_dir)
-    if document is None:
-        return None, (
-            f"No annotation_tags.json next to this eval's labels ({labels_dir}). "
-            "Tag answers land there when the dataset's annotator projects are "
-            "synced — define tags on the dataset, sync, and re-run or rebuild."
+    document = tag_analytics.load_tag_document(labels_dir) if labels_dir else None
+    specs = datasets_svc.dataset_tag_specs(eval_obj.dataset)
+    reasons = {}
+    if labels_dir is not None:
+        if document is None:
+            missing = (
+                f"No annotation_tags.json next to this eval's labels ({labels_dir}). "
+                "Tag answers land there when the dataset's annotator projects are "
+                "synced — define tags on the dataset, sync, and re-run or rebuild."
+            )
+            sources.append({"key": "annotator_tags", "label": "Annotator answers",
+                            "state": "missing", "detail": missing,
+                            "path": str(labels_dir)})
+            # Every declared tag is missing for the same one reason; saying it
+            # per tag beats making the reader infer it from an absence.
+            reasons = {str(spec["name"]): missing for spec in specs}
+        else:
+            sources.append({
+                "key": "annotator_tags", "label": "Annotator answers", "state": "ok",
+                "detail": f"{len(document.get('tags') or [])} tag(s) answered over "
+                          f"{len(document.get('images') or {})} image(s)",
+                "path": str(labels_dir),
+            })
+
+    # Image measurements are a property of the dataset, not of any one eval or
+    # label set, so they are looked up by dataset rather than beside the labels.
+    measures = measures_svc.load(eval_obj.dataset.name)
+    state, detail = measures_svc.freshness(eval_obj.dataset.name, measures)
+    sources.append({
+        "key": "measures", "label": "Image measurements",
+        "state": "ok" if state == "ok" else ("partial" if state == "stale" else "missing"),
+        "detail": detail,
+        "path": str(measures_svc.measures_path(eval_obj.dataset.name)),
+    })
+    if state == "stale":
+        # Still describes the frames it was taken from, so it is offered with a
+        # warning rather than thrown away.
+        for _name, _key, label, _unit in tag_analytics.IMAGE_MEASURE_TAGS:
+            reasons.setdefault(label, detail)
+
+    box_measures = tag_analytics.load_box_measures(labels_dir) if labels_dir else None
+    if box_measures is None:
+        box_detail = (
+            "Person size and pose have not been measured for this label set. "
+            "This one needs the trainer's GPU — a person detector and the posture "
+            "engine over each frame once."
         )
+        box_state = "missing"
+    elif not box_measures.get("complete", True):
+        done = (box_measures.get("totals") or {}).get("images_done", "?")
+        total = (box_measures.get("totals") or {}).get("images", "?")
+        box_state = "partial"
+        box_detail = (
+            f"Measured {done} of {total} frame(s) before the pass was stopped. The "
+            "buckets below are cut over what it did measure, which is a smaller "
+            "population than the eval."
+        )
+    else:
+        totals = box_measures.get("totals") or {}
+        box_state = "ok"
+        box_detail = (
+            f"{totals.get('boxes', 0)} box(es) measured against "
+            f"{box_measures.get('person_source', 'unknown')} person boxes; "
+            f"{totals.get('without_person', 0)} had no person around them"
+        )
+    sources.append({"key": "box_measures", "label": "Box measures (person / pose)",
+                    "state": box_state, "detail": box_detail,
+                    "path": str(labels_dir or "")})
 
-    try:
-        table = tag_analytics.load_table(artifact)
-    except (OSError, ValueError) as exc:
-        return None, f"Could not read {artifact.name}: {exc}"
-    return (table, tag_analytics.build_tag_index(table, document)), None
+    index = tag_analytics.build_tag_index(
+        table, document, declared_specs=specs, measures=measures,
+        box_measures=box_measures, reasons=reasons)
+    return (table, index, sources), None
 
 
 class TagAnalyticsMixin:
@@ -552,6 +666,10 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin,
                  name="eval_pipelines_combinedeval_tag_analytics"),
             path("tag-analytics/data/", self.admin_site.admin_view(self.tag_analytics_data),
                  name="eval_pipelines_combinedeval_tag_analytics_data"),
+            path("tag-analytics/compare/", self.admin_site.admin_view(self.tag_compare_data),
+                 name="eval_pipelines_combinedeval_tag_compare"),
+            path("tag-analytics/measure/", self.admin_site.admin_view(self.tag_measure),
+                 name="eval_pipelines_combinedeval_tag_measure"),
             path("hard-images/", self.admin_site.admin_view(self.hard_images_view),
                  name="eval_pipelines_combinedeval_hard_images"),
             path("hard-images/image/", self.admin_site.admin_view(self.hard_images_image),
@@ -584,14 +702,118 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin,
             "title": f"Tag analytics — {eval_obj}",
             "subject_name": str(eval_obj),
             "dataset": eval_obj.dataset.name,
-            "problem": problem,
+            "fatal": problem,
             "query": urlencode({"kind": kind, "eval": eval_obj.pk}),
             "data_url": reverse("admin:eval_pipelines_combinedeval_tag_analytics_data"),
+            "measure_url": reverse("admin:eval_pipelines_combinedeval_tag_measure"),
         }
         if loaded is not None:
-            table, index = loaded
+            table, index, sources = loaded
+            context["sources"] = sources
             context["report"] = tag_analytics.report(table, index, eval_obj.metrics)
         return TemplateResponse(request, "admin/eval_pipelines/tag_analytics.html", context)
+
+    @method_decorator(require_POST)
+    def tag_measure(self, request):
+        """Queue an image-measurement pass for this eval's dataset, then come back.
+
+        The person looking at a "not measured yet" row is exactly the person who
+        wants it measured; making them find the Datasets list and remember which
+        dataset this eval used is a detour with no purpose. The bulk path stays
+        on the Dataset action.
+
+        POST because it starts work — a URL someone pasted should not.
+        """
+        eval_obj, kind = _resolve_eval_for_tags(request)
+        wanted = request.POST.get("measure_kind") or DatasetMeasureRun.IMAGE
+        if wanted == DatasetMeasureRun.BOX:
+            run = DatasetMeasureRun.objects.create(
+                dataset=eval_obj.dataset, kind=DatasetMeasureRun.BOX,
+                label_source=eval_obj.label_source,
+                annotator=getattr(eval_obj, "annotator", None),
+                explicit_labels_path=getattr(eval_obj, "explicit_labels_path", "") or "",
+            )
+            try:
+                config_gen.write_measures_request(run)
+            except (ValueError, FileNotFoundError, RuntimeError) as exc:
+                run.delete()
+                messages.error(request, f"Cannot measure this label set: {exc}")
+                return HttpResponseRedirect(_tag_analytics_url(eval_obj, kind))
+            _queue().enqueue(jobs.build_box_measures, run.pk, job_timeout=jobs.JOB_TIMEOUT)
+            messages.info(
+                request,
+                f"Measuring {run.labels_dir_snapshot} against "
+                f"{run.person_source} person boxes — it takes the trainer's one job "
+                "slot, so queued evals will wait. Track it under Fleet > Image "
+                "measures runs, then reload this page.",
+            )
+            return HttpResponseRedirect(_tag_analytics_url(eval_obj, kind))
+
+        run = DatasetMeasureRun.objects.create(dataset=eval_obj.dataset)
+        django_rq.get_queue("default").enqueue(
+            fleet_jobs.measure_dataset_images, run.id,
+            job_timeout=fleet_admin.MEASURE_JOB_TIMEOUT)
+        messages.info(
+            request,
+            f"Measuring {eval_obj.dataset.name}'s images — track it under "
+            "Fleet > Image measures runs, then reload this page.",
+        )
+        return HttpResponseRedirect(_tag_analytics_url(eval_obj, kind))
+
+    def tag_compare_data(self, request):
+        """One tag's slices scored across several evals, as JSON.
+
+        ``?evals=base:12,pipeline:7`` — the ``kind``/``orig_id`` pair the compare
+        page's columns already carry. ``?mode=tags`` lists what can be compared;
+        otherwise ``&tag=&metric=`` fills the grid.
+
+        Lazy on purpose. Each column parses its own match table (tens of MB on a
+        large eval), so doing this on page load would make the compare page pay
+        for a section most visits never open.
+        """
+        columns, notes = [], []
+        for token in (request.GET.get("evals") or "").split(","):
+            kind, _, pk = token.strip().partition(":")
+            if not pk:
+                continue
+            if len(columns) >= MAX_COMPARE_COLUMNS:
+                notes.append(f"Only the first {MAX_COMPARE_COLUMNS} evals were compared.")
+                break
+            eval_obj = _eval_by_kind(kind, pk)
+            if eval_obj is None:
+                continue
+            loaded, problem = _load_tag_analysis(eval_obj)
+            if loaded is None:
+                notes.append(f"#{pk}: {problem}")
+                continue
+            table, index, _sources = loaded
+            columns.append({
+                "label": eval_obj.model_label(), "dataset": eval_obj.dataset.name,
+                "table": table, "index": index,
+            })
+
+        if not columns:
+            return JsonResponse(
+                {"error": "; ".join(notes) or "No comparable evals were named."}, status=400)
+
+        if request.GET.get("mode") == "tags":
+            return JsonResponse({
+                "tags": tag_analytics.comparable_tags(columns),
+                "columns": [column["label"] for column in columns],
+                # The metric list follows the chosen tag's scope, and the page
+                # needs both lists before the first grid is built.
+                "frame_metrics": tag_analytics.FRAME_METRICS,
+                "box_metrics": tag_analytics.BOX_METRICS,
+                "notes": notes,
+            })
+
+        try:
+            payload = tag_analytics.compare_tag(
+                columns, request.GET.get("tag", ""), request.GET.get("metric", ""))
+        except tag_analytics.UnknownClause as exc:
+            return JsonResponse({"error": str(exc)}, status=400)
+        payload["notes"] = notes
+        return JsonResponse(payload)
 
     def tag_analytics_data(self, request):
         """Score one operator-built slice, or one cross-tab, as JSON.
@@ -604,7 +826,7 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin,
         loaded, problem = _load_tag_analysis(eval_obj)
         if loaded is None:
             return JsonResponse({"error": problem}, status=400)
-        table, index = loaded
+        table, index, _sources = loaded
 
         try:
             if request.GET.get("mode") == "cross":

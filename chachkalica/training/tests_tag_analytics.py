@@ -46,6 +46,18 @@ def _table(**overrides) -> dict:
     return table
 
 
+def _table_v2(**overrides) -> dict:
+    """The same table, at the version that also records each box's extent."""
+    table = _table(version=2)
+    table["gt"] = {
+        **table["gt"],
+        "w": [0.1, 0.2, 0.3, 0.4, 0.5],
+        "h": [0.1, 0.2, 0.3, 0.4, 0.5],
+    }
+    table.update(overrides)
+    return table
+
+
 def _tags(**overrides) -> dict:
     document = {
         "version": 1,
@@ -295,10 +307,36 @@ class JoinIntegrityTests(TagAnalyticsSetup):
 
     def test_a_future_table_version_is_refused_rather_than_misread(self):
         path = self.root / "eval_matches.json"
-        path.write_text(json.dumps(_table(version=2)), encoding="utf-8")
+        path.write_text(json.dumps(_table(version=3)), encoding="utf-8")
 
         with self.assertRaises(ValueError):
             tag_analytics.load_table(path)
+
+    def test_the_version_that_carries_box_geometry_is_read(self):
+        table, _index = self.load(table=_table_v2())
+
+        self.assertEqual(table.version, 2)
+        self.assertTrue(table.has_geometry)
+
+    def test_a_version_one_table_reads_with_the_geometry_simply_unknown(self):
+        table, _index = self.load()
+
+        self.assertEqual(table.version, 1)
+        self.assertFalse(table.has_geometry)
+        self.assertEqual(table.gt_w.size, table.num_gt)
+
+    def test_a_truncated_ground_truth_column_is_refused_not_zipped_past(self):
+        # A short column would silently pair a class with another box's row and
+        # mis-tag every box after it, which no later check would notice.
+        broken = _table()
+        broken["gt"]["row"] = broken["gt"]["row"][:-1]
+        path = self.root / "eval_matches.json"
+        path.write_text(json.dumps(broken), encoding="utf-8")
+
+        with self.assertRaises(ValueError) as caught:
+            tag_analytics.load_table(path)
+
+        self.assertIn("gt.row", str(caught.exception))
 
 
 class ArtifactDiscoveryTests(TagAnalyticsSetup):
@@ -312,3 +350,291 @@ class ArtifactDiscoveryTests(TagAnalyticsSetup):
     def test_a_directory_without_one_is_simply_none(self):
         self.assertIsNone(tag_analytics.match_table_artifact(self.root))
         self.assertIsNone(tag_analytics.match_table_artifact(""))
+
+
+class TercileBucketTests(TestCase):
+    """Cutting a measure into low/medium/high without inventing empty rows."""
+
+    def test_a_spiky_discrete_measure_still_yields_three_populated_buckets(self):
+        # 80% of frames hold exactly one box, so the 33rd and 66th percentiles
+        # are both 1.0 and a naive tercile leaves the middle bucket empty.
+        result = tag_analytics.tercile_buckets(
+            np.array([1.0] * 80 + [2.0] * 10 + [3.0] * 10))
+
+        counts = {cut["value"]: cut["count"] for cut in result["cuts"]}
+        self.assertEqual(counts, {"low": 80, "medium": 10, "high": 10})
+
+    def test_a_continuous_measure_cuts_where_the_percentiles_do(self):
+        values = np.linspace(0.0, 1.0, 3000)
+
+        result = tag_analytics.tercile_buckets(values)
+
+        self.assertAlmostEqual(result["cuts"][0]["max"],
+                               float(np.quantile(values, 1 / 3)), places=2)
+        self.assertAlmostEqual(result["cuts"][1]["max"],
+                               float(np.quantile(values, 2 / 3)), places=2)
+
+    def test_a_constant_measure_says_so_rather_than_showing_one_full_width_row(self):
+        result = tag_analytics.tercile_buckets(np.full(50, 4.0))
+
+        self.assertEqual(result["degenerate"], "constant")
+        self.assertEqual(len(result["cuts"]), 1)
+
+    def test_two_distinct_values_give_two_buckets_not_an_empty_middle(self):
+        result = tag_analytics.tercile_buckets(np.array([1.0] * 30 + [7.0] * 70))
+
+        self.assertEqual([cut["value"] for cut in result["cuts"]], ["low", "high"])
+        self.assertTrue(all(cut["count"] for cut in result["cuts"]))
+
+    def test_entries_with_no_value_are_left_unbucketed(self):
+        result = tag_analytics.tercile_buckets(
+            np.array([1.0, 5.0, 9.0, 0.0]),
+            np.array([True, True, True, False]),
+        )
+
+        self.assertEqual(int(result["assignment"][3]), -1)
+
+
+class AutomaticTagTests(TagAnalyticsSetup):
+    """Slices nobody had to annotate."""
+
+    def _bare(self, table=None):
+        path = self.root / "eval_matches.json"
+        path.write_text(json.dumps(table or _table()), encoding="utf-8")
+        loaded = tag_analytics.load_table(path)
+        return loaded, tag_analytics.build_tag_index(loaded)
+
+    def test_crowding_works_with_no_tag_sidecar_at_all(self):
+        _table_obj, index = self._bare()
+
+        crowding = index.tag("auto:crowding")
+
+        self.assertEqual(crowding.source, "auto")
+        # img0 holds two boxes; the other three hold one each.
+        self.assertEqual(crowding.counts["low"], 3)
+        self.assertEqual(crowding.counts["high"], 1)
+
+    def test_a_crowding_slice_scores_the_images_it_names(self):
+        table, index = self._bare()
+
+        busiest = tag_analytics.slice_metrics(table, index, [("auto:crowding", "high")])
+
+        self.assertEqual(busiest["images"], 1)
+        self.assertEqual(busiest["gt"], 2)
+
+    def test_box_size_says_which_action_unlocks_it_when_geometry_is_missing(self):
+        _table_obj, index = self.load()
+
+        box_size = index.tag("auto:box size")
+
+        self.assertEqual(box_size.status, "unavailable")
+        self.assertFalse(box_size.usable)
+        self.assertIn("Build tag analytics data", box_size.status_detail)
+
+    def test_box_size_buckets_every_box_once_the_table_carries_geometry(self):
+        _table_obj, index = self.load(table=_table_v2())
+
+        box_size = index.tag("auto:box size")
+
+        self.assertEqual(box_size.status, "ok")
+        self.assertEqual(sum(box_size.counts.values()), 5)
+        self.assertTrue(box_size.cuts)
+
+    def test_the_agreement_check_still_holds_with_computed_tags_present(self):
+        table, index = self.load(table=_table_v2())
+
+        report = tag_analytics.report(
+            table, index, {"map50": 0.55, "precision": 0.75, "recall": 0.6})
+
+        self.assertTrue(report["check"]["agrees"])
+
+
+class EveryTagIsListedTests(TagAnalyticsSetup):
+    """What could this eval have been sliced by — including the answer 'nothing'."""
+
+    _SHIFT = [{"name": "shift", "scope": "frame", "widget": "radio",
+               "choices": ["day", "night"], "max_rating": 5}]
+
+    def _with_choices(self, *choices):
+        tags = _tags()
+        tags["tags"][0]["choices"] = list(choices)
+        return self.load(tags=tags)
+
+    def test_a_declared_option_nobody_picked_is_a_zero_row_not_a_missing_one(self):
+        _table_obj, index = self._with_choices("sun", "rain", "hail")
+
+        weather = index.tag("weather")
+
+        self.assertIn("hail", weather.values)
+        self.assertEqual(weather.counts["hail"], 0)
+
+    def test_a_zero_row_can_still_be_scored_rather_than_refused(self):
+        table, index = self._with_choices("sun", "rain", "hail")
+
+        empty = tag_analytics.slice_metrics(table, index, [("weather", "hail")])
+
+        self.assertEqual(empty["images"], 0)
+
+    def test_a_tag_defined_on_the_dataset_but_never_synced_is_listed_with_why(self):
+        table, _index = self.load()
+        index = tag_analytics.build_tag_index(
+            table, _tags(), declared_specs=self._SHIFT)
+
+        shift = index.tag("shift")
+
+        self.assertEqual(shift.status, "unsynced")
+        self.assertFalse(shift.usable)
+        self.assertIn("sync", shift.status_detail.lower())
+
+    def test_a_tag_with_no_data_is_reported_rather_than_dropped(self):
+        table, _index = self.load()
+        index = tag_analytics.build_tag_index(
+            table, _tags(), declared_specs=self._SHIFT)
+
+        report = tag_analytics.report(table, index)
+
+        self.assertIn("shift", {e["name"] for e in report["tags_without_data"]})
+        self.assertNotIn("shift", {b["name"] for b in report["breakdowns"]})
+
+    def test_a_value_neither_declared_nor_observed_is_still_refused(self):
+        table, index = self.load()
+
+        with self.assertRaises(tag_analytics.UnknownClause):
+            tag_analytics.slice_metrics(table, index, [("weather", "hail")])
+
+    def test_a_frame_slice_with_no_ground_truth_reports_undefined_not_zero(self):
+        # Empty frames are real and attract false positives, so the row stays --
+        # but a mean over no boxes is 0.0, which would read as a catastrophic
+        # mAP rather than an undefined one.
+        only_img0_has_boxes = _table()
+        only_img0_has_boxes["gt"] = {"image": [0, 0], "class": [0, 0], "row": [0, 1]}
+        only_img0_has_boxes["pred"] = {"image": [0, 3], "class": [0, 0],
+                                       "score": [0.9, 0.8], "iou": [0.9, 0.0],
+                                       "gt": [0, -1]}
+        table, index = self.load(table=only_img0_has_boxes)
+
+        breakdown = tag_analytics.tag_breakdown(
+            table, index, index.tag("auto:crowding"))
+        barren = next(r for r in breakdown["rows"] if r["gt"] == 0)
+
+        self.assertTrue(barren["no_ground_truth"])
+        self.assertIsNone(barren["delta"])
+
+
+class BoxMeasureTests(TagAnalyticsSetup):
+    """Person size and pose, joined to ground-truth boxes by row."""
+
+    def _document(self, **overrides):
+        document = {
+            "version": 1, "kind": "box", "complete": True,
+            "person_source": "rtmo",
+            "measures": [{"name": "pose", "kind": "categorical",
+                          "choices": ["standing", "sitting", "lying", "(no person)"]},
+                         {"name": "person size ratio", "kind": "numeric"}],
+            "images": {
+                "img0.jpg": {"boxes": [
+                    {"row": 0, "class_id": 0,
+                     "values": {"pose": "standing", "person size ratio": 0.05}},
+                    {"row": 1, "class_id": 0,
+                     "values": {"pose": "sitting", "person size ratio": 0.30}},
+                ]},
+                "img1.jpg": {"boxes": [
+                    {"row": 0, "class_id": 0,
+                     "values": {"pose": "standing", "person size ratio": 0.12}},
+                ]},
+                "img2.jpg": {"boxes": [
+                    {"row": 0, "class_id": 0, "values": {"pose": "(no person)"}},
+                ]},
+                "img3.jpg": {"boxes": [
+                    {"row": 0, "class_id": 0,
+                     "values": {"pose": "lying", "person size ratio": 0.45}},
+                ]},
+            },
+        }
+        document.update(overrides)
+        return document
+
+    def _index(self, document=None):
+        table, _index = self.load()
+        return table, tag_analytics.build_tag_index(
+            table, _tags(), box_measures=document or self._document())
+
+    def test_pose_becomes_a_box_slice(self):
+        _table, index = self._index()
+
+        pose = index.tag(tag_analytics.POSE_TAG)
+
+        self.assertEqual(pose.source, "auto")
+        self.assertEqual(pose.counts["standing"], 2)
+        self.assertEqual(pose.counts["sitting"], 1)
+        self.assertEqual(pose.counts["lying"], 1)
+
+    def test_a_box_with_nobody_around_it_is_its_own_bucket(self):
+        _table, index = self._index()
+
+        pose = index.tag(tag_analytics.POSE_TAG)
+
+        # Distinct from "not measured": the pass looked and found nobody.
+        self.assertEqual(pose.counts[tag_analytics.NO_PERSON], 1)
+        self.assertNotIn(tag_analytics.UNMEASURED, pose.counts)
+
+    def test_a_posture_nobody_struck_is_a_zero_row(self):
+        document = self._document()
+        for entry in document["images"].values():
+            for box in entry["boxes"]:
+                box["values"]["pose"] = "standing"
+        _table, index = self._index(document)
+
+        pose = index.tag(tag_analytics.POSE_TAG)
+
+        self.assertIn("lying", pose.values)
+        self.assertEqual(pose.counts["lying"], 0)
+
+    def test_person_size_is_bucketed_over_the_boxes_that_have_one(self):
+        _table, index = self._index()
+
+        size = index.tag(tag_analytics.PERSON_SIZE_TAG)
+
+        self.assertEqual(size.status, "ok")
+        # Four ratios, one box with no person and therefore no ratio.
+        self.assertEqual(size.counts[tag_analytics.UNMEASURED], 1)
+        self.assertEqual(sum(cut["count"] for cut in size.cuts), 4)
+
+    def test_a_pose_slice_can_be_scored(self):
+        table, index = self._index()
+
+        standing = tag_analytics.slice_metrics(
+            table, index, [(tag_analytics.POSE_TAG, "standing")])
+
+        self.assertEqual(standing["kind"], "box")
+        self.assertEqual(standing["gt"], 2)
+
+    def test_a_drifted_row_drops_that_image_rather_than_mislabelling_it(self):
+        document = self._document()
+        # The sidecar thinks img0's boxes are class 7; the labels say 0.
+        for box in document["images"]["img0.jpg"]["boxes"]:
+            box["class_id"] = 7
+        _table, index = self._index(document)
+
+        pose = index.tag(tag_analytics.POSE_TAG)
+
+        # img0's two boxes are left unmeasured rather than attributed to
+        # whatever now sits on those lines.
+        self.assertEqual(pose.counts["standing"], 1)
+        self.assertEqual(pose.counts["sitting"], 0)
+
+    def test_the_no_person_bucket_keeps_its_exact_spelling(self):
+        # friendy_chachkalica/ml/build_measures.py writes this string and pins
+        # the same literal. The two cannot import each other (no torch here, no
+        # Django there), so a drift would split one bucket into two that look
+        # identical on the page.
+        self.assertEqual(tag_analytics.NO_PERSON, "(no person)")
+
+    def test_without_a_sidecar_both_tags_name_the_pass_that_makes_one(self):
+        table, _index = self.load()
+        index = tag_analytics.build_tag_index(table, _tags())
+
+        for name in (tag_analytics.POSE_TAG, tag_analytics.PERSON_SIZE_TAG):
+            definition = index.tag(name)
+            self.assertEqual(definition.status, "unavailable")
+            self.assertIn("Measure box statistics", definition.status_detail)

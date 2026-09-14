@@ -408,6 +408,78 @@ class GroundingSamRun(models.Model):
         return f"{self.dataset.name} — {self.status}"
 
 
+class DatasetMeasureRun(models.Model):
+    """One measuring pass over a dataset.
+
+    Exists for the same reason :class:`GroundingSamRun` does: the work is a walk
+    over tens of thousands of frames, and an operator watching it needs to tell
+    "never run" from "running, 40% through" from "died on image 12,003". The
+    measurements themselves do not live here — they go in the dataset's own
+    sidecar (``fleet.services.measures``), because they outlive any one run and
+    are read by every later eval of that dataset.
+    """
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    OK = "ok"
+    ERROR = "error"
+    STATUS_CHOICES = [(QUEUED, "queued"), (RUNNING, "running"), (OK, "ok"), (ERROR, "error")]
+
+    #: Two passes, one row shape. The image pass is a decode and a histogram and
+    #: runs here; the box pass needs a person detector and the posture engine and
+    #: runs in the trainer. They differ in where they run and what they write,
+    #: not in what an operator needs to watch.
+    IMAGE = "image"
+    BOX = "box"
+    KIND_CHOICES = [(IMAGE, "image statistics (brightness / contrast)"),
+                    (BOX, "box measures (person size / pose)")]
+
+    dataset = models.ForeignKey(
+        Dataset, on_delete=models.CASCADE, related_name="measure_runs")
+    kind = models.CharField(max_length=16, choices=KIND_CHOICES, default=IMAGE)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=QUEUED)
+    error = models.TextField(blank=True)
+
+    images_total = models.PositiveIntegerField(default=0)
+    images_processed = models.PositiveIntegerField(default=0)
+    images_failed = models.PositiveIntegerField(default=0)
+    #: The image-set digest this pass wrote, so a later read can tell whether
+    #: the dataset has moved on since.
+    signature = models.CharField(max_length=64, blank=True)
+
+    # --- box pass only -----------------------------------------------------
+    # Box measures are keyed by a label file's line numbers, so unlike the image
+    # pass they belong to one label set rather than to the dataset.
+    label_source = models.CharField(max_length=16, blank=True)
+    annotator = models.ForeignKey(
+        "fleet.Annotator", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="+")
+    explicit_labels_path = models.CharField(max_length=1024, blank=True)
+    labels_dir_snapshot = models.CharField(max_length=1024, blank=True)
+    person_source = models.CharField(max_length=32, blank=True)
+    request_yaml_path = models.CharField(max_length=1024, blank=True)
+    output_dir = models.CharField(max_length=1024, blank=True)
+    boxes_measured = models.PositiveIntegerField(default=0)
+    boxes_without_person = models.PositiveIntegerField(default=0)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "image measures run"
+        verbose_name_plural = "image measures runs"
+
+    def __str__(self) -> str:
+        return f"{self.dataset.name} [{self.kind}] — {self.status}"
+
+    def progress(self) -> str:
+        if not self.images_total:
+            return "—"
+        return f"{self.images_processed} / {self.images_total}"
+
+
 class DatasetInferenceRun(models.Model):
     """One "Run model inference…" over a dataset: a model applied image by image
     to a dataset's frames, timed.
