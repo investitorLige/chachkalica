@@ -854,6 +854,14 @@ class EvaluatedModelSource(models.Model):
                   "model_source is 'bundle'; the bundle's manifest supplies the model, "
                   "the detector and the whole pipeline geometry.",
     )
+    class_map = models.JSONField(
+        default=dict, blank=True,
+        help_text="Optional {dataset class name: model class name} translation applied "
+                  "to the ground truth before scoring. A name mapped to null/\"\" is "
+                  "dropped from the eval entirely. Empty (the default) scores the "
+                  "dataset's classes exactly as they are — which only produces a "
+                  "number when the model shares their names.",
+    )
     # Kept as text beside the FK so a finished eval still says what it scored
     # after the catalogue entry, artifact or bundle behind it is gone — and so a
     # changelist of artifact evals is readable without resolving paths.

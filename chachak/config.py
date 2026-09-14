@@ -60,6 +60,12 @@ class PipelineConfig:
     # name and merged per image before scoring (see run.py:run_pipeline). Empty
     # for an ordinary single-model pipeline eval.
     extra_checkpoints: List[Path] = field(default_factory=list)
+    # Translates the dataset's class names into the model's before scoring, so a
+    # test set labelled in a finer taxonomy than the model predicts can be scored
+    # at all: {handgun: gun, rifle: gun, bat: null} collapses two classes onto one
+    # and drops the third. Empty (the ordinary case) is an exact identity. Applied
+    # by ``metrics.apply_class_map`` in run.py; see friendy_chachkalica/metrics.py.
+    class_map: Dict[str, Optional[str]] = field(default_factory=dict)
 
 
 # ── Config predicates ────────────────────────────────────────────────────────
@@ -103,6 +109,26 @@ def _parse_classes(value: Any) -> Dict[int, str]:
     if isinstance(value, dict):
         return {int(cid): str(name) for cid, name in value.items()}
     raise ValueError("classes must be a list or mapping")
+
+
+def _parse_class_map(value: Any) -> Dict[str, Optional[str]]:
+    """Normalize the optional ``class_map`` block: ``{name: name-or-null}``.
+
+    A blank string is stored as ``None`` so "drop this class" has one spelling
+    by the time it reaches ``apply_class_map`` — YAML and an HTML form disagree
+    about how to write an absent value, and the difference stops here.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("class_map must be a mapping of dataset class name -> model class name")
+    parsed: Dict[str, Optional[str]] = {}
+    for key, mapped in value.items():
+        if mapped is None or str(mapped).strip() == "":
+            parsed[str(key)] = None
+        else:
+            parsed[str(key)] = str(mapped).strip()
+    return parsed
 
 
 def _require(raw: Dict[str, Any], key: str) -> Any:
@@ -216,6 +242,14 @@ def pipeline_config_from_dict(raw: Dict[str, Any], base_dir: Path) -> PipelineCo
         _resolve_path(checkpoint, base_dir) for checkpoint in (raw.get("extra_checkpoints") or [])
     ]
 
+    class_map = _parse_class_map(raw.get("class_map"))
+    unknown = sorted(set(class_map) - set(classes.values()))
+    if unknown:
+        raise ValueError(
+            f"class_map names classes the dataset does not have: {unknown}. "
+            f"Its classes are {sorted(classes.values())}."
+        )
+
     config = PipelineConfig(
         name=name,
         pipeline=pipeline,
@@ -232,6 +266,7 @@ def pipeline_config_from_dict(raw: Dict[str, Any], base_dir: Path) -> PipelineCo
             None if raw.get("map_score_threshold") is None
             else float(raw.get("map_score_threshold"))
         ),
+        class_map=class_map,
         iou_thresholds=iou_thresholds,
         merge_nms_iou=float(raw.get("merge_nms_iou", 0.5)),
         tiling=_parse_tiling(raw.get("tiling")),

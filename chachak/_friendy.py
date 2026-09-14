@@ -36,6 +36,7 @@ from friendy_chachkalica.data import (  # noqa: E402
 )
 from friendy_chachkalica.metrics import (  # noqa: E402
     EVAL_HARD_IMAGES_FRACTION,
+    apply_class_map,
     evaluate_detection,
     remap_raw_predictions_to_eval_classes,
 )
@@ -61,6 +62,7 @@ __all__ = [
     "build_eval_dataloader",
     "detection_collate_fn",
     "EVAL_HARD_IMAGES_FRACTION",
+    "apply_class_map",
     "evaluate_detection",
     "remap_raw_predictions_to_eval_classes",
     "resolve_device",

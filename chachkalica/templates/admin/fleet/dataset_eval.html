@@ -42,6 +42,37 @@ annotation tag, or promoted to labels.</p>
      this eval's operating point; the rows below are the scoring's own. #}
   {% include "admin/videos/_inference_fields.html" %}
 
+  {# The class-space check. Optional by construction: leave it alone and no
+     class_map fields are posted, which is the eval this form always queued. #}
+  <div class="form-row" data-class-sync="{{ class_sync_url }}"
+       data-class-dataset="{{ dataset.pk }}">
+    <label>Classes:</label>
+    <p>
+      <input type="button" class="button" value="Check classes" data-class-button>
+    </p>
+    <div data-class-report
+         style="margin-top:8px;font-family:monospace;font-size:11px;line-height:1.6"></div>
+    <div data-class-table style="font-size:11px"></div>
+    <p class="help">
+      {% if dataset_class_names %}
+        An eval matches predictions to ground truth <strong>by class name</strong> and
+        drops anything the two class spaces don&rsquo;t share — so a model that names its
+        classes differently from
+        <code>{{ dataset.name }}</code> ({{ dataset_class_names|join:", " }}) scores
+        <em>nothing</em>: every box dropped and 0.0 for every metric, which reads exactly
+        like a model that detects nothing. Press <strong>Check classes</strong> to see how
+        the two line up; if they don&rsquo;t, map each of this dataset&rsquo;s classes onto
+        one the model predicts (several may collapse onto the same one — a
+        <code>handgun</code>/<code>rifle</code>/<code>knife</code> test set onto a
+        single-class <code>gun</code> detector), or drop the ones it cannot predict.
+        Skip this entirely and the eval runs on the dataset&rsquo;s classes as-is.
+      {% else %}
+        No <code>classes.txt</code> under <code>{{ dataset.name }}</code>, so there is
+        nothing to compare or map.
+      {% endif %}
+    </p>
+  </div>
+
   <div class="form-row">
     <label for="map_score_threshold">mAP confidence floor:</label>
     <input type="number" name="map_score_threshold" id="map_score_threshold"
@@ -90,4 +121,5 @@ annotation tag, or promoted to labels.</p>
 </form>
 
 {% include "admin/videos/_inference_scripts.html" %}
+<script src="{% static 'training/class_sync.js' %}"></script>
 {% endblock %}

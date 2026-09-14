@@ -7,7 +7,7 @@ Django resolves against this — so nothing here needs to know about it.
 from django.urls import path
 
 from admin_sections.sites import section_site
-from fleetsite.admin_views import bundle_sync_view
+from fleetsite.admin_views import bundle_sync_view, class_sync_view
 
 urlpatterns = [
     # A handful of ModelAdmins (videos, cameras) call reverse("bundle-sync")
@@ -16,5 +16,6 @@ urlpatterns = [
     # too. Must precede the catch-all site.urls below for the same
     # prefix-shadowing reason fleetsite/urls.py documents for the main site.
     path("bundles/sync/", section_site.admin_view(bundle_sync_view), name="bundle-sync"),
+    path("classes/sync/", section_site.admin_view(class_sync_view), name="class-sync"),
     path("", section_site.urls),
 ]

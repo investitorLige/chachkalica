@@ -28,6 +28,7 @@ try:
         _write_hard_images,
         _write_match_table,
         _write_yaml,
+        apply_class_map,
         build_eval_dataloader,
         evaluate_detection,
         remap_raw_predictions_to_eval_classes,
@@ -53,6 +54,7 @@ except ImportError:  # run as a flat script
         _write_hard_images,
         _write_match_table,
         _write_yaml,
+        apply_class_map,
         build_eval_dataloader,
         evaluate_detection,
         remap_raw_predictions_to_eval_classes,
@@ -144,13 +146,17 @@ def run_pipeline(config) -> Dict[str, Any]:
             "names (train_dataset.classes), so predictions cannot be remapped by name "
             "onto the eval classes. Re-train (or re-save the checkpoint) with class names."
         )
+    # The dataset's classes translated into the model's, so a test set labelled
+    # in a finer taxonomy than the model predicts is scorable. Without a
+    # class_map both come back as config.classes and this is an identity.
+    target_classes, eval_classes = apply_class_map(config.classes, config.class_map)
     result = pipeline.run(
         loader,
         config.output_dir,
         num_classes=num_classes,
         prediction_classes=train_classes,
-        target_classes=config.classes,
-        eval_classes=config.classes,
+        target_classes=target_classes,
+        eval_classes=eval_classes,
         compute_metrics=config.labels is not None,
     )
 
@@ -166,6 +172,8 @@ def run_pipeline(config) -> Dict[str, Any]:
         "predictions": str(result["prediction_path"]),
         "metrics": result["metrics"],
     }
+    if config.class_map:
+        output["class_map"] = dict(config.class_map)
     result_path = Path(config.output_dir) / "result.yaml"
     _write_yaml(result_path, _to_builtin(output))
     print(f"[chachak] Wrote result: {result_path}")
@@ -213,6 +221,12 @@ def run_combined_pipeline(config) -> Dict[str, Any]:
             )
         runtimes.append((pipeline, train_classes))
 
+    # As in run_pipeline: the eval space is the dataset's classes translated
+    # through the operator's class_map, an identity when there isn't one. The
+    # DatasetConfig below keeps the dataset's own space — that is what the
+    # loader validates the raw label ids against.
+    target_classes, eval_classes = apply_class_map(config.classes, config.class_map)
+
     dataset_config = DatasetConfig(
         name=f"{config.name}-data",
         images=config.images,
@@ -223,7 +237,7 @@ def run_combined_pipeline(config) -> Dict[str, Any]:
     experiment = ExperimentConfig(
         name=config.name,
         train_datasets=[dataset_config],
-        models=[ModelConfig(name="combined", num_classes=len(config.classes))],
+        models=[ModelConfig(name="combined", num_classes=len(eval_classes))],
         output_dir=config.output_dir,
         test_dataset=dataset_config,
         training=TrainingConfig(
@@ -257,7 +271,7 @@ def run_combined_pipeline(config) -> Dict[str, Any]:
             raw_preds = pipe.process_batch(images, targets)
             per_model_frame_preds.append([
                 remap_raw_predictions_to_eval_classes(
-                    prediction.detach().cpu(), train_classes, config.classes
+                    prediction.detach().cpu(), train_classes, eval_classes
                 )
                 for prediction in raw_preds
             ])
@@ -303,12 +317,13 @@ def run_combined_pipeline(config) -> Dict[str, Any]:
         iou_thresholds=config.iou_thresholds,
         score_threshold=config.score_threshold,
         map_score_threshold=config.map_score_threshold,
-        num_classes=len(config.classes),
-        # Merged predictions are already remapped into config.classes, so this
-        # remap step inside evaluate_detection is an identity mapping.
-        prediction_classes=config.classes,
-        target_classes=config.classes,
-        eval_classes=config.classes,
+        num_classes=len(eval_classes),
+        # Merged predictions are already remapped into eval_classes, so that
+        # remap step inside evaluate_detection is an identity mapping. The
+        # targets are not — they are still in the dataset's own id space.
+        prediction_classes=eval_classes,
+        target_classes=target_classes,
+        eval_classes=eval_classes,
         )
     metrics["eval_seconds"] = round(time.perf_counter() - started, 3)
     print(
@@ -324,9 +339,9 @@ def run_combined_pipeline(config) -> Dict[str, Any]:
             all_targets,
             records,
             config=None,
-            prediction_classes=config.classes,
-            target_classes=config.classes,
-            eval_classes=config.classes,
+            prediction_classes=eval_classes,
+            target_classes=target_classes,
+            eval_classes=eval_classes,
             score_threshold=config.score_threshold,
             top_k_fraction=EVAL_HARD_IMAGES_FRACTION,
         )
@@ -336,10 +351,10 @@ def run_combined_pipeline(config) -> Dict[str, Any]:
             all_targets,
             records,
             config=None,
-            num_classes=len(config.classes),
-            prediction_classes=config.classes,
-            target_classes=config.classes,
-            eval_classes=config.classes,
+            num_classes=len(eval_classes),
+            prediction_classes=eval_classes,
+            target_classes=target_classes,
+            eval_classes=eval_classes,
             iou_thresholds=config.iou_thresholds,
             score_threshold=config.score_threshold,
             map_score_threshold=config.map_score_threshold,
@@ -355,6 +370,8 @@ def run_combined_pipeline(config) -> Dict[str, Any]:
         "predictions": str(prediction_path),
         "metrics": metrics,
     }
+    if config.class_map:
+        output["class_map"] = dict(config.class_map)
     result_path = output_dir / "result.yaml"
     _write_yaml(result_path, _to_builtin(output))
     print(f"[chachak] Wrote result: {result_path}")

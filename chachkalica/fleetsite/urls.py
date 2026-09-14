@@ -8,7 +8,11 @@
 from django.contrib import admin
 from django.urls import include, path
 
-from fleetsite.admin_views import benchmark_console_view, bundle_sync_view
+from fleetsite.admin_views import (
+    benchmark_console_view,
+    bundle_sync_view,
+    class_sync_view,
+)
 
 admin.site.site_header = "Chachkalica Fleet"
 admin.site.site_title = "Chachkalica Fleet"
@@ -28,6 +32,12 @@ urlpatterns = [
         "admin/bundles/sync/",
         admin.site.admin_view(bundle_sync_view),
         name="bundle-sync",
+    ),
+    # Same shape, for the "Check classes" button on the dataset-eval form.
+    path(
+        "admin/classes/sync/",
+        admin.site.admin_view(class_sync_view),
+        name="class-sync",
     ),
     # Every project's own blank admin front — /admin/s/<slug>/, one row in
     # AdminSection per front, no code change or redeploy to add one — is NOT

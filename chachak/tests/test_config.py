@@ -119,3 +119,38 @@ class LoadConfigTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClassMapTest(unittest.TestCase):
+    """The optional ``class_map`` block: the dataset's names in the model's terms.
+
+    Parsed here rather than in the trainer so a typo is a config error at load
+    time, not a silently-dropped class discovered in the metrics afterwards.
+    """
+
+    def test_absent_by_default(self):
+        self.assertEqual(load_pipeline_config(write_config(BASE)).class_map, {})
+
+    def test_parsed_and_normalized(self):
+        body = {**BASE, "class_map": {"a": "thing", "b": None}}
+        config = load_pipeline_config(write_config(body))
+        self.assertEqual(config.class_map, {"a": "thing", "b": None})
+
+    def test_blank_means_drop_just_like_null(self):
+        """A form posts "" for a drop and YAML writes null; both arrive here."""
+        by_blank = load_pipeline_config(
+            write_config({**BASE, "class_map": {"a": "thing", "b": "  "}}))
+        by_null = load_pipeline_config(
+            write_config({**BASE, "class_map": {"a": "thing", "b": None}}))
+        self.assertEqual(by_blank.class_map, by_null.class_map)
+
+    def test_naming_a_class_the_dataset_does_not_have_is_rejected(self):
+        """Almost always a typo, and silently a no-op if it were allowed through."""
+        body = {**BASE, "class_map": {"a": "thing", "nosuch": "thing"}}
+        with self.assertRaises(ValueError) as caught:
+            load_pipeline_config(write_config(body))
+        self.assertIn("nosuch", str(caught.exception))
+
+    def test_a_non_mapping_is_rejected(self):
+        with self.assertRaises(ValueError):
+            load_pipeline_config(write_config({**BASE, "class_map": ["a", "b"]}))
