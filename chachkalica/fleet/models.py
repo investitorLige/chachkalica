@@ -254,9 +254,9 @@ class AnnotationTag(models.Model):
     at setup time (``lsapi.build_label_config``); editing them afterwards needs
     an explicit push to the projects that already exist.
 
-    A tag's ``name`` is not just a key: Label Studio labels a ``perRegion``
-    control in the region details panel with its ``name``, so it is also what a
-    box-wide tag's annotator reads on screen.
+    A tag's ``name`` is not just a key: it is emitted as the ``<Header>`` above
+    the control (``lsapi.tags_xml``), so it is also what the annotator reads on
+    screen.
 
     Nothing here reaches the YOLO ``.txt``/COCO export — that format has no
     place to put an attribute — so tag values live in Label Studio and come out
@@ -293,8 +293,8 @@ class AnnotationTag(models.Model):
     scope = models.CharField(max_length=16, choices=SCOPE_CHOICES, default=FRAME)
     name = models.CharField(
         max_length=64,
-        help_text="Control name, e.g. occlusion_level. Box-wide tags show this "
-                  "name to the annotator in the region panel.",
+        help_text="Control name, e.g. occlusion_level. Doubles as the heading "
+                  "shown above the control, so name it for the annotator.",
     )
     widget = models.CharField(max_length=16, choices=WIDGET_CHOICES, default=RADIO)
     choices = models.JSONField(

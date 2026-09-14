@@ -416,7 +416,7 @@ def _read_label_shapes(label_dir, image_path, class_names):
 @admin.register(Dataset)
 class DatasetAdmin(admin.ModelAdmin):
     form = DatasetAdminForm
-    list_display = ["name", "storage_type", "storage_root", "has_labels"]
+    list_display = ["name", "storage_type", "storage_root", "has_labels_display"]
     readonly_fields = ["has_labels"]
     search_fields = ["name"]
     actions = [
@@ -451,6 +451,14 @@ class DatasetAdmin(admin.ModelAdmin):
         # so the flag reflects whether a source labels/ folder is present.
         super().save_model(request, obj, form, change)
         datasets_svc.detect_labels(obj)
+
+    @admin.display(boolean=True, ordering="has_labels", description="Has labels")
+    def has_labels_display(self, obj):
+        # The stored flag is only refreshed at specific call sites (save,
+        # promote, grounding-SAM generation, fleet_setup_dataset), so labels
+        # dropped onto disk out-of-band would otherwise show as absent here
+        # until something happens to re-save the row. Recompute live instead.
+        return datasets_svc.detect_labels(obj, persist=False)
 
     def _save_posted_tags(self, request, dataset):
         """Save the tag editor's rows onto a dataset.
