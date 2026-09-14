@@ -393,7 +393,11 @@ as page text.{% endcomment %}
   const TAGS = JSON.parse(tagsNode.textContent);
   const FRAME_METRICS = JSON.parse(document.getElementById("tga-frame-metrics").textContent);
   const BOX_METRICS = JSON.parse(document.getElementById("tga-box-metrics").textContent);
-  const DATA_URL = "{{ data_url }}?{{ query }}";
+  // escapejs, not the default HTML escaping: this is a JS string, and
+  // "&" autoescaped to "&amp;" turns ?kind=base&eval=7 into a request whose
+  // second parameter is named "amp;eval" -- the view then 404s, and every
+  // fetch on this page parses an HTML error page as JSON.
+  const DATA_URL = "{{ data_url|escapejs }}?{{ query|escapejs }}";
   const byName = Object.fromEntries(TAGS.map(t => [t.name, t]));
 
   function option(value, label) {
