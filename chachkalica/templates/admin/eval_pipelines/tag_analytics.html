@@ -60,6 +60,33 @@
   .tga table.grid td.empty { color: #bbb; }
   .tga details { margin: 6px 0 14px; }
   .tga details summary { cursor: pointer; font-size: 12px; color: #777; }
+
+  /* ---- Scorecard: every tag value in one table, shaded per column ---- */
+  .tga .sweep { display: flex; gap: 12px; align-items: center; margin: 10px 0 4px;
+                font-size: 13px; flex-wrap: wrap; }
+  .tga .sweep input[type=range] { width: 320px; max-width: 55vw; }
+  .tga .sweep .at { font-variant-numeric: tabular-nums; font-weight: 700; min-width: 4.2em; }
+  .tga .sweep .eval-point { font-size: 11px; color: #777; }
+  .tga table.card { background: #fff; width: 100%; }
+  .tga table.card th, .tga table.card td { border: 1px solid #dcdcdc; color: #222;
+                                           background-color: #fff; }
+  /* The tag's own band: a labelled rule, so values group visually without the
+     reader having to carry the tag name down the column. */
+  .tga table.card tr.band th { background: #eef1f4; text-align: left; font-size: 12px;
+                               letter-spacing: .03em; }
+  .tga table.card tr.band th .unit { font-weight: 400; color: #777; margin-left: 8px; }
+  .tga table.card td.rowlabel { background: #fafafa; }
+  /* Same green ramp as the cross-tab grid, so one shading language on the page.
+     Unshaded (--i unset) cells keep the plain background: a column that does
+     not vary is not a column with a worst cell. */
+  .tga table.card td.shade { color: #fff !important; font-weight: 700;
+                             background: rgba(20, 120, 55, calc(var(--i) * 0.9)); }
+  .tga table.card td.na { color: #bbb; background: #fff; }
+  /* mAP does not move with the slider (it integrates the whole curve), so its
+     columns are marked once in the header rather than explained per cell. */
+  .tga table.card th.fixed { color: #8a8a8a; }
+  .tga table.card th.fixed::after { content: " \00b7 fixed"; font-size: 10px; font-weight: 400; }
+  .tga .sweep-busy { opacity: .45; transition: opacity .12s; }
 </style>
 {% endblock %}
 
@@ -77,8 +104,7 @@
 
 <h2>Data sources</h2>
 <p class="note">
-  What this page had to read, and what each one costs when it is missing. Only the match
-  outcomes are required — every other gap removes some tags, not the page.
+  What this page read. Only the match outcomes are required; other gaps cost tags, not the page.
 </p>
 <table>
   <thead><tr><th class="rowlabel">source</th><th class="rowlabel">state</th>
@@ -112,12 +138,9 @@
 {% with report=report %}
 
 <p class="note">
-  How this model does on the slices of <strong>{{ dataset }}</strong> that its annotation
-  tags define. Nothing was re-run: every number here is re-scored from the match outcomes
-  this eval already recorded, at its own operating point —
-  confidence <code>&ge; {{ report.score_threshold }}</code>, IoU thresholds
-  <code>{{ report.iou_thresholds|join:", " }}</code>.
-  {% if report.backfilled %}The match table was rebuilt from the saved predictions after the fact.{% endif %}
+  Re-scored from this eval's stored match outcomes — nothing re-run. Confidence
+  <code>&ge; {{ report.score_threshold }}</code>, IoU <code>{{ report.iou_thresholds|join:", " }}</code>.
+  {% if report.backfilled %}Match table rebuilt from saved predictions.{% endif %}
 </p>
 
 {% if report.check %}
@@ -167,20 +190,14 @@
 </table>
 {% if report.coverage.ambiguous_filenames %}
   <p class="note">
-    Measurements are joined to frames by filename, which is all the match table records.
-    {{ report.coverage.ambiguous_filenames }} image(s) share a basename with an image in a
-    different subdirectory, so no measurement can be attributed to either without guessing —
-    they are left unmeasured instead.
+    {{ report.coverage.ambiguous_filenames }} image(s) share a basename across subdirectories,
+    so measurements (joined by filename) were left unattributed rather than guessed.
   </p>
 {% endif %}
 {% if report.coverage.row_mismatches %}
   <p class="note">
-    Box tags are joined to ground-truth boxes by their line number in the label file, checked
-    against the class recorded beside it. {{ report.coverage.row_mismatches }} image(s)
-    disagreed — their labels and tag answers have drifted apart (relabelled, re-promoted, or
-    hand-edited since the sync) — so their <em>box</em> tags were left out rather than
-    attributed to the wrong boxes. Their frame tags are unaffected. Re-sync the annotator's
-    project to line them up again.
+    {{ report.coverage.row_mismatches }} image(s): labels and tag answers have drifted apart, so
+    their <em>box</em> tags were dropped rather than misattributed. Frame tags unaffected; re-sync to fix.
   </p>
 {% endif %}
 
@@ -292,11 +309,8 @@
       </tbody>
     </table>
     <p class="note">
-      A box tag selects ground-truth boxes, and a prediction carries no tags — so a false
-      positive belongs to no value of this tag and precision and mAP are not defined here.
-      What is measurable is whether each tagged box was found, and how well: recall at the
-      eval's operating confidence and IoU 0.5, the same averaged over every IoU threshold,
-      and the IoU and confidence of the predictions that found them.
+      Predictions carry no tags, so precision and mAP are undefined for a box slice — only
+      whether each tagged box was found, and how well.
     </p>
   {% endif %}
 {% endfor %}
@@ -304,9 +318,7 @@
 {% if report.tags_without_data %}
   <h2>Tags with no data here</h2>
   <p class="note">
-    Defined somewhere, but unable to slice this eval. They are listed rather than dropped
-    because &ldquo;what could I have cut this by?&rdquo; is the question this page exists to
-    answer, and a silent omission answers it wrong.
+    Defined, but unable to slice this eval — listed rather than silently dropped.
   </p>
   <table>
     <thead><tr><th class="rowlabel">tag</th><th class="rowlabel">scope</th>
@@ -324,11 +336,23 @@
   </table>
 {% endif %}
 
+<h2>All tags</h2>
+<p class="note">
+  Every value of every tag, scored at one confidence. Shaded worst&rarr;best down each column,
+  within each tag.
+</p>
+<div class="sweep">
+  <label for="tga-threshold">confidence</label>
+  <input type="range" id="tga-threshold" min="0" max="1000" value="500" step="5">
+  <span class="at" id="tga-threshold-at">—</span>
+  <button type="button" class="button" id="tga-threshold-reset">Back to eval's point</button>
+  <span class="eval-point" id="tga-threshold-note"></span>
+</div>
+<div id="tga-scorecard"></div>
+
 <h2>Cross-tab</h2>
 <p class="note">
-  One metric over every combination of two tags' values — the intersection, so a cell is the
-  images (or boxes) answering both. Pairing a box tag with anything makes the whole grid a
-  box slice, with only the ground-truth-side metrics on offer.
+  One metric over every pair of tag values. A box tag makes the whole grid a box slice.
 </p>
 <div class="controls">
   <div><label for="tga-a">rows</label><select id="tga-a"></select></div>
@@ -340,8 +364,7 @@
 
 <h2>Custom slice</h2>
 <p class="note">
-  Any intersection of tag values, to whatever depth. Frame-only filters get the full metric
-  set; add a box tag and the slice becomes a set of boxes, scored on recall.
+  Any intersection of tag values. Adding a box tag drops the slice to boxes, scored on recall.
 </p>
 <div id="tga-clauses"></div>
 <div class="controls">
@@ -387,6 +410,109 @@ as page text.{% endcomment %}
 
   function number(value) {
     return value === null || value === undefined ? "—" : Number(value).toFixed(4);
+  }
+
+  // ------------------------------------------------------------ scorecard
+  // Every tag value at one confidence, re-fetched as the slider moves. The
+  // server re-scores from the stored match table, so this costs no re-run --
+  // but it is a request per settle, hence the debounce and the in-flight guard.
+  const sweep = document.getElementById("tga-threshold");
+  const sweepAt = document.getElementById("tga-threshold-at");
+  const sweepNote = document.getElementById("tga-threshold-note");
+  const sweepReset = document.getElementById("tga-threshold-reset");
+  const card = document.getElementById("tga-scorecard");
+  let evalThreshold = null;
+  let sweepTimer = null;
+  let sweepSeq = 0;
+
+  function fmt(value) {
+    return value === null || value === undefined ? "—" : Number(value).toFixed(3);
+  }
+
+  function renderScorecard(data) {
+    if (!data.groups.length) {
+      card.textContent = "No tag on this eval can slice it.";
+      return;
+    }
+    let html = '<table class="card"><thead><tr>'
+      + '<th class="rowlabel">tag / value</th><th>n</th>';
+    data.columns.forEach(c => {
+      html += '<th' + (c.swept ? "" : ' class="fixed"') + ">" + c.label + "</th>";
+    });
+    html += "</tr></thead><tbody>";
+
+    data.groups.forEach(group => {
+      const span = data.columns.length + 2;
+      html += '<tr class="band"><th colspan="' + span + '">' + group.label
+        + (group.kind === "box" ? "  (box-wide)" : "")
+        + (group.source === "auto" ? "  · computed" : "")
+        + (group.unit ? '<span class="unit">' + group.unit + "</span>" : "")
+        + "</th></tr>";
+
+      group.rows.forEach(row => {
+        html += '<tr><td class="rowlabel">' + row.value + "</td>"
+          + "<td>" + row.population + "</td>";
+        data.columns.forEach(c => {
+          const value = row.metrics[c.key];
+          const shade = (row.intensity || {})[c.key];
+          if (value === null || value === undefined) {
+            html += '<td class="na">—</td>';
+          } else if (shade === null || shade === undefined) {
+            html += "<td>" + fmt(value) + "</td>";
+          } else {
+            html += '<td class="shade" style="--i:' + shade + '">' + fmt(value) + "</td>";
+          }
+        });
+        html += "</tr>";
+      });
+    });
+    html += "</tbody></table>";
+    card.innerHTML = html;
+  }
+
+  function loadScorecard(threshold) {
+    const seq = ++sweepSeq;
+    const params = new URLSearchParams({ mode: "scorecard" });
+    if (threshold !== null && threshold !== undefined) { params.set("threshold", threshold); }
+    card.classList.add("sweep-busy");
+    fetch(DATA_URL + "&" + params.toString())
+      .then(response => response.json())
+      .then(data => {
+        // A slower earlier request must not repaint over a newer one.
+        if (seq !== sweepSeq) { return; }
+        card.classList.remove("sweep-busy");
+        if (data.error) { card.textContent = data.error; return; }
+        if (evalThreshold === null) {
+          evalThreshold = data.score_threshold;
+          sweep.min = String(Math.round(data.score_floor * 1000));
+          sweep.value = String(Math.round(data.score_cut * 1000));
+          sweepNote.textContent = "eval scored at " + fmt(data.score_threshold)
+            + " · table floor " + fmt(data.score_floor);
+        }
+        sweepAt.textContent = fmt(data.score_cut)
+          + (data.at_eval_threshold ? "" : " *");
+        renderScorecard(data);
+      })
+      .catch(error => {
+        if (seq !== sweepSeq) { return; }
+        card.classList.remove("sweep-busy");
+        card.textContent = String(error);
+      });
+  }
+
+  if (sweep) {
+    sweep.addEventListener("input", () => {
+      sweepAt.textContent = (sweep.value / 1000).toFixed(3);
+      clearTimeout(sweepTimer);
+      sweepTimer = setTimeout(() => loadScorecard(sweep.value / 1000), 180);
+    });
+    sweepReset.addEventListener("click", () => {
+      if (evalThreshold === null) { return; }
+      sweep.value = String(Math.round(evalThreshold * 1000));
+      loadScorecard(evalThreshold);
+    });
+    card.textContent = "Scoring…";
+    loadScorecard(null);
   }
 
   // ------------------------------------------------------------ cross-tab

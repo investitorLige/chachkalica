@@ -820,7 +820,13 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin,
 
         ``?mode=slice&clauses=[["weather","rain"],["shift","night"]]`` intersects
         the clauses; ``?mode=cross&tag_a=&tag_b=&metric=`` fills a grid with one
-        metric over every combination of two tags' values.
+        metric over every combination of two tags' values;
+        ``?mode=scorecard`` scores every value of every usable tag at once.
+
+        All three accept ``&threshold=`` to score at a confidence other than the
+        eval's own. Nothing is re-run for it: the match table holds every
+        prediction down to its score floor, so a different cut is a filter over
+        rows already on disk (see ``tag_analytics.resolve_score_cut``).
         """
         eval_obj, _kind = _resolve_eval_for_tags(request)
         loaded, problem = _load_tag_analysis(eval_obj)
@@ -829,17 +835,26 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin,
         table, index, _sources = loaded
 
         try:
+            # Absent means "the eval's own operating point"; a blank or
+            # unparseable one is a client bug worth reporting, not worth
+            # silently scoring at a threshold nobody asked for.
+            raw_threshold = request.GET.get("threshold")
+            threshold = None if raw_threshold in (None, "") else float(raw_threshold)
+
+            if request.GET.get("mode") == "scorecard":
+                return JsonResponse(tag_analytics.scorecard(table, index, threshold))
             if request.GET.get("mode") == "cross":
                 return JsonResponse(tag_analytics.cross_tab(
                     table, index,
                     request.GET.get("tag_a", ""), request.GET.get("tag_b", ""),
-                    request.GET.get("metric", ""),
+                    request.GET.get("metric", ""), threshold,
                 ))
             clauses = json.loads(request.GET.get("clauses") or "[]")
             if not isinstance(clauses, list):
                 raise ValueError("clauses must be a list of [tag, value] pairs")
             pairs = [(str(pair[0]), str(pair[1])) for pair in clauses]
-            return JsonResponse(tag_analytics.slice_metrics(table, index, pairs))
+            return JsonResponse(
+                tag_analytics.slice_metrics(table, index, pairs, threshold))
         except tag_analytics.UnknownClause as exc:
             return JsonResponse({"error": str(exc)}, status=400)
         except (ValueError, TypeError, IndexError) as exc:
