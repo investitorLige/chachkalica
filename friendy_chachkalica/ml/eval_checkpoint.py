@@ -7,6 +7,12 @@ checkpoint already carries everything needed to rebuild the model
 (``model_name``, ``model_config``, and the training ``classes``), so the caller
 only supplies the eval dataset (images, labels, classes) and where to write.
 
+``checkpoint_path`` does not have to be a ``.pt``: an exported ``.onnx`` or a
+TensorRT ``.engine`` is evaluated the same way, through the adapter that serves
+it (see :func:`load_eval_adapter`). That is the point of allowing it — the
+number anyone deploys on is the exported artifact's, and it is not always the
+checkpoint's.
+
 Driven by a small request YAML so the trainer service can launch it as a
 subprocess, mirroring ``run.py``:
 
@@ -93,6 +99,107 @@ def _as_class_map(classes: Union[Dict, List]) -> Dict[int, str]:
     return {index: str(name) for index, name in enumerate(classes)}
 
 
+#: Suffixes that name a complete inference artifact rather than a torch
+#: checkpoint: the weights, the preprocessing and the class map all live in the
+#: file plus its ``.meta.json`` sidecar, so there is no architecture to rebuild.
+EXPORTED_SUFFIXES = {".onnx", ".engine"}
+
+
+def _ensure_chachak_importable() -> None:
+    """Put the repo root on sys.path so ``import chachak`` resolves in-process.
+
+    chachak lives at ``<repo_root>/chachak`` and shares this torch/CUDA env.
+    Mirrors ``ml/train.py::_ensure_chachak_importable``.
+    """
+    import sys
+
+    root = str(Path(__file__).resolve().parent.parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+def load_eval_adapter(checkpoint_path: Union[str, Path], device) -> tuple:
+    """Load whatever ``checkpoint_path`` names, ready to predict.
+
+    A ``.pt`` is rebuilt from its own ``model_name`` / ``num_classes`` /
+    ``params`` and has its weights loaded, as this module always did. An
+    exported ``.onnx`` or TensorRT ``.engine`` is a finished inference artifact
+    instead, and goes through ``chachak.infer.load_checkpoint_adapter`` — the
+    same resolution the trainer's single-image predict endpoint and every
+    chachak pipeline already use, so "evaluate the thing that actually gets
+    deployed" scores it through the very runtime that serves it.
+
+    Returns ``(adapter, info)``, ``info`` carrying ``model_name``,
+    ``num_classes``, ``params`` and the training ``classes`` as ``{id: name}``.
+
+    The suffix branch is deliberate rather than handing everything to chachak:
+    that loader prefers a sibling ``<name>.onnx`` when one exists beside a
+    ``.pt`` — the right call for serving, the wrong one here, where a ``.pt``
+    eval has to score the checkpoint the caller named and not whatever was
+    exported from it later.
+    """
+    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path.suffix.lower() in EXPORTED_SUFFIXES:
+        _ensure_chachak_importable()
+        from chachak.infer import load_checkpoint_adapter
+
+        adapter, info = load_checkpoint_adapter(checkpoint_path, device)
+        if not info.get("train_classes"):
+            # Same refusal as the checkpoint branch, one file further out: the
+            # class order is the artifact's, and guessing it from the eval
+            # dataset would mislabel every prediction instead of failing.
+            raise ValueError(
+                f"{checkpoint_path} has no class names in its .meta.json sidecar "
+                "(class_map), so its predictions cannot be remapped by name onto "
+                "the eval classes. Re-export it from a checkpoint that records them."
+            )
+        return adapter, info
+
+    print(f"[eval] Loading checkpoint: {checkpoint_path}")
+    state = torch.load(checkpoint_path, map_location="cpu")
+    model_name = state["model_name"]
+    model_config = state.get("model_config", {}) or {}
+    num_classes = model_config.get("num_classes")
+    params = dict(model_config.get("params", {}) or {})
+    train_classes_raw = (state.get("train_dataset") or {}).get("classes")
+    if not train_classes_raw:
+        # Falling back to the eval class list would silently mislabel every
+        # prediction whenever the model's training class order differs from it.
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} does not record its training class names "
+            "(train_dataset.classes), so predictions cannot be remapped by name onto "
+            "the eval classes. Re-train (or re-save the checkpoint) with class names."
+        )
+    print(f"[eval] Building model adapter: {model_name} num_classes={num_classes} device={device}")
+    adapter = build_model(model_name, num_classes=num_classes, **params)
+    adapter.to(device)
+    adapter.model.load_state_dict(state["model_state_dict"])
+    return adapter, {
+        "model_name": model_name,
+        "num_classes": num_classes,
+        "params": params,
+        "train_classes": _as_class_map(train_classes_raw),
+    }
+
+
+def _clamp_batch_size(adapter: Any, batch_size: int) -> int:
+    """Narrow ``batch_size`` to what ``adapter`` can take in one predict call.
+
+    Only a TensorRT engine caps this: its built optimization profile is the
+    ceiling, and that profile is 1 unless the engine was deliberately built
+    wider (see ``chachak.infer._adapter_max_batch``, whose duck-typed read this
+    mirrors so nothing here has to import ``trt_infer``). The pipeline path
+    chunks oversized batches internally; this one hands the loader's batch
+    straight to the adapter, so the loader is what has to be narrowed.
+    """
+    max_batch = getattr(getattr(adapter, "_model", None), "max_batch", None)
+    if not isinstance(max_batch, int) or batch_size <= max_batch:
+        return batch_size
+    print(f"[eval] Engine profile takes {max_batch} image(s) per call: "
+          f"narrowing eval batch size {batch_size} -> {max_batch}")
+    return max(1, max_batch)
+
+
 def eval_checkpoint(
     checkpoint_path: Union[str, Path],
     images: Union[str, Path],
@@ -111,32 +218,18 @@ def eval_checkpoint(
     device: str = "auto",
 ) -> Dict[str, Any]:
     checkpoint_path = Path(checkpoint_path)
-    print(f"[eval] Loading checkpoint: {checkpoint_path}")
-    state = torch.load(checkpoint_path, map_location="cpu")
-    model_name = state["model_name"]
-    model_config = state.get("model_config", {}) or {}
-    num_classes = model_config.get("num_classes")
-    params = dict(model_config.get("params", {}) or {})
-    train_classes_raw = (state.get("train_dataset") or {}).get("classes")
-    if not train_classes_raw:
-        # Falling back to the eval class list would silently mislabel every
-        # prediction whenever the model's training class order differs from it.
-        raise ValueError(
-            f"Checkpoint {checkpoint_path} does not record its training class names "
-            "(train_dataset.classes), so predictions cannot be remapped by name onto "
-            "the eval classes. Re-train (or re-save the checkpoint) with class names."
-        )
-    train_classes = _as_class_map(train_classes_raw)
     eval_classes = _as_class_map(classes)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     dev = resolve_device(device)
-    print(f"[eval] Building model adapter: {model_name} num_classes={num_classes} device={dev}")
-    adapter = build_model(model_name, num_classes=num_classes, **params)
-    adapter.to(dev)
-    adapter.model.load_state_dict(state["model_state_dict"])
+    adapter, info = load_eval_adapter(checkpoint_path, dev)
+    model_name = info["model_name"]
+    num_classes = info["num_classes"]
+    params = dict(info["params"] or {})
+    train_classes = info["train_classes"]
+    batch_size = _clamp_batch_size(adapter, batch_size)
 
     dataset_config = DatasetConfig(
         name=f"{name}-data", images=Path(images), labels=Path(labels) if labels else None,

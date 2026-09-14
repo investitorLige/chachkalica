@@ -50,8 +50,12 @@ def _column(eval_run) -> dict:
         "kind": kind,
         "orig_id": orig_id,
         "output_dir": getattr(eval_run, "output_dir", "") or "",
-        "model": eval_run.trained_model.name,
-        "arch": eval_run.trained_model.arch,
+        # Through the row's own accessors, not the FK: an eval of an exported
+        # artifact or a bundle has no catalogue entry behind it and names itself
+        # by the snapshot it stamped instead (all three shapes provide these —
+        # see EvaluatedModelSource / CombinedEval).
+        "model": eval_run.model_label(),
+        "arch": eval_run.model_arch(),
         "dataset": eval_run.dataset.name,
         "metrics": metrics,
         # When the eval ran (stamped by the trainer). Fall back to the row's

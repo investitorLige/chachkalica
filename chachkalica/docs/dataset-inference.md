@@ -15,6 +15,7 @@ Three surfaces already run a model, and none of them answered this question:
 |---|---|---|
 | Models → *Preview model on selected dataset…* | a catalogued `.pt` only | what does it see, on this image? |
 | Models → *Evaluate…* | a catalogued `.pt` only | how **accurate** is it, in mAP? |
+| Datasets → *Evaluate a model on this dataset…* | all three formats | how **accurate** is it, in mAP? |
 | Videos → *Run model inference…* | all three formats | what does it see, over a clip? |
 | Bundle benchmarks | one bundle | how fast, in a synthetic loop? |
 | **Datasets → *Run model inference…*** | **all three formats** | **how fast, per real frame, through the pipeline it will be served with?** |
@@ -24,8 +25,10 @@ ever loads a `.pt`, while what ships is an engine or a bundle, and an engine's
 frame cost is the number anyone actually asks about.
 
 It is deliberately **not** an eval. There is no mAP here — that is what
-*Evaluate…* is for, and a second, worse accuracy number for the same question
-would only invite arguments about which one is right.
+*Evaluate…* is for (including, for the same three formats,
+[Datasets → *Evaluate a model on this dataset…*](dataset-eval.md)), and a second,
+worse accuracy number for the same question would only invite arguments about
+which one is right.
 
 ## The form
 

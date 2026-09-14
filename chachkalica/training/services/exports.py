@@ -245,11 +245,14 @@ def export_pipeline_sidecar(trained_model, artifact_path: Path) -> dict:
     return defaults
 
 
-def _classes_from_meta(artifact_path: Path) -> list[str] | None:
+def classes_from_meta(artifact_path: Path) -> list[str] | None:
     """Class names off ``artifact_path``'s ``.meta.json`` sidecar, ordered by id.
 
     Fallback for :func:`build_bundle_request` when the catalogued
-    :class:`~training.models.TrainedModel` has no ``classes`` of its own.
+    :class:`~training.models.TrainedModel` has no ``classes`` of its own, and the
+    whole answer for an artifact with no catalogue entry at all — including one
+    inside a bundle, which is why this is public
+    (:func:`training.services.bundles.read_class_names`).
     """
     meta_path = artifact_path.with_suffix(META_SIDECAR_SUFFIX)
     try:
@@ -286,7 +289,7 @@ def build_bundle_request(trained_model, artifact_path: Path) -> dict | None:
     if meta["pipeline"] == pipeline_meta.RAW:
         return None
 
-    classes = list(trained_model.classes) or _classes_from_meta(artifact_path)
+    classes = list(trained_model.classes) or classes_from_meta(artifact_path)
     if not classes:
         return None
 
@@ -426,7 +429,7 @@ def read_class_names(relpath: str, ts: TrainingSettings | None = None) -> list[s
     except ValueError:
         return []
 
-    names = _classes_from_meta(artifact)
+    names = classes_from_meta(artifact)
     if names:
         return list(names)
     model = _model_from_catalogue(artifact)

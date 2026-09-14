@@ -16,11 +16,24 @@ from django.db import models
 
 from fleet.models import Annotator, Dataset
 from training import pipelines
-from training.models import EvalRun, ExperimentDataset, TrainedModel, default_iou_thresholds
+from training.models import (
+    EvalRun,
+    EvaluatedModelSource,
+    ExperimentDataset,
+    TrainedModel,
+    default_iou_thresholds,
+)
 
 
-class PipelineEvalRun(models.Model):
-    """One evaluation of a :class:`TrainedModel` through a chachak pipeline."""
+class PipelineEvalRun(EvaluatedModelSource):
+    """One evaluation of a model through a chachak pipeline.
+
+    The model is a catalogued :class:`TrainedModel`, an exported artifact or a
+    bundle — see :class:`~training.models.EvaluatedModelSource`. A bundle-sourced
+    run owns none of the geometry below: it is re-read from the manifest on
+    submit (``sync_bundle``), because a bundle ships the pipeline its weights
+    were tuned with.
+    """
 
     # Status vocabulary matches EvalRun so the shared status badge/analytics work.
     CREATED = "created"
@@ -52,8 +65,10 @@ class PipelineEvalRun(models.Model):
     # Pipelines that require a person detector checkpoint.
     DETECTOR_PIPELINES = pipelines.DETECTOR_PIPELINES
 
+    # Null for an eval of an exported artifact or a bundle (see EvaluatedModelSource).
     trained_model = models.ForeignKey(
-        TrainedModel, on_delete=models.CASCADE, related_name="pipeline_eval_runs"
+        TrainedModel, on_delete=models.CASCADE, related_name="pipeline_eval_runs",
+        null=True, blank=True,
     )
     # Extra models combined with `trained_model` into one merged evaluation —
     # see TrainedModelAdmin.evaluate. Empty for an ordinary single-model eval.
@@ -150,7 +165,7 @@ class PipelineEvalRun(models.Model):
         )
 
     def _models_label(self) -> str:
-        names = [self.trained_model.name, *(m.name for m in self.combined_models.all())]
+        names = [self.model_label(), *(m.name for m in self.combined_models.all())]
         return " + ".join(names)
 
     @property
@@ -158,7 +173,9 @@ class PipelineEvalRun(models.Model):
         return self.pk is not None and self.combined_models.exists()
 
     def all_models(self) -> list:
-        return [self.trained_model, *self.combined_models.all()]
+        """The catalogue entries behind this eval — empty for an artifact/bundle one."""
+        first = [self.trained_model] if self.trained_model_id else []
+        return [*first, *self.combined_models.all()]
 
     def metric(self, key: str):
         return self.metrics.get(key) if isinstance(self.metrics, dict) else None
@@ -206,9 +223,14 @@ class CombinedEval(models.Model):
     id = models.CharField(primary_key=True, max_length=32)
     orig_id = models.IntegerField()
     kind = models.CharField(max_length=16)
+    # Null on an eval of an exported artifact or a bundle, which stands behind no
+    # catalogue entry — those say what they scored through the snapshot below.
     trained_model = models.ForeignKey(
-        TrainedModel, on_delete=models.DO_NOTHING, db_constraint=False, related_name="+"
+        TrainedModel, on_delete=models.DO_NOTHING, db_constraint=False, related_name="+",
+        null=True,
     )
+    model_source = models.CharField(max_length=16)
+    model_label_snapshot = models.CharField(max_length=512, blank=True)
     dataset = models.ForeignKey(
         Dataset, on_delete=models.DO_NOTHING, db_constraint=False, related_name="+"
     )
@@ -231,8 +253,29 @@ class CombinedEval(models.Model):
     def __str__(self) -> str:
         return (
             f"{'Pipeline Eval' if self.kind == self.PIPELINE else 'Eval'} #{self.orig_id} — "
-            f"{self.trained_model.name} [{self.pipeline}] on {self.dataset.name}"
+            f"{self.model_label()} [{self.pipeline}] on {self.dataset.name}"
         )
+
+    def model_label(self) -> str:
+        """What this row evaluated, without opening the real eval.
+
+        The union carries the snapshot rather than joining it back: an artifact
+        or bundle eval has no ``trained_model`` to join to, and a trained one
+        that outlived its catalogue entry would render "(deleted model)" twice
+        over. Falls back to the live name for rows written before the snapshot
+        existed.
+        """
+        if self.model_label_snapshot:
+            return self.model_label_snapshot
+        return self.trained_model.name if self.trained_model_id else "(deleted model)"
+
+    def model_arch(self) -> str:
+        """Arch for a catalogued model, else the format it ran as — mirrors
+        :meth:`training.models.EvaluatedModelSource.model_arch`."""
+        if self.trained_model_id:
+            return self.trained_model.arch
+        return dict(EvaluatedModelSource.MODEL_SOURCE_CHOICES).get(
+            self.model_source, self.model_source or "")
 
     def metric(self, key: str):
         return self.metrics.get(key) if isinstance(self.metrics, dict) else None

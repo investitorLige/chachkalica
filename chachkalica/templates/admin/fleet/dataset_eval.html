@@ -1,0 +1,93 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block content %}
+<p>Evaluate a model against <strong>{{ dataset.name }}</strong>&rsquo;s labels.</p>
+<p class="help">Queued like any other eval: it runs on the trainer and lands in
+<em>Eval Pipelines</em> (raw models under &ldquo;Base Eval&rdquo;, pipelined ones under their
+pipeline), where it can be compared against the checkpoint&rsquo;s own numbers, sliced by
+annotation tag, or promoted to labels.</p>
+
+{% if not visible_to_trainer %}
+  <p class="errornote">
+    <code>{{ images_dir }}</code> is outside <code>{{ shared_data_root }}</code>, which is the
+    only tree the trainer can open: images are handed to it as paths, not copied. Move the
+    dataset under the data root — or point <em>source_dir</em> in Fleet settings at it —
+    before evaluating on it.
+  </p>
+{% endif %}
+
+{# Re-posts the action without a model_source, which lands back on step 1. #}
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <p><input type="submit" class="button" value="← Change model type"></p>
+</form>
+
+<form action="" method="post">
+  {% csrf_token %}
+  {% for pk in selected %}
+    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="model_source" value="{{ model_source }}">
+  <input type="hidden" name="apply" value="1">
+
+  {# The model + pipeline half, shared verbatim with the inference forms — same
+     knobs, same prefill from the model's own recorded pipeline, so a model is
+     scored through the geometry it is served with. Its score_threshold row is
+     this eval's operating point; the rows below are the scoring's own. #}
+  {% include "admin/videos/_inference_fields.html" %}
+
+  <div class="form-row">
+    <label for="map_score_threshold">mAP confidence floor:</label>
+    <input type="number" name="map_score_threshold" id="map_score_threshold"
+           min="0" max="1" step="0.001" value="{{ values.map_score_threshold }}">
+    <p class="help">Minimum prediction confidence included in AP/mAP. Keep this low so mAP
+    sweeps the whole precision-recall curve — unlike the <em>score threshold</em> above,
+    which is the single operating point precision, recall, F1 and the confusion matrix are
+    reported at.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="label_source">Label source:</label>
+    <select name="label_source" id="label_source">
+      {% for value, label in label_source_choices %}
+        <option value="{{ value }}"{% if value == values.label_source %} selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <p class="help">Where the ground truth comes from: the dataset&rsquo;s own source labels,
+    a specific annotator&rsquo;s output, or an explicit labels path.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="annotator">Annotator:</label>
+    <select name="annotator" id="annotator">
+      <option value="">—</option>
+      {% for a in annotators %}
+        <option value="{{ a.pk }}"{% if a.pk|stringformat:"s" == values.annotator %} selected{% endif %}>{{ a.username }}</option>
+      {% endfor %}
+    </select>
+    <p class="help">Whose output to score against. Only used when <em>Label source</em> is
+    &ldquo;annotator output&rdquo;.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="explicit_labels_path">Explicit labels path:</label>
+    <input type="text" name="explicit_labels_path" id="explicit_labels_path" size="60"
+           value="{{ values.explicit_labels_path }}">
+    <p class="help">Filesystem path to a labels directory. Only used when <em>Label
+    source</em> is &ldquo;explicit path&rdquo;.</p>
+  </div>
+
+  <div class="submit-row">
+    <input type="submit" class="default" value="Queue evaluation">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+
+{% include "admin/videos/_inference_scripts.html" %}
+{% endblock %}

@@ -377,23 +377,41 @@ def combined_checkpoints(run) -> list[str]:
     return paths
 
 
+def eval_model_checkpoint(eval_obj) -> str:
+    """The model path to name in ``eval_obj``'s request YAML.
+
+    A catalogued model keeps sending its recorded ``checkpoint_path`` verbatim —
+    what every eval has always sent, and what the trainer resolves against its
+    own root. An exported artifact or a bundle has no catalogue row to read a
+    path off, so it is resolved here against the export/bundle root (and refused
+    if it escapes one) exactly as a serving run resolves it — see
+    :meth:`training.models.EvaluatedModelSource.model_checkpoint`.
+    """
+    if eval_obj.model_source == eval_obj.TRAINED:
+        tm = eval_obj.trained_model
+        if tm is None:
+            raise ValueError(f"{eval_obj}: no trained model to evaluate.")
+        if not tm.checkpoint_path:
+            raise ValueError(f"{tm.name}: no checkpoint path to evaluate.")
+        return tm.checkpoint_path
+    return eval_obj.model_checkpoint()
+
+
 def build_eval_request(eval_run, output_dir: Path | str, ts: TrainingSettings | None = None) -> dict:
     """Assemble the eval request consumed by friendy_chachkalica's ml/eval_checkpoint.py.
 
     ``classes`` is the *eval dataset's* class space (the target labels); the
-    model's own train-class space is read from the checkpoint by the trainer.
+    model's own train-class space is read from the checkpoint — or, for an
+    exported artifact, from its ``.meta.json`` — by the trainer.
     When ``eval_run`` combines 2+ models, ``extra_checkpoints`` carries the
     others' checkpoint paths and the trainer merges all models' predictions
     into one result (see ``eval_checkpoint.eval_combined_checkpoints``).
     """
     ts = ts or TrainingSettings.load()
-    tm = eval_run.trained_model
     ds = eval_run.dataset
-    if not tm.checkpoint_path:
-        raise ValueError(f"{tm.name}: no checkpoint path to evaluate.")
     data = {
         "name": f"eval-{eval_run.pk}",
-        "checkpoint_path": tm.checkpoint_path,
+        "checkpoint_path": eval_model_checkpoint(eval_run),
         "images": str(images_dir(ds)),
         "classes": dataset_classes(ds),
         "output_dir": str(output_dir),
@@ -453,17 +471,14 @@ def build_pipeline_request(pe, output_dir: Path | str, ts: TrainingSettings | No
     ``chachkalica/docs/pipeline-metadata.md``.
     """
     ts = ts or TrainingSettings.load()
-    tm = pe.trained_model
     ds = pe.dataset
-    if not tm.checkpoint_path:
-        raise ValueError(f"{tm.name}: no checkpoint path to evaluate.")
 
     from eval_pipelines.models import PipelineEvalRun
 
     data = {
         "name": f"pipeline-{pe.pk}",
         "pipeline": pe.pipeline,
-        "model_checkpoint": tm.checkpoint_path,
+        "model_checkpoint": eval_model_checkpoint(pe),
         "images": str(images_dir(ds)),
         "classes": dataset_classes(ds),
         "output_dir": str(output_dir),
@@ -541,6 +556,41 @@ PREDICTIONS_FILE = {"pipeline": "predictions.pt", "base": "eval_predictions.pt"}
 BACKUP_LABELS_SUBDIR = "backup_labels"
 
 
+def prediction_space(eval_obj, eval_classes: list[str]) -> dict:
+    """How a service re-reading this eval's saved predictions learns their classes.
+
+    Every consumer of a finished eval's ``*_predictions.pt`` — "promote to
+    labels", the match-table rebuild — has to know the class space those
+    prediction ids are indexed in, and gets it one of three ways:
+
+    * a **combined** run's predictions were already remapped into the eval
+      dataset's space before being merged, so the lookup is an identity;
+    * a **catalogued model**'s space is read back out of its checkpoint by the
+      trainer, which is stricter than trusting a copy of the list here;
+    * an **artifact or bundle** has no checkpoint to read, so its ``.meta.json``
+      class map is sent instead.
+
+    Returns the single key to merge into the payload. Refuses rather than
+    defaults when an artifact records no classes: a wrong class space silently
+    relabels every box, which is exactly the failure the checkpoint read exists
+    to prevent.
+    """
+    if getattr(eval_obj, "is_combined", False):
+        return {"prediction_classes": eval_classes}
+    if eval_obj.model_source == eval_obj.TRAINED:
+        tm = eval_obj.trained_model
+        if tm is None or not tm.checkpoint_path:
+            raise ValueError(f"{eval_obj}: no checkpoint path to read train classes from.")
+        return {"checkpoint_path": tm.checkpoint_path}
+    names = eval_obj.prediction_class_names()
+    if not names:
+        raise ValueError(
+            f"{eval_obj.model_label()} records no class names (no class_map in its "
+            ".meta.json), so the class space of its saved predictions is unknown."
+        )
+    return {"prediction_classes": list(names)}
+
+
 def build_promote_payload(eval_obj, kind: str, score_threshold: float) -> dict:
     """Assemble the trainer ``/promote_labels`` payload for one eval run.
 
@@ -551,21 +601,16 @@ def build_promote_payload(eval_obj, kind: str, score_threshold: float) -> dict:
     always about becoming the source of truth. Raises ``ValueError`` when the run
     has no output dir or checkpoint yet.
 
-    A combined run (2+ models) has no single owning checkpoint — but its saved
-    predictions are already indexed in the *eval dataset's* class space (every
-    model was remapped into it before merging, see ``eval_combined_checkpoints``
-    / ``chachak/run.py``), so promotion there is an identity name-remap: we send
-    ``prediction_classes`` instead of ``checkpoint_path`` and the trainer skips
-    loading a checkpoint (see ``promote_labels.promote_labels``).
+    Which class space the saved predictions are in — and so what the trainer
+    remaps them *from* — is decided by :func:`prediction_space`: a checkpoint to
+    read for a catalogued model, an explicit class list for a combined run or
+    for an exported artifact / bundle (the trainer then skips loading a
+    checkpoint, see ``promote_labels.promote_labels``).
     """
-    tm = eval_obj.trained_model
     ds = eval_obj.dataset
     if not eval_obj.output_dir:
         raise ValueError(f"{eval_obj}: no output dir — run the eval before promoting.")
 
-    is_combined = getattr(eval_obj, "is_combined", False)
-    if not is_combined and not tm.checkpoint_path:
-        raise ValueError(f"{tm.name}: no checkpoint path.")
     try:
         predictions_file = PREDICTIONS_FILE[kind]
     except KeyError:
@@ -580,11 +625,8 @@ def build_promote_payload(eval_obj, kind: str, score_threshold: float) -> dict:
         "labels_dir": str(datasets_svc.labels_source_dir(ds)),
         "backup_dir": str(dataset_root / BACKUP_LABELS_SUBDIR / Path(eval_obj.output_dir).name),
         "score_threshold": float(score_threshold),
+        **prediction_space(eval_obj, classes),
     }
-    if is_combined:
-        payload["prediction_classes"] = classes
-    else:
-        payload["checkpoint_path"] = tm.checkpoint_path
     return payload
 
 
@@ -641,13 +683,7 @@ def build_match_table_payload(eval_obj, kind: str) -> dict:
     if labels is not None:
         payload["labels_dir"] = str(labels)
 
-    if getattr(eval_obj, "is_combined", False):
-        payload["prediction_classes"] = classes
-    else:
-        tm = eval_obj.trained_model
-        if not tm.checkpoint_path:
-            raise ValueError(f"{tm.name}: no checkpoint path to read train classes from.")
-        payload["checkpoint_path"] = tm.checkpoint_path
+    payload.update(prediction_space(eval_obj, classes))
     return payload
 
 

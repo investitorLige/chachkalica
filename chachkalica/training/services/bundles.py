@@ -270,6 +270,26 @@ def pipeline_defaults(relpath: str, ts: TrainingSettings | None = None) -> dict 
     return _manifest_defaults(manifest, bundle_dir)
 
 
+def read_class_names(relpath: str, ts: TrainingSettings | None = None) -> list[str]:
+    """Class names the bundle's model predicts, ordered by class id.
+
+    Read off the model artifact's ``.meta.json`` — the same sidecar
+    :func:`training.services.exports.read_class_names` reads for a loose
+    artifact, and the same one the bundle's own runtime reads to decode its
+    output. ``[]`` when the bundle or its sidecar can't be read: callers use
+    this to tell a service the class space of predictions it is about to
+    re-read, and an empty list means "you'll have to get it elsewhere" rather
+    than a guess.
+    """
+    from training.services import exports
+
+    try:
+        artifact = model_artifact(relpath, ts)
+    except BundleError:
+        return []
+    return list(exports.classes_from_meta(artifact) or [])
+
+
 # The fields a bundle owns. `score_threshold` is deliberately absent: the bundle
 # ships one, but confidence is the one knob its own README treats as tunable, so
 # an operator's value wins. Kept in sync with GEOMETRY_FIELDS in

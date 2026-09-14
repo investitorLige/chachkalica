@@ -810,12 +810,153 @@ class BuildNode(models.Model):
         return self.base_url.rstrip("/")
 
 
-class EvalRun(models.Model):
-    """One standalone evaluation of a :class:`TrainedModel` against a dataset.
+class EvaluatedModelSource(models.Model):
+    """Which model an eval scores: a catalogued ``.pt``, an exported artifact, or
+    a bundle.
+
+    Shared by :class:`EvalRun` and :class:`~eval_pipelines.models.PipelineEvalRun`
+    because an eval is an eval whichever of the three it ran — the same metrics,
+    the same comparison page, the same tag analytics. It carries the same three
+    columns (and the same vocabulary) every *serving* row already carries
+    (:class:`videos.models.InferenceJob`, :class:`fleet.models.DatasetInferenceRun`,
+    :class:`cameras.models.CameraInference`); see
+    :mod:`training.services.inference_form`, which is the copy the forms read.
+
+    Why an eval needs them at all: a ``.pt``'s mAP is not the deployed model's
+    mAP. Export quantizes, an EfficientNMS plugin replaces the framework's NMS,
+    and a bundle pins a geometry — each a place accuracy can move. Scoring the
+    artifact that ships is the only way to know it didn't.
+    """
+
+    TRAINED = "trained"
+    EXPORTED = "exported"
+    BUNDLE = "bundle"
+    MODEL_SOURCE_CHOICES = [
+        (TRAINED, "trained model (.pt checkpoint)"),
+        (EXPORTED, "exported artifact (ONNX / TensorRT)"),
+        (BUNDLE, "infer bundle (self-contained pipeline directory)"),
+    ]
+
+    model_source = models.CharField(
+        max_length=16, choices=MODEL_SOURCE_CHOICES, default=TRAINED,
+        help_text="Where the evaluated model comes from: the trained-models "
+                  "catalogue, an exported artifact under the export output "
+                  "directory, or a self-contained infer bundle.",
+    )
+    artifact_path = models.CharField(
+        max_length=1024, blank=True,
+        help_text="Path of the exported .onnx/.engine relative to the export output "
+                  "directory. Set when model_source is 'exported'.",
+    )
+    bundle_path = models.CharField(
+        max_length=1024, blank=True,
+        help_text="Path of the bundle directory relative to the bundle root. Set when "
+                  "model_source is 'bundle'; the bundle's manifest supplies the model, "
+                  "the detector and the whole pipeline geometry.",
+    )
+    # Kept as text beside the FK so a finished eval still says what it scored
+    # after the catalogue entry, artifact or bundle behind it is gone — and so a
+    # changelist of artifact evals is readable without resolving paths.
+    model_label_snapshot = models.CharField(max_length=512, blank=True)
+
+    class Meta:
+        abstract = True
+
+    def model_label(self) -> str:
+        """Human name of the model this eval scored, whichever source it came from."""
+        if self.model_label_snapshot:
+            return self.model_label_snapshot
+        if self.model_source == self.EXPORTED:
+            return self.artifact_path or "(no artifact)"
+        if self.model_source == self.BUNDLE:
+            return self.bundle_path or "(no bundle)"
+        if self.trained_model_id:
+            return self.trained_model.name
+        return "(deleted model)"
+
+    def model_arch(self) -> str:
+        """Architecture label for the comparison page's header row.
+
+        Only a catalogued model records one; an artifact's arch lives in its
+        ``.meta.json`` and a bundle's in its manifest, neither of which is worth
+        opening to fill a table cell — the format is the useful distinction
+        there, and it is what the label already shows.
+        """
+        if self.trained_model_id:
+            return self.trained_model.arch
+        return dict(self.MODEL_SOURCE_CHOICES).get(self.model_source, self.model_source)
+
+    def model_checkpoint(self) -> str:
+        """Absolute path of the model artifact to evaluate.
+
+        Same resolution, and the same out-of-root refusals, as
+        :meth:`fleet.models.DatasetInferenceRun.model_checkpoint` — a bundle
+        resolves to the model *inside* it, and its geometry comes separately from
+        the manifest (see :meth:`sync_bundle`). Raises ``ValueError`` when the
+        model is missing or unusable.
+        """
+        if self.model_source == self.EXPORTED:
+            from training.services import exports
+
+            return str(exports.resolve(self.artifact_path))
+
+        if self.model_source == self.BUNDLE:
+            from training.services import bundles
+
+            return str(bundles.model_artifact(self.bundle_path))
+
+        if not self.trained_model_id:
+            raise ValueError("Eval has no trained model.")
+        if not self.trained_model.checkpoint_path:
+            raise ValueError(f"{self.trained_model.name}: no checkpoint path to evaluate.")
+        return str(self.trained_model.resolved_checkpoint_path())
+
+    def prediction_class_names(self) -> list:
+        """The class space this eval's saved predictions are indexed in.
+
+        Only needed for the two after-the-fact services that re-read those
+        predictions — "promote to labels" and the match-table rebuild — which
+        otherwise read a checkpoint for it. An artifact has no checkpoint to
+        read, so its ``.meta.json`` class map is sent instead; ``[]`` means
+        "read it from the checkpoint", which is what a trained-model eval does.
+        """
+        if self.model_source == self.EXPORTED:
+            from training.services import exports
+
+            return exports.read_class_names(self.artifact_path)
+        if self.model_source == self.BUNDLE:
+            from training.services import bundles
+
+            return bundles.read_class_names(self.bundle_path)
+        return []
+
+    def sync_bundle(self):
+        """Re-derive the pipeline fields from this eval's bundle, if it has one.
+
+        Bundle-sourced rows own no geometry of their own — the manifest does;
+        shares the contract (and the service) of
+        :meth:`videos.models.InferenceJob.sync_bundle`. A base
+        :class:`EvalRun` has no geometry fields to write, so this is a no-op
+        there and only :class:`~eval_pipelines.models.PipelineEvalRun` really
+        uses it.
+        """
+        if self.model_source != self.BUNDLE:
+            return None
+        from training.services import bundles
+
+        return bundles.apply_defaults(self, self.bundle_path)
+
+
+class EvalRun(EvaluatedModelSource):
+    """One standalone evaluation of a model against a dataset.
 
     Mirrors :class:`TrainingRun`: the admin action writes an eval request YAML
     and enqueues a job that drives the trainer service's /eval endpoint, then
     ingests the resulting metrics back here.
+
+    The model is usually a catalogued :class:`TrainedModel` (the Models tab's
+    "Evaluate…"), but does not have to be — see :class:`EvaluatedModelSource`
+    for the other two, which arrive from the Datasets tab's "Evaluate…".
     """
 
     CREATED = "created"
@@ -837,8 +978,11 @@ class EvalRun(models.Model):
     EXPLICIT = ExperimentDataset.EXPLICIT
     NONE = ExperimentDataset.NONE
 
+    # Null for an eval of an exported artifact or a bundle, which no catalogue
+    # entry need stand behind (one copied in from another machine has none).
     trained_model = models.ForeignKey(
-        TrainedModel, on_delete=models.CASCADE, related_name="eval_runs"
+        TrainedModel, on_delete=models.CASCADE, related_name="eval_runs",
+        null=True, blank=True,
     )
     # Extra models combined with `trained_model` into one merged evaluation —
     # see TrainedModelAdmin.evaluate. Empty for an ordinary single-model eval.
@@ -880,7 +1024,7 @@ class EvalRun(models.Model):
         return f"Eval #{self.pk} — {self._models_label()} on {self.dataset.name}"
 
     def _models_label(self) -> str:
-        names = [self.trained_model.name, *(m.name for m in self.combined_models.all())]
+        names = [self.model_label(), *(m.name for m in self.combined_models.all())]
         return " + ".join(names)
 
     @property
@@ -888,7 +1032,9 @@ class EvalRun(models.Model):
         return self.pk is not None and self.combined_models.exists()
 
     def all_models(self) -> list:
-        return [self.trained_model, *self.combined_models.all()]
+        """The catalogue entries behind this eval — empty for an artifact/bundle one."""
+        first = [self.trained_model] if self.trained_model_id else []
+        return [*first, *self.combined_models.all()]
 
     def metric(self, key: str):
         return self.metrics.get(key) if isinstance(self.metrics, dict) else None

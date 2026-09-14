@@ -176,6 +176,12 @@ def _run_geometry_rows(run) -> list[tuple[str, object]]:
             for label, value in rows]
 
 
+#: What an eval keeps for mAP by default — low, so the precision-recall curve is
+#: swept rather than truncated (the same default the Models tab's Evaluate form
+#: carries, and EvalRun.map_score_threshold's own).
+_DEFAULT_MAP_SCORE_THRESHOLD = 0.001
+
+
 def _dataset_run_form_values(defaults: dict, posted) -> dict:
     """The values to render the dataset-run form with: the shared pipeline half
     (prefilled from the model's own metadata) plus this form's own two knobs.
@@ -187,6 +193,23 @@ def _dataset_run_form_values(defaults: dict, posted) -> dict:
     return inference_form.form_values(defaults, posted, extra={
         "image_limit": _DEFAULT_IMAGE_LIMIT,
         "warmup": _DEFAULT_WARMUP,
+    })
+
+
+def _dataset_eval_form_values(defaults: dict, posted) -> dict:
+    """The values to render the dataset-eval form with.
+
+    The shared pipeline half prefilled from the model's own metadata, plus the
+    two knobs that belong to the *scoring* rather than to the model: the mAP
+    confidence floor and the labels to score against. ``score_threshold`` is not
+    among them — it is the shared half's own field, and an eval's operating point
+    and a serving run's confidence threshold are the same number.
+    """
+    return inference_form.form_values(defaults, posted, extra={
+        "map_score_threshold": _DEFAULT_MAP_SCORE_THRESHOLD,
+        "label_source": "",
+        "annotator": "",
+        "explicit_labels_path": "",
     })
 
 
@@ -398,6 +421,7 @@ class DatasetAdmin(admin.ModelAdmin):
     search_fields = ["name"]
     actions = [
         "run_model_inference",
+        "evaluate_on_dataset",
         "edit_annotation_tags",
         "setup_for_all_active",
         "sync_all_projects",
@@ -916,6 +940,213 @@ class DatasetAdmin(admin.ModelAdmin):
         # actually resolved.
         run.model_label_snapshot = run.model_label()
         return run, None
+
+    @admin.action(description="Evaluate a model on this dataset…")
+    def evaluate_on_dataset(self, request, queryset):
+        """Score a model against this dataset's labels — .pt, artifact or bundle.
+
+        The Models tab's "Evaluate…" starts from a catalogued checkpoint and asks
+        which dataset. This one starts from the dataset and asks which model, and
+        that is the whole point: it accepts the two formats that tab cannot offer,
+        an exported ``.onnx``/``.engine`` and an infer bundle. A ``.pt``'s mAP is
+        not the deployed model's mAP — export quantizes, an EfficientNMS plugin
+        replaces the framework's NMS, a bundle pins a geometry — so "is the thing
+        we ship still as accurate as the thing we trained" needs the artifact
+        itself scored, not its parent checkpoint.
+
+        The result is an ordinary eval: a :class:`~training.models.EvalRun` when
+        the pipeline is raw, a
+        :class:`~eval_pipelines.models.PipelineEvalRun` otherwise, landing in the
+        Eval Pipelines section beside every model-side eval, with the same
+        metrics, comparison page, tag analytics and promote-to-labels. That is
+        why it reuses those rows rather than inventing a dataset-side eval of its
+        own: a bundle's mAP is only interesting next to the checkpoint's.
+
+        Same two-step shape as "Run model inference…", and the same shared form
+        halves (``training.services.inference_form``), so the model list and the
+        pipeline knobs cannot drift from the serving forms.
+        """
+        if queryset.count() != 1:
+            self.message_user(request, "Select exactly one dataset to evaluate on.",
+                              level=messages.WARNING)
+            return None
+        dataset = queryset.first()
+        directory = dataset_inference.dataset_dir(dataset.name)
+
+        base_context = {
+            **self.admin_site.each_context(request),
+            "dataset": dataset,
+            "action": "evaluate_on_dataset",
+            "selected": [str(dataset.pk)],
+            "action_checkbox_name": ACTION_CHECKBOX_NAME,
+        }
+
+        # ------------------------------------------------- step 1: model source
+        model_source = request.POST.get("model_source") or ""
+        if model_source not in dict(inference_form.MODEL_SOURCE_CHOICES):
+            if request.POST.get("configure") or request.POST.get("apply"):
+                self.message_user(request, "Choose which kind of model to evaluate.",
+                                  level=messages.WARNING)
+            return TemplateResponse(
+                request, "admin/fleet/dataset_eval_source.html", {
+                    **base_context,
+                    "title": f"Evaluate a model — {dataset.name}",
+                    **inference_form.source_step_context(),
+                })
+
+        # ------------------------------------------------------- step 2: submit
+        if request.POST.get("apply"):
+            queued, error = self._queue_dataset_eval(request, dataset, model_source)
+            if error:
+                self.message_user(request, error, level=messages.WARNING)
+            else:
+                self.message_user(request, queued)
+                return redirect(reverse("admin:eval_pipelines_combinedeval_changelist"))
+
+        # ------------------------------------------ step 2: render the full form
+        from training.models import EvalRun
+
+        model_ctx = inference_form.model_context(model_source, request.POST)
+        context = {
+            **base_context,
+            "title": f"Evaluate a model — {dataset.name}",
+            **model_ctx,
+            **inference_form.pipeline_context(),
+            "values": _dataset_eval_form_values(model_ctx["defaults"], request.POST),
+            "annotators": Annotator.objects.filter(
+                status=Annotator.ACTIVE).order_by("username"),
+            "label_source_choices": EvalRun._meta.get_field("label_source").choices,
+            "images_dir": str(lsapi.image_source_dir(directory))
+                          if directory.is_dir() else str(directory),
+            "visible_to_trainer": dataset_inference.visible_to_trainer(directory),
+            "shared_data_root": str(dataset_inference.shared_data_root()),
+        }
+        return TemplateResponse(request, "admin/fleet/dataset_eval.html", context)
+
+    def _queue_dataset_eval(self, request, dataset, model_source):
+        """Validate the step-2 POST, create the eval row and enqueue it.
+
+        Returns ``(message, None)`` once the job is queued, or ``(None, message)``
+        on the first problem found, so the caller can re-render with a warning.
+
+        Which *kind* of eval is decided by the pipeline, exactly as the Models
+        tab decides it: raw (no chachak pipeline) is a base
+        :class:`~training.models.EvalRun`, anything else a
+        :class:`~eval_pipelines.models.PipelineEvalRun`. For a bundle the
+        pipeline is not the form's to choose — it is read back out of the
+        manifest here, so an operator who never pressed "Sync bundle" still gets
+        the geometry the bundle ships rather than a raw eval of a model that was
+        tuned for tiling.
+        """
+        from eval_pipelines.models import PipelineEvalRun
+        from training import jobs as training_jobs
+        from training.models import EvalRun
+        from training.services import bundles, config_gen
+
+        model_fields, error = inference_form.parse_model_source(request.POST, model_source)
+        if error:
+            return None, error
+        knobs, error = inference_form.parse_pipeline_fields(request.POST)
+        if error:
+            return None, error
+
+        map_score_threshold = inference_form.parse_float_in_range(
+            request.POST.get("map_score_threshold"), default=0.001, low=0.0, high=1.0)
+        if map_score_threshold is None:
+            return None, "mAP confidence floor must be between 0 and 1."
+
+        label_source = request.POST.get("label_source") or EvalRun.SOURCE
+        annotator = Annotator.objects.filter(pk=request.POST.get("annotator") or None).first()
+        explicit = (request.POST.get("explicit_labels_path") or "").strip()
+        if label_source == EvalRun.ANNOTATOR and annotator is None:
+            return None, "Pick an annotator for 'annotator output'."
+        if label_source == EvalRun.EXPLICIT and not explicit:
+            return None, "Give a labels path for 'explicit path'."
+
+        directory = dataset_inference.dataset_dir(dataset.name)
+        if not directory.is_dir():
+            return None, f"{dataset.name}: no dataset directory at {directory}."
+        if not dataset_inference.visible_to_trainer(directory):
+            return None, (
+                f"{directory} is outside {dataset_inference.shared_data_root()}, which "
+                f"is the only tree the trainer can open — images are handed to it as "
+                f"paths, not copied. Move the dataset under the data root (or point "
+                f"source_dir there) to evaluate on it."
+            )
+
+        # Where the ground truth will come from, checked here rather than left
+        # to fail in the trainer: a missing labels directory is the ordinary case
+        # of an annotator who never synced, and "eval #12 errored" half an hour
+        # later is a worse way to learn it. A "no labels" source resolves to None
+        # and is left alone — that run legitimately scores nothing and only
+        # writes predictions.
+        try:
+            labels = config_gen.resolve_label_dir(
+                dataset, label_source, annotator, explicit)
+        except ValueError as exc:
+            return None, str(exc)
+        if labels is not None and not Path(labels).is_dir():
+            return None, (f"{dataset.name}: no labels directory at {labels} — there "
+                          "is nothing to score against.")
+
+        # A bundle's geometry is the bundle's, not the form's — the server-side
+        # half of the locked fields on the page, re-read from the manifest so a
+        # stale page (or one whose "Sync bundle" was never pressed) still
+        # evaluates what the bundle actually says today.
+        if model_source == inference_form.BUNDLE:
+            defaults = bundles.pipeline_defaults(model_fields["bundle_path"])
+            if defaults is None:
+                return None, (f"{model_fields['bundle_path']}: cannot read the bundle's "
+                              "pipeline.json, so there is no geometry to evaluate with.")
+            knobs.update(bundles.geometry(defaults))
+
+        pipeline = knobs.pop("pipeline")
+        common = dict(
+            dataset=dataset,
+            label_source=label_source,
+            annotator=annotator,
+            explicit_labels_path=explicit,
+            map_score_threshold=map_score_threshold,
+            score_threshold=knobs.pop("score_threshold"),
+            model_source=model_source,
+            **model_fields,
+        )
+
+        if pipeline == inference_form.RAW:
+            # A base eval has no geometry columns at all: raw means the whole
+            # image goes straight to the model, and parse_pipeline_fields has
+            # already blanked every knob that implies otherwise.
+            eval_obj = EvalRun(**common)
+        else:
+            # Non-null on the row but optional on the form, so a blank field
+            # means the model's default rather than a null write.
+            if knobs.get("detector_expand_ratio") is None:
+                knobs["detector_expand_ratio"] = (
+                    PipelineEvalRun._meta.get_field("detector_expand_ratio").get_default())
+            eval_obj = PipelineEvalRun(pipeline=pipeline, **common, **knobs)
+
+        eval_obj.model_label_snapshot = eval_obj.model_label()
+        eval_obj.save()
+        try:
+            if isinstance(eval_obj, EvalRun):
+                config_gen.write_eval_request(eval_obj)
+            else:
+                config_gen.write_pipeline_request(eval_obj)
+        except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
+            eval_obj.delete()
+            return None, f"Cannot build the eval request: {exc}"
+
+        if isinstance(eval_obj, EvalRun):
+            _queue().enqueue(training_jobs.run_eval, eval_obj.pk,
+                             job_timeout=training_jobs.JOB_TIMEOUT)
+            label = f"Eval #{eval_obj.pk}"
+        else:
+            _queue().enqueue(training_jobs.run_pipeline_eval, eval_obj.pk,
+                             job_timeout=training_jobs.JOB_TIMEOUT)
+            label = f"Pipeline eval #{eval_obj.pk} ({pipeline})"
+        eval_obj.status = eval_obj.QUEUED
+        eval_obj.save(update_fields=["status"])
+        return (f"{label} queued for {eval_obj.model_label()} on {dataset.name}.", None)
 
     @admin.action(description="Merge selected datasets into a new dataset…")
     def merge_selected(self, request, queryset):

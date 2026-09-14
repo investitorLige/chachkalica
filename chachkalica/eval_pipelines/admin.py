@@ -160,6 +160,10 @@ class EvalDisplayMixin:
     def models_display(self, obj):
         """The primary model, plus any combined ones ("A + B").
 
+        ``model_label()`` rather than the FK's name: an eval of an exported
+        artifact or a bundle has no catalogue entry, and names itself by the
+        path it stamped on itself when it was queued.
+
         ``CombinedEval`` rows (the read-only union view) have no
         ``combined_models`` — the view only carries the primary FK — so those
         just show the one model name.
@@ -167,8 +171,8 @@ class EvalDisplayMixin:
         combined = getattr(obj, "combined_models", None)
         extra = combined.all() if combined is not None else []
         if not extra:
-            return obj.trained_model.name
-        return " + ".join([obj.trained_model.name, *(m.name for m in extra)])
+            return obj.model_label()
+        return " + ".join([obj.model_label(), *(m.name for m in extra)])
 
     @admin.display(description="status", ordering="status")
     def status_badge(self, obj):
@@ -383,11 +387,13 @@ class BaseEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin, adm
     promote_kind = "base"
     list_display = ["__str__", "models_display", "dataset", "status_badge",
                     "map50", "map50_95", "eval_time", "created_at"]
-    list_filter = ["status", "trained_model"]
+    list_filter = ["status", "model_source", "trained_model"]
     actions = ["analyze_selected", "open_tag_analytics", "build_tag_data",
                "launch_selected", "reconcile_selected", "promote_labels"]
     readonly_fields = [
-        "trained_model", "dataset", "label_source", "annotator", "explicit_labels_path",
+        "trained_model", "model_source", "artifact_path", "bundle_path",
+        "model_label_snapshot",
+        "dataset", "label_source", "annotator", "explicit_labels_path",
         "score_threshold",
         "status", "request_yaml_path", "output_dir", "metrics_pretty", "last_error",
         "started_at", "finished_at", "created_at",
@@ -438,11 +444,13 @@ class PipelineEvalRunAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMix
     promote_kind = "pipeline"
     list_display = ["__str__", "models_display", "dataset", "status_badge",
                     "map50", "map50_95", "eval_time", "created_at"]
-    list_filter = ["status", "trained_model"]
+    list_filter = ["status", "model_source", "trained_model"]
     actions = ["analyze_selected", "open_tag_analytics", "build_tag_data",
                "launch_selected", "reconcile_selected", "promote_labels"]
     readonly_fields = [
-        "trained_model", "dataset", "label_source", "annotator", "explicit_labels_path",
+        "trained_model", "model_source", "artifact_path", "bundle_path",
+        "model_label_snapshot",
+        "dataset", "label_source", "annotator", "explicit_labels_path",
         "pipeline", "detector_checkpoint", "detector_expand_ratio",
         "tile_width_pct", "tile_height_pct", "overlap", "chain",
         "score_threshold",
@@ -496,7 +504,7 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin,
     list_display = ["__str__", "models_display", "pipeline", "dataset", "status_badge",
                     "map50", "map50_95", "eval_time", "created_at"]
     list_display_links = None
-    list_filter = ["status", "pipeline", "trained_model"]
+    list_filter = ["status", "pipeline", "model_source", "trained_model"]
     actions = ["analyze_selected", "open_tag_analytics", "build_tag_data",
                "launch_selected", "reconcile_selected", "promote_labels",
                "delete_selected_evals"]
