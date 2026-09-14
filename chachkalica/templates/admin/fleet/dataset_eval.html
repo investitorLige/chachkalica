@@ -6,7 +6,7 @@
 <p class="help">Queued like any other eval: it runs on the trainer and lands in
 <em>Eval Pipelines</em> (raw models under &ldquo;Base Eval&rdquo;, pipelined ones under their
 pipeline), where it can be compared against the checkpoint&rsquo;s own numbers, sliced by
-annotation tag, or promoted to labels.</p>
+tag (see <em>Sliceable by</em> below), or promoted to labels.</p>
 
 {% if not visible_to_trainer %}
   <p class="errornote">
@@ -35,6 +35,8 @@ annotation tag, or promoted to labels.</p>
   <input type="hidden" name="action" value="{{ action }}">
   <input type="hidden" name="model_source" value="{{ model_source }}">
   <input type="hidden" name="apply" value="1">
+  {# The tag panel is dataset-keyed and this form has no dataset field. #}
+  <input type="hidden" id="dataset" value="{{ dataset.pk }}">
 
   {# The model + pipeline half, shared verbatim with the inference forms — same
      knobs, same prefill from the model's own recorded pipeline, so a model is
@@ -83,6 +85,17 @@ annotation tag, or promoted to labels.</p>
     source</em> is &ldquo;explicit path&rdquo;.</p>
   </div>
 
+  {# Directly under the three inputs that decide it, because the causal link is
+     the point: this is what the eval will be sliceable by, and these fields are
+     what settles it. #}
+  <div class="form-row" id="tag-availability"
+       data-tag-panel="{{ tag_availability_url }}">
+    <label>Sliceable by:</label>
+    <div data-tag-panel-report>
+      {% include "admin/training/_tag_availability.html" %}
+    </div>
+  </div>
+
   <div class="submit-row">
     <input type="submit" class="default" value="Queue evaluation">
     <a href="../" class="button cancel-link">Cancel</a>
@@ -90,4 +103,5 @@ annotation tag, or promoted to labels.</p>
 </form>
 
 {% include "admin/videos/_inference_scripts.html" %}
+<script src="{% static 'training/eval_tag_panel.js' %}"></script>
 {% endblock %}

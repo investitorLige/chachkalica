@@ -28,7 +28,7 @@ from admin_sections.scoping import scope_queryset
 from fleet import jobs
 from fleet.models import (
     AnnotationTag, Annotator, Dataset, DatasetInferenceResult, DatasetInferenceRun,
-    FleetSettings, GroundingSamRun, Project,
+    DatasetMeasureRun, FleetSettings, GroundingSamRun, Project,
 )
 from fleet.services import analytics as analytics_svc
 from fleet.services import annotation_tags as annotation_tags_svc
@@ -40,7 +40,7 @@ from fleet.services import merge as merge_svc
 from fleet.services import overlap as overlap_svc
 from fleet.services import split as split_svc
 from fleet.services.paths import source_root
-from training.services import inference_form
+from training.services import inference_form, tag_availability
 from videos.services import inference
 
 _STATUS_COLORS = {
@@ -80,6 +80,13 @@ _DEFAULT_WARMUP = 3
 #: flipping through the whole dataset.
 _RUN_THUMB_WIDTH = 260
 _RUN_ROW_LIMIT = 300
+
+
+#: A measuring pass is a decode plus a histogram per image — roughly the cost of
+#: the duplicate-image scan, which the 79k-image `person_all` takes ~35 min for.
+#: Two hours leaves room for a slower disk without letting a wedged job sit
+#: forever.
+MEASURE_JOB_TIMEOUT = 7200
 
 
 def _queue():
@@ -423,6 +430,8 @@ class DatasetAdmin(admin.ModelAdmin):
         "run_model_inference",
         "evaluate_on_dataset",
         "edit_annotation_tags",
+        "measure_images",
+        "measure_boxes",
         "setup_for_all_active",
         "sync_all_projects",
         "setup_sync_one_annotator",
@@ -726,6 +735,62 @@ class DatasetAdmin(admin.ModelAdmin):
         }
         return TemplateResponse(request, "admin/fleet/promote_annotator.html", context)
 
+    @admin.action(description="Measure image statistics (brightness / contrast)…")
+    def measure_images(self, request, queryset):
+        """Measure every image once, so any eval of this dataset can be sliced by it.
+
+        Cached per dataset rather than per eval: brightness and contrast are
+        properties of the frames, not of any model run, so one pass serves every
+        eval of them forever after. No GPU and no trainer — it is a decode and a
+        histogram per image, which is why it can run on the web worker.
+        """
+        for dataset in queryset:
+            run = DatasetMeasureRun.objects.create(dataset=dataset)
+            _queue().enqueue(jobs.measure_dataset_images, run.id,
+                             job_timeout=MEASURE_JOB_TIMEOUT)
+        self.message_user(
+            request,
+            f"{queryset.count()} dataset(s) queued for measuring — track progress under "
+            "Fleet > Image measures runs. The results appear as computed tags on every "
+            "eval of these datasets, including ones that have already finished.",
+        )
+
+    @admin.action(description="Measure box statistics (person size / pose)…")
+    def measure_boxes(self, request, queryset):
+        """Measure each ground-truth box's person and posture, against source labels.
+
+        Runs in the trainer — it needs a person detector and the posture engine —
+        and takes its one job slot for the duration, so queued evals wait. Scoped
+        to the dataset's *source* labels; to measure an annotator's labels
+        instead, start from the eval that scored them (Tag analytics names the
+        label set it is missing and offers the same button).
+        """
+        from training import jobs as training_jobs
+        from training.models import EvalRun
+        from training.services import config_gen as config_gen_svc
+
+        queued = []
+        for dataset in queryset:
+            run = DatasetMeasureRun.objects.create(
+                dataset=dataset, kind=DatasetMeasureRun.BOX,
+                label_source=EvalRun.SOURCE)
+            try:
+                config_gen_svc.write_measures_request(run)
+            except (ValueError, FileNotFoundError, RuntimeError) as exc:
+                run.delete()
+                self.message_user(request, f"{dataset.name}: {exc}", level=messages.ERROR)
+                continue
+            _queue().enqueue(training_jobs.build_box_measures, run.pk,
+                             job_timeout=training_jobs.JOB_TIMEOUT)
+            queued.append(f"{dataset.name} ({run.person_source} person boxes)")
+        if queued:
+            self.message_user(
+                request,
+                "Measuring " + ", ".join(queued) + ". The trainer runs one job at a "
+                "time, so queued evals will wait — track it under Fleet > Image "
+                "measures runs.",
+            )
+
     @admin.action(description="Generate labels with Grounding SAM…")
     def generate_grounding_sam_labels(self, request, queryset):
         """Auto-label a dataset's unlabeled images from classes.txt via Grounding SAM.
@@ -1021,6 +1086,18 @@ class DatasetAdmin(admin.ModelAdmin):
             "visible_to_trainer": dataset_inference.visible_to_trainer(directory),
             "shared_data_root": str(dataset_inference.shared_data_root()),
         }
+        # The dataset is fixed here, but label_source/annotator are not -- and
+        # they are what decides which tag answers a later Tag analytics page
+        # finds -- so the panel is rendered for the current values and then kept
+        # in step by the same JS the model-side form uses.
+        values = context["values"]
+        context["availability"] = tag_availability.availability(
+            dataset,
+            values.get("label_source") or EvalRun.SOURCE,
+            Annotator.objects.filter(pk=values.get("annotator") or None).first(),
+            values.get("explicit_labels_path") or "",
+        )
+        context["tag_availability_url"] = reverse("dataset-tags")
         return TemplateResponse(request, "admin/fleet/dataset_eval.html", context)
 
     def _queue_dataset_eval(self, request, dataset, model_source):
@@ -1832,6 +1909,39 @@ class GroundingSamRunAdmin(admin.ModelAdmin):
     @admin.display(description="progress")
     def progress(self, obj):
         return f"{obj.images_processed}/{obj.images_total}"
+
+
+@admin.register(DatasetMeasureRun)
+class DatasetMeasureRunAdmin(admin.ModelAdmin):
+    """Progress tracker for image-measurement passes.
+
+    Monitoring only — runs are created from the Dataset admin's "Measure image
+    statistics…" action. Refresh to watch ``images_processed`` move; the numbers
+    it produces live in the dataset's own sidecar, not on these rows, because
+    they outlive the run and are read by every later eval.
+    """
+
+    list_display = ["dataset", "status_badge", "progress", "images_failed",
+                    "created_at", "finished_at"]
+    list_filter = ["status", "dataset"]
+    ordering = ["-created_at"]
+    fields = ["dataset", "status_badge", "progress", "images_failed", "signature",
+              "error", "created_at", "started_at", "finished_at"]
+    readonly_fields = fields
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    @admin.display(description="status", ordering="status")
+    def status_badge(self, obj):
+        return _status_badge(obj.status)
+
+    @admin.display(description="progress")
+    def progress(self, obj):
+        return obj.progress()
 
 
 @admin.register(DatasetInferenceRun)

@@ -1,5 +1,11 @@
 # Annotation tags
 
+> Not every slice needs an annotator. [Tag analytics](tag-analytics.md)
+> also offers **computed tags** — frame crowding and box size — measured
+> from the eval itself, so a dataset with no tags at all can still be cut
+> into meaningful slices. Define tags here for the questions only a person
+> can answer.
+
 Extra questions annotators answer beyond drawing boxes: *is this frame indoors,
 is this box occluded, how far away is it*. Defined per dataset, compiled into
 the labeling interface of every Label Studio project created for it.

@@ -19,6 +19,16 @@
                 background: #6b7b8c; border-radius: 3px; padding: 1px 6px; margin-left: 8px;
                 vertical-align: middle; }
   .tga .scope.box { background: #8c6b7b; }
+  /* Computed tags are badged so a measured slice is never mistaken for one a
+     person answered, and vice versa. */
+  .tga .scope.auto { background: #4a6a8c; }
+  .tga .state { display: inline-block; font-size: 11px; border-radius: 3px;
+                padding: 1px 6px; color: #fff; background: #147837; }
+  .tga .state.partial { background: #b8860b; }
+  .tga .state.missing { background: #8a8a8a; }
+  .tga .cuts { color: #777; font-size: 12px; margin: .2em 0 .4em; }
+  .tga .cuts code { font-size: 11px; }
+  .tga tr.empty td { color: #bbb; }
   /* Deltas carry an explicit palette so they stay legible under the admin's dark
      theme, same reason the confusion matrix on the compare page does. */
   .tga .delta { font-weight: 700; }
@@ -61,9 +71,44 @@
   {{ subject_name }} &nbsp;·&nbsp; dataset <strong>{{ dataset }}</strong>
 </p>
 
-{% if problem %}
-  <div class="banner">{{ problem }}</div>
+{% if fatal %}
+  <div class="banner">{{ fatal }}</div>
 {% else %}
+
+<h2>Data sources</h2>
+<p class="note">
+  What this page had to read, and what each one costs when it is missing. Only the match
+  outcomes are required — every other gap removes some tags, not the page.
+</p>
+<table>
+  <thead><tr><th class="rowlabel">source</th><th class="rowlabel">state</th>
+             <th class="rowlabel">detail</th></tr></thead>
+  <tbody>
+    {% for source in sources %}
+      <tr>
+        <td class="rowlabel">{{ source.label }}</td>
+        <td class="rowlabel"><span class="state {{ source.state }}">{{ source.state }}</span></td>
+        <td class="rowlabel">{{ source.detail }}
+          {% if source.key == "box_measures" and source.state != "ok" %}
+            <form method="post" action="{{ measure_url }}?{{ query }}" style="display:inline">
+              {% csrf_token %}
+              <input type="hidden" name="measure_kind" value="box">
+              <button type="submit" class="button">Measure now</button>
+            </form>
+          {% endif %}
+          {% if source.key == "measures" and source.state != "ok" %}
+            {# The person reading "not measured yet" is the person who wants it
+               measured; sending them to find the dataset is a detour. #}
+            <form method="post" action="{{ measure_url }}?{{ query }}" style="display:inline">
+              {% csrf_token %}
+              <button type="submit" class="button">Measure now</button>
+            </form>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
 {% with report=report %}
 
 <p class="note">
@@ -114,8 +159,20 @@
       <tr><td class="rowlabel">Images whose box tags were dropped</td>
           <td>{{ report.coverage.row_mismatches }}</td></tr>
     {% endif %}
+    {% if report.coverage.ambiguous_filenames %}
+      <tr><td class="rowlabel">Images with an ambiguous filename</td>
+          <td>{{ report.coverage.ambiguous_filenames }}</td></tr>
+    {% endif %}
   </tbody>
 </table>
+{% if report.coverage.ambiguous_filenames %}
+  <p class="note">
+    Measurements are joined to frames by filename, which is all the match table records.
+    {{ report.coverage.ambiguous_filenames }} image(s) share a basename with an image in a
+    different subdirectory, so no measurement can be attributed to either without guessing —
+    they are left unmeasured instead.
+  </p>
+{% endif %}
 {% if report.coverage.row_mismatches %}
   <p class="note">
     Box tags are joined to ground-truth boxes by their line number in the label file, checked
@@ -141,15 +198,35 @@
 </div>
 
 {% for breakdown in report.breakdowns %}
-  <h3>{{ breakdown.name }}
+  <h3>{{ breakdown.label }}
     <span class="scope {% if breakdown.kind == 'box' %}box{% endif %}">
       {% if breakdown.kind == 'box' %}box-wide{% else %}frame-wide{% endif %}</span>
+    {% if breakdown.source == 'auto' %}<span class="scope auto">computed</span>{% endif %}
   </h3>
   <p class="note">
-    answered on {{ breakdown.answered }} of {{ breakdown.total }}
+    {% if breakdown.source == 'auto' %}
+      measured on {{ breakdown.answered }} of {{ breakdown.total }}
+    {% else %}
+      answered on {{ breakdown.answered }} of {{ breakdown.total }}
+    {% endif %}
     {% if breakdown.kind == 'box' %}boxes{% else %}images{% endif %}
+    {% if breakdown.unit %}· {{ breakdown.unit }}{% endif %}
     {% if breakdown.truncated %}· only the most common values are shown{% endif %}
   </p>
+  {% if breakdown.cuts %}
+    {# A bucket called "low" means nothing without the number behind it, and the
+       cut points are this dataset's own — they do not transfer to another eval. #}
+    <p class="cuts">cut into terciles over this eval:
+      {% for cut in breakdown.cuts %}
+        <code>{{ cut.value }}</code>
+        {% if cut.min is None %}&le; {{ cut.max|floatformat:3 }}
+        {% elif cut.max is None %}&gt; {{ cut.min|floatformat:3 }}
+        {% else %}{{ cut.min|floatformat:3 }}&ndash;{{ cut.max|floatformat:3 }}{% endif %}
+        ({{ cut.count }}){% if not forloop.last %} ·{% endif %}
+      {% endfor %}
+      {% if breakdown.status_detail %}<br>{{ breakdown.status_detail }}{% endif %}
+    </p>
+  {% endif %}
 
   {% if breakdown.kind == 'frame' %}
     <table>
@@ -160,16 +237,30 @@
       </thead>
       <tbody>
         {% for row in breakdown.rows %}
-          <tr>
+          {# A value nothing falls into has no score, only zeros. Dashes, because
+             a row reading "mAP50 0.0000" looks like a model that failed rather
+             than a bucket nobody used. #}
+          <tr {% if row.empty %}class="empty"{% endif %}>
             <td class="rowlabel">{{ row.value }}</td>
             <td>{{ row.images }}</td><td>{{ row.gt }}</td><td>{{ row.predictions }}</td>
-            <td>{{ row.map50|floatformat:4 }}</td>
-            <td class="delta {% if row.delta < 0 %}down{% elif row.delta > 0 %}up{% endif %}">
-              {% if row.delta < 0 %}{{ row.delta|floatformat:3 }}{% else %}+{{ row.delta|floatformat:3 }}{% endif %}</td>
-            <td>{{ row.map50_95|floatformat:4 }}</td>
-            <td>{{ row.precision|floatformat:4 }}</td>
-            <td>{{ row.recall|floatformat:4 }}</td>
-            <td>{{ row.f1|floatformat:4 }}</td>
+            {% if row.empty %}
+              <td colspan="6">no images carry this value</td>
+            {% elif row.no_ground_truth %}
+              {# No ground truth here, so mAP and recall are undefined rather
+                 than zero. Precision and the prediction count are still real:
+                 they say how often the model fired on an empty frame. #}
+              <td class="na" colspan="3">no ground truth &mdash; mAP undefined</td>
+              <td>{{ row.precision|floatformat:4 }}</td>
+              <td class="na" colspan="2">&mdash;</td>
+            {% else %}
+              <td>{{ row.map50|floatformat:4 }}</td>
+              <td class="delta {% if row.delta < 0 %}down{% elif row.delta > 0 %}up{% endif %}">
+                {% if row.delta < 0 %}{{ row.delta|floatformat:3 }}{% else %}+{{ row.delta|floatformat:3 }}{% endif %}</td>
+              <td>{{ row.map50_95|floatformat:4 }}</td>
+              <td>{{ row.precision|floatformat:4 }}</td>
+              <td>{{ row.recall|floatformat:4 }}</td>
+              <td>{{ row.f1|floatformat:4 }}</td>
+            {% endif %}
           </tr>
         {% endfor %}
       </tbody>
@@ -183,15 +274,19 @@
       </thead>
       <tbody>
         {% for row in breakdown.rows %}
-          <tr>
+          <tr {% if row.empty %}class="empty"{% endif %}>
             <td class="rowlabel">{{ row.value }}</td>
             <td>{{ row.gt }}</td><td>{{ row.found }}</td><td>{{ row.missed }}</td>
-            <td>{{ row.recall|floatformat:4 }}</td>
-            <td class="delta {% if row.delta < 0 %}down{% elif row.delta > 0 %}up{% endif %}">
-              {% if row.delta < 0 %}{{ row.delta|floatformat:3 }}{% else %}+{{ row.delta|floatformat:3 }}{% endif %}</td>
-            <td>{{ row.recall_50_95|floatformat:4 }}</td>
-            <td>{{ row.mean_iou|floatformat:4 }}</td>
-            <td>{{ row.mean_score|floatformat:4 }}</td>
+            {% if row.empty %}
+              <td colspan="5">no boxes carry this value</td>
+            {% else %}
+              <td>{{ row.recall|floatformat:4 }}</td>
+              <td class="delta {% if row.delta < 0 %}down{% elif row.delta > 0 %}up{% endif %}">
+                {% if row.delta < 0 %}{{ row.delta|floatformat:3 }}{% else %}+{{ row.delta|floatformat:3 }}{% endif %}</td>
+              <td>{{ row.recall_50_95|floatformat:4 }}</td>
+              <td>{{ row.mean_iou|floatformat:4 }}</td>
+              <td>{{ row.mean_score|floatformat:4 }}</td>
+            {% endif %}
           </tr>
         {% endfor %}
       </tbody>
@@ -205,6 +300,29 @@
     </p>
   {% endif %}
 {% endfor %}
+
+{% if report.tags_without_data %}
+  <h2>Tags with no data here</h2>
+  <p class="note">
+    Defined somewhere, but unable to slice this eval. They are listed rather than dropped
+    because &ldquo;what could I have cut this by?&rdquo; is the question this page exists to
+    answer, and a silent omission answers it wrong.
+  </p>
+  <table>
+    <thead><tr><th class="rowlabel">tag</th><th class="rowlabel">scope</th>
+               <th class="rowlabel">source</th><th class="rowlabel">why</th></tr></thead>
+    <tbody>
+      {% for entry in report.tags_without_data %}
+        <tr>
+          <td class="rowlabel">{{ entry.label }}</td>
+          <td class="rowlabel">{% if entry.kind == 'box' %}box-wide{% else %}frame-wide{% endif %}</td>
+          <td class="rowlabel">{% if entry.source == 'auto' %}computed{% else %}annotator{% endif %}</td>
+          <td class="rowlabel">{{ entry.detail }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
 
 <h2>Cross-tab</h2>
 <p class="note">
@@ -275,7 +393,15 @@ as page text.{% endcomment %}
   const selectA = document.getElementById("tga-a");
   const selectB = document.getElementById("tga-b");
   const selectMetric = document.getElementById("tga-metric");
-  const tagOptions = TAGS.map(t => [t.name, t.name + (t.kind === "box" ? "  (box-wide)" : "")]);
+  // The option's value stays the tag's real name -- it is the wire key for
+  // every slice request -- while the label shows the readable half plus how it
+  // was produced, so a measured slice is never mistaken for an annotated one.
+  const tagOptions = TAGS.map(t => [
+    t.name,
+    (t.label || t.name)
+      + (t.kind === "box" ? "  (box-wide)" : "")
+      + (t.source === "auto" ? "  · computed" : ""),
+  ]);
   fill(selectA, tagOptions);
   fill(selectB, tagOptions);
   if (TAGS.length > 1) { selectB.selectedIndex = 1; }

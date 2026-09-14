@@ -378,14 +378,48 @@ class TagAnalyticsViewTests(PipelineEvalSetup):
 
         response = self._get(er)
 
-        self.assertIn("Build tag analytics data", response.context_data["problem"])
+        self.assertIn("Build tag analytics data", response.context_data["fatal"])
 
-    def test_a_dataset_with_no_tag_answers_says_where_they_would_be(self):
+    def test_a_dataset_with_no_tag_answers_still_renders_what_it_can(self):
+        # Missing annotator answers cost some tags, not the page: crowding comes
+        # off the match table alone, so an untagged dataset is still sliceable.
+        er = self._eval_with_table(table={
+            **_MATCH_TABLE,
+            "images": ["img1.jpg", "img2.jpg", "img3.jpg"],
+            "gt": {"image": [0, 0, 1, 2], "class": [0, 0, 0, 0], "row": [0, 1, 0, 0]},
+        })
+
+        response = self._get(er)
+        response.render()
+
+        self.assertIsNone(response.context_data["fatal"])
+        report = response.context_data["report"]
+        self.assertIn("auto:crowding", [b["name"] for b in report["breakdowns"]])
+
+    def test_a_measure_that_cannot_split_this_data_says_so_instead(self):
+        # Every image in this fixture holds exactly one box, so crowding has a
+        # single bucket -- which is not a slice, and is reported as such rather
+        # than rendered as a full-width row that looks like a result.
         er = self._eval_with_table(table=_MATCH_TABLE)
 
         response = self._get(er)
 
-        self.assertIn("annotation_tags.json", response.context_data["problem"])
+        report = response.context_data["report"]
+        entry = next(e for e in report["tags_without_data"]
+                     if e["name"] == "auto:crowding")
+        self.assertEqual(entry["status"], "collapsed")
+
+    def test_a_missing_tag_sidecar_is_reported_as_a_source_not_a_dead_page(self):
+        er = self._eval_with_table(table=_MATCH_TABLE)
+
+        response = self._get(er)
+
+        states = {s["key"]: s for s in response.context_data["sources"]}
+        # A version 1 table reads fine but carries no box geometry, so it is a
+        # partial source rather than a missing one.
+        self.assertEqual(states["match_table"]["state"], "partial")
+        self.assertEqual(states["annotator_tags"]["state"], "missing")
+        self.assertIn("annotation_tags.json", states["annotator_tags"]["detail"])
 
     def test_both_artifacts_present_renders_the_report(self):
         er = self._eval_with_table(table=_MATCH_TABLE, tags=_TAG_DOCUMENT)
@@ -393,9 +427,9 @@ class TagAnalyticsViewTests(PipelineEvalSetup):
         response = self._get(er)
         response.render()
 
-        self.assertIsNone(response.context_data["problem"])
+        self.assertIsNone(response.context_data["fatal"])
         report = response.context_data["report"]
-        self.assertEqual([b["name"] for b in report["breakdowns"]], ["weather"])
+        self.assertIn("weather", [b["name"] for b in report["breakdowns"]])
         self.assertContains(response, "Tag analytics")
         self.assertContains(response, "weather")
 
@@ -532,3 +566,85 @@ class ProxyCleanupTests(TestCase):
         )
         BatchDetectEval.objects.all().delete()
         self.assertFalse(out.exists())
+
+
+class TagCompareTests(PipelineEvalSetup):
+    """One tag's slices, side by side across several evals."""
+
+    _VARIED = {
+        **_MATCH_TABLE,
+        "images": ["img1.jpg", "img2.jpg", "img3.jpg"],
+        "gt": {"image": [0, 0, 1, 2], "class": [0, 0, 0, 0], "row": [0, 1, 0, 0]},
+    }
+
+    def _eval(self, name, table, score_threshold=0.25):
+        output_dir = self.source.parent / name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "eval_matches.json").write_text(
+            json.dumps({**table, "score_threshold": score_threshold}), encoding="utf-8")
+        return EvalRun.objects.create(
+            trained_model=self.tm, dataset=self.ds1, label_source=EvalRun.SOURCE,
+            output_dir=str(output_dir), metrics={"map50": 0.5},
+        )
+
+    def _get(self, evals, **params):
+        admin = CombinedEvalAdmin(CombinedEval, AdminSite())
+        tokens = ",".join(f"{CombinedEval.BASE}:{e.pk}" for e in evals)
+        request = RequestFactory().get("/", {"evals": tokens, **params})
+        request.user = mock.Mock(is_active=True, is_staff=True)
+        return json.loads(admin.tag_compare_data(request).content)
+
+    def test_it_lists_what_these_evals_can_be_compared_by(self):
+        payload = self._get([self._eval("cmp-1", self._VARIED),
+                             self._eval("cmp-2", self._VARIED)], mode="tags")
+
+        self.assertIn("auto:crowding", [t["name"] for t in payload["tags"]])
+        self.assertEqual(len(payload["columns"]), 2)
+
+    def test_it_scores_one_tag_across_every_column(self):
+        payload = self._get([self._eval("cmp-3", self._VARIED),
+                             self._eval("cmp-4", self._VARIED)],
+                            tag="auto:crowding", metric="map50")
+
+        self.assertEqual(payload["tag"], "auto:crowding")
+        self.assertTrue(payload["rows"])
+        for row in payload["rows"]:
+            self.assertEqual(len(row["cells"]), 2)
+
+    def test_a_column_without_the_tag_is_marked_not_dropped(self):
+        # The second eval's every image holds one box, so crowding collapses
+        # there and cannot slice -- but the column must still be shown.
+        payload = self._get([self._eval("cmp-5", self._VARIED),
+                             self._eval("cmp-6", _MATCH_TABLE)],
+                            tag="auto:crowding", metric="map50")
+
+        self.assertEqual(len(payload["columns"]), 2)
+        self.assertTrue(payload["columns"][1]["absent"])
+        self.assertTrue(all(row["cells"][1]["absent"] for row in payload["rows"]))
+
+    def test_columns_scored_at_different_confidences_are_flagged(self):
+        payload = self._get([self._eval("cmp-7", self._VARIED, score_threshold=0.25),
+                             self._eval("cmp-8", self._VARIED, score_threshold=0.5)],
+                            tag="auto:crowding", metric="map50")
+
+        self.assertTrue(any("operating confidence" in w for w in payload["warnings"]))
+
+    def test_an_eval_with_no_match_table_is_noted_rather_than_fatal(self):
+        good = self._eval("cmp-9", self._VARIED)
+        bare = EvalRun.objects.create(
+            trained_model=self.tm, dataset=self.ds1, label_source=EvalRun.SOURCE,
+            output_dir=str(self.source.parent / "cmp-none"), metrics={"map50": 0.1})
+
+        payload = self._get([good, bare], tag="auto:crowding", metric="map50")
+
+        self.assertEqual(len(payload["columns"]), 1)
+        self.assertTrue(any("Build tag analytics data" in note for note in payload["notes"]))
+
+    def test_naming_no_usable_eval_is_an_error_not_an_empty_grid(self):
+        bare = EvalRun.objects.create(
+            trained_model=self.tm, dataset=self.ds1, label_source=EvalRun.SOURCE,
+            output_dir=str(self.source.parent / "cmp-empty"), metrics={})
+
+        payload = self._get([bare], tag="auto:crowding")
+
+        self.assertIn("error", payload)

@@ -1278,7 +1278,12 @@ def _f1(precision: float, recall: float) -> float:
 # analytics are computed from outside this process.
 # --------------------------------------------------------------------------
 
-MATCH_TABLE_VERSION = 1
+#: Version 2 added ``gt.w``/``gt.h`` — each ground-truth box's extent as a
+#: fraction of its frame — so a consumer can slice an eval by object size
+#: without re-reading the label files (whose row semantics are this module's,
+#: not theirs). A version 1 table is still perfectly readable; it simply has
+#: no geometry, and a reader should say so rather than guess.
+MATCH_TABLE_VERSION = 2
 
 
 def _remap_target_rows(target, id_to_name, eval_name_to_id):
@@ -1410,14 +1415,15 @@ def match_table(
 
     Shape (all coordinates already gone; only outcomes remain)::
 
-        {"version": 1,
+        {"version": 2,
          "iou_thresholds": [0.5, ...],
          "score_threshold": 0.25,          # the headline operating point
          "score_floor": 0.001,             # lowest score present in the rows
          "operating_nms_threshold": null,
          "classes": {"0": "person", ...},
          "images": ["img01.jpg", ...],
-         "gt":   {"image": [...], "class": [...], "row": [...]},
+         "gt":   {"image": [...], "class": [...], "row": [...],
+                  "w": [...], "h": [...]},
          "pred": {"image": [...], "class": [...], "score": [...],
                   "iou": [...], "gt": [...]},
          "pred_operating": {...} | null}
@@ -1425,7 +1431,9 @@ def match_table(
     ``pred.gt`` indexes the ``gt`` arrays (or -1 for a prediction with no
     same-class ground truth in its image), so the two tables join directly.
     ``gt.row`` is the box's line in its label file, which is what the annotation
-    tag sidecar keys per-box answers on.
+    tag sidecar keys per-box answers on. ``gt.w``/``gt.h`` are the box's width
+    and height as fractions of its own frame, carried here so "how does this
+    model do on small objects" needs neither the label files nor the images.
 
     ``pred`` holds the AP set: raw, NMS-free, collected down to the AP score
     floor. ``pred_operating`` is only present when the run used an operating
@@ -1483,6 +1491,8 @@ def match_table(
     gt_image: list[int] = []
     gt_class: list[int] = []
     gt_row: list[int] = []
+    gt_width: list[float] = []
+    gt_height: list[float] = []
     gt_offsets: list[int] = []
     for image_index, target in enumerate(prepared_targets):
         gt_offsets.append(len(gt_image))
@@ -1490,6 +1500,23 @@ def match_table(
         gt_image.extend([image_index] * len(labels))
         gt_class.extend(labels)
         gt_row.extend(gt_rows_per_image[image_index])
+        # Extent as a fraction of the frame. Taken from the same target the
+        # labels above came from, so these line up with gt_row for free:
+        # _remap_target_rows returns the surviving boxes and their source rows
+        # in step, and a box that was dropped by the eval-class remap is absent
+        # from both. Rounded like the prediction block's floats -- six decimals
+        # is finer than any box is measured to, and keeps the file small.
+        height, width = [int(value) for value in target['orig_size'].tolist()[:2]]
+        for box in target['boxes'].tolist():
+            if width > 0 and height > 0:
+                gt_width.append(round((box[2] - box[0]) / width, 6))
+                gt_height.append(round((box[3] - box[1]) / height, 6))
+            else:
+                # No frame size to divide by (a backfilled record that never
+                # recorded one). A fabricated ratio would look like data, so
+                # say "unknown" and let the reader disable the tag instead.
+                gt_width.append(-1.0)
+                gt_height.append(-1.0)
 
     pred_block = _prediction_block(prepared_predictions, prepared_targets, gt_offsets)
 
@@ -1521,7 +1548,8 @@ def match_table(
             for class_id in class_ids
         },
         "images": names,
-        "gt": {"image": gt_image, "class": gt_class, "row": gt_row},
+        "gt": {"image": gt_image, "class": gt_class, "row": gt_row,
+               "w": gt_width, "h": gt_height},
         "pred": pred_block,
         "pred_operating": operating_block,
     }

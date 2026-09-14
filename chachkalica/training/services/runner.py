@@ -85,6 +85,25 @@ def fetch_eval_status(eval_run, ts: TrainingSettings | None = None) -> dict:
     return resp.json()
 
 
+def launch_measures(run_id: int, request_path: str) -> dict:
+    """Start a box-measure pass (person size, posture) in the trainer."""
+    response = requests.post(
+        f"{base_url()}/measures",
+        json={"measures_id": run_id, "request_path": str(request_path)},
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_measures_status(run_id: int) -> dict:
+    response = requests.get(f"{base_url()}/measures/{run_id}", timeout=TIMEOUT)
+    if response.status_code == 404:
+        return {"status": "unknown"}
+    response.raise_for_status()
+    return response.json()
+
+
 def launch_pipeline(pe, ts: TrainingSettings | None = None) -> dict:
     """Ask the service to run a chachak pipeline eval from its generated request."""
     payload = {"pipeline_id": pe.pk, "request_path": pe.request_yaml_path}

@@ -100,3 +100,16 @@ labels, and the match-table rebuild — need to know the class space those ids a
 in. For a catalogued model the trainer reads it back out of the checkpoint; for
 an artifact or bundle, Django sends the `.meta.json` class list instead
 (`config_gen.prediction_space`).
+
+## Sliceable by
+
+The form shows, under the label-source fields, what an eval against these labels
+will be able to be cut by afterwards: the dataset's
+[annotation tags](annotation-tags.md) and whether each has answers synced to
+*these* labels, plus the computed tags that need no annotation.
+
+It sits there rather than next to the dataset picker on purpose. Tag answers are
+read from whichever labels the eval scored against, so **label source** and
+**annotator** decide which answers a later
+[Tag analytics](tag-analytics.md) page can find — and that used to be invisible
+until the page refused to render.
