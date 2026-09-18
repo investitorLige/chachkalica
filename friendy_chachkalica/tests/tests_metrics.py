@@ -377,7 +377,9 @@ class MatchTableGeometryTests(unittest.TestCase):
 
     def test_the_table_announces_the_version_that_carries_geometry(self):
         self.assertEqual(self._table()["version"], MATCH_TABLE_VERSION)
-        self.assertEqual(MATCH_TABLE_VERSION, 2)
+        # Version 3 added prediction geometry on top of the ground-truth
+        # extents this class covers; the reader pins the same number.
+        self.assertEqual(MATCH_TABLE_VERSION, 3)
 
     def test_extents_follow_the_surviving_rows_not_the_original_order(self):
         gt = self._table()["gt"]
@@ -403,3 +405,82 @@ class MatchTableGeometryTests(unittest.TestCase):
 
         self.assertTrue(all(value == -1.0 for value in gt["w"]))
         self.assertTrue(all(value == -1.0 for value in gt["h"]))
+
+
+class MatchTablePredictionGeometryTests(unittest.TestCase):
+    """The sparse boxes version 3 adds, and why they are sparse.
+
+    A prediction's match outcome says whether it was right; it cannot say *where
+    it was*, and "which person did this land on" needs the second. Carrying the
+    full prediction set's coordinates would roughly triple a table that already
+    runs to tens of megabytes, almost all of it rows scoring 0.01 that no
+    per-person question is ever asked of -- so geometry stops at the operating
+    point, and the block records the cut it stopped at.
+    """
+
+    TARGETS = [{
+        "boxes": torch.tensor([[0.0, 0.0, 64.0, 120.0]]),
+        "labels": torch.tensor([0]),
+        "orig_size": torch.tensor([240, 320]),
+    }]
+    #: Centre-xywh normalized, as the trainer's predictions come: a 0.9 box on
+    #: the ground-truth object, and a 0.1 box far away and far below the cut.
+    PREDICTIONS = [torch.tensor([
+        [0.10, 0.25, 0.20, 0.50, 0.90, 0.0],
+        [0.80, 0.80, 0.10, 0.10, 0.10, 0.0],
+    ])]
+
+    def _table(self, **kwargs):
+        return match_table(
+            self.PREDICTIONS, self.TARGETS,
+            iou_thresholds=[0.5], score_threshold=0.25, map_score_threshold=0.001,
+            prediction_classes={0: "person"}, target_classes={0: "person"},
+            eval_classes={0: "person"}, image_names=["frame.jpg"], **kwargs)
+
+    def test_only_the_operating_point_carries_a_box(self):
+        geom = self._table()["pred"]["geom"]
+
+        # Both predictions are in the rows; only the 0.9 one has geometry.
+        self.assertEqual(geom["index"], [0])
+        self.assertEqual(geom["cut"], 0.25)
+
+    def test_the_box_is_a_fraction_of_its_own_frame(self):
+        geom = self._table()["pred"]["geom"]
+
+        # Centre 0.10 x 0.25, extent 0.20 x 0.50 -> corners at 0.0/0.0/0.2/0.5.
+        self.assertAlmostEqual(geom["x0"][0], 0.0, places=5)
+        self.assertAlmostEqual(geom["y0"][0], 0.0, places=5)
+        self.assertAlmostEqual(geom["x1"][0], 0.2, places=5)
+        self.assertAlmostEqual(geom["y1"][0], 0.5, places=5)
+
+    def test_the_index_selects_exactly_the_rows_at_or_above_the_cut(self):
+        block = self._table()["pred"]
+        geom = block["geom"]
+
+        expected = [row for row, score in enumerate(block["score"])
+                    if score >= geom["cut"]]
+        self.assertEqual(geom["index"], expected)
+        for corner in ("x0", "y0", "x1", "y1"):
+            self.assertEqual(len(geom[corner]), len(geom["index"]))
+
+    def test_geometry_rides_the_operating_block_when_there_is_one(self):
+        table = self._table(operating_nms_threshold=0.7)
+
+        # The AP block is not the operating set here, so it carries no boxes:
+        # the per-person question is asked of the suppressed rows.
+        self.assertNotIn("geom", table["pred"])
+        self.assertIn("geom", table["pred_operating"])
+
+    def test_a_frame_of_unknown_size_contributes_no_geometry(self):
+        targets = [{**self.TARGETS[0], "orig_size": torch.tensor([0, 0])}]
+        geom = match_table(
+            self.PREDICTIONS, targets,
+            iou_thresholds=[0.5], score_threshold=0.25, map_score_threshold=0.001,
+            prediction_classes={0: "person"}, target_classes={0: "person"},
+            eval_classes={0: "person"}, image_names=["frame.jpg"],
+        )["pred"]["geom"]
+
+        # Sparse is the point: the rows stay, the boxes are simply absent, and
+        # a reader attributes none of them rather than all of them to (0, 0).
+        self.assertEqual(geom["index"], [])
+        self.assertEqual(geom["x0"], [])

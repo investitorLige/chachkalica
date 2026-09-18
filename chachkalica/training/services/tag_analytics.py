@@ -21,13 +21,26 @@ by score and walking them reproduces the trainer's own AP accumulation, for the
 whole set or any part of it — which is what makes an arbitrary intersection of
 tags cost milliseconds instead of a GPU pass.
 
-**The one thing this cannot do.** A frame tag selects images, so a slice of
-frames is a whole little dataset and gets the full metric set. A box tag
+**Three populations, three metric sets.** A frame tag selects images, so a
+slice of frames is a whole little dataset and gets everything. A box tag
 selects *ground-truth boxes*, and a prediction carries no tags — an unmatched
 false positive belongs to no box, so it cannot be attributed to "occluded".
 Box-tag slices therefore report recall, misses, mean IoU and the score
 distribution, and no precision or mAP. Reporting one would mean inventing an
 attribution nobody measured.
+
+A **person** tag is the way out of that, for the questions that are really
+about people. Where a box tag can only describe someone who was carrying
+something worth labelling, the people the measures pass found are a population
+in their own right, and each one is a yes/no per class asked twice — is there a
+weapon on them in the labels, and did the model say there was. A false positive
+now has an owner (the person it landed on), and a person carrying nothing is a
+row rather than an absence, so precision, specificity and accuracy exist here
+and only here. Two things make that honest rather than convenient: it needs a
+prediction's box, which is why the match table grew a geometry block at
+version 3, and it is not an accounting of boxes — a weapon on the ground
+belongs to no person, so :func:`person_orphans` counts those separately instead
+of letting them disappear between the two views.
 
 The aggregation here is a second implementation of the trainer's accumulation,
 which is a thing worth being nervous about. It checks itself: the unfiltered
@@ -54,8 +67,10 @@ MATCH_TABLE_SUFFIX = "_matches.json"
 #: Match table versions this build can read. Version 2 added ``gt.w``/``gt.h``
 #: (each box's extent as a fraction of its frame); version 1 carries no
 #: geometry and simply leaves the size tag unavailable, which is a sentence on
-#: the page rather than a refusal to render it.
-SUPPORTED_MATCH_TABLE_VERSIONS = (1, 2)
+#: the page rather than a refusal to render it. Version 3 added ``pred.geom``,
+#: the operating set's boxes, without which a prediction cannot be attributed
+#: to a person and the per-person section says so instead of rendering.
+SUPPORTED_MATCH_TABLE_VERSIONS = (1, 2, 3)
 
 #: The bucket an image or box with no answer for a tag falls into. Named, not
 #: dropped: "the model is worse on the frames nobody tagged" is a finding about
@@ -145,6 +160,11 @@ MAX_TEXT_VALUES = 25
 #: handful of boxes is noise with a decimal point on it.
 SMALL_SLICE_BOXES = 30
 
+#: A slice of people rather than of frames or of ground-truth boxes. Not one of
+#: ``tag_values``' scopes: those mirror what an annotator can be asked for, and
+#: nobody annotates a person the posture pass invented.
+PERSON_SCOPE = "person"
+
 
 def match_table_artifact(output_dir: str | Path | None) -> Path | None:
     """The one ``*_matches.json`` in an eval's output directory, or None.
@@ -213,6 +233,15 @@ class MatchTable:
     op_gt: np.ndarray
     operating_is_ap: bool
 
+    #: Operating-set predictions that carry a box, as positions into the ``op_*``
+    #: columns above, with their normalized xyxy alongside. Sparse on purpose --
+    #: version 3 writes geometry only at and above the operating confidence, so
+    #: these are the rows a per-person question can be asked of, and
+    #: ``geom_cut`` is the lowest confidence any of them was written at.
+    op_geom_row: np.ndarray
+    op_geom_box: np.ndarray
+    geom_cut: float
+
     #: ``{iou_threshold: (claim_score, claim_iou)}`` per ground-truth box,
     #: filled on first use — only box-tag slices need it.
     claims: dict = field(default_factory=dict)
@@ -234,9 +263,25 @@ class MatchTable:
     def num_gt(self) -> int:
         return int(self.gt_image.size)
 
+    @property
+    def has_prediction_geometry(self) -> bool:
+        """Whether predictions can be placed on the frame at all.
 
-def _columns(block: dict) -> tuple[np.ndarray, ...]:
-    """Prediction columns, reordered into descending-score accumulation order."""
+        False for a version 1 or 2 table. Also false for a version 3 one whose
+        every record lacked a frame size to normalize against -- the block is
+        then present and empty, which is a different sentence to the reader
+        than "this eval predates the feature", so the caller checks the version
+        separately rather than inferring it from here.
+        """
+        return bool(self.op_geom_row.size)
+
+
+def _columns(block: dict) -> tuple[tuple[np.ndarray, ...], np.ndarray]:
+    """Prediction columns in descending-score order, and the order itself.
+
+    The order comes back because the sparse geometry block indexes the file's
+    rows, not these, and has to be carried across the same permutation.
+    """
     score = np.asarray(block["score"], dtype=np.float64)
     order = _stable_score_order(score)
     return (
@@ -245,7 +290,47 @@ def _columns(block: dict) -> tuple[np.ndarray, ...]:
         score[order],
         np.asarray(block["iou"], dtype=np.float64)[order],
         np.asarray(block["gt"], dtype=np.int64)[order],
-    )
+    ), order
+
+
+def _geometry(path: str, block: dict, order: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    """The block's sparse prediction boxes, remapped onto the sorted columns.
+
+    ``geom.index`` points into the file's row order; every consumer here works
+    in descending-score order, so the indices are pushed through the same
+    permutation once, at load, rather than at every slice.
+    """
+    geom = block.get("geom")
+    empty = (np.zeros(0, dtype=np.int64), np.zeros((0, 4), dtype=np.float64), 0.0)
+    if not isinstance(geom, dict):
+        return empty
+
+    index = np.asarray(geom.get("index") or [], dtype=np.int64)
+    corners = [np.asarray(geom.get(key) or [], dtype=np.float64)
+               for key in ("x0", "y0", "x1", "y1")]
+    for key, column in zip(("x0", "y0", "x1", "y1"), corners):
+        if column.size != index.size:
+            raise ValueError(
+                f"{path}: pred.geom.{key} has {column.size} entries but index has "
+                f"{index.size} -- the table is truncated or hand-edited.")
+    if not index.size:
+        return empty
+    if int(index.min()) < 0 or int(index.max()) >= order.size:
+        raise ValueError(
+            f"{path}: pred.geom.index points outside the prediction rows -- "
+            f"the table is truncated or hand-edited.")
+
+    # order[i] is the file row that landed at sorted position i, so its inverse
+    # takes a file row to where it now lives.
+    rank = np.empty(order.size, dtype=np.int64)
+    rank[order] = np.arange(order.size, dtype=np.int64)
+    rows = rank[index]
+    boxes = np.stack(corners, axis=1)
+
+    # Sorted-position order, so a slice can intersect these against a mask with
+    # searchsorted rather than a scan.
+    shuffle = np.argsort(rows, kind="mergesort")
+    return rows[shuffle], boxes[shuffle], float(geom.get("cut") or 0.0)
 
 
 def _stable_score_order(scores: np.ndarray) -> np.ndarray:
@@ -266,16 +351,18 @@ def _load_table(path: str, _stamp: tuple) -> MatchTable:
             f"{path}: match table version {version!r} is not supported by this build."
         )
 
-    pred_image, pred_class, pred_score, pred_iou, pred_gt = _columns(data["pred"])
+    (pred_image, pred_class, pred_score, pred_iou, pred_gt), pred_order = _columns(data["pred"])
 
     operating = data.get("pred_operating")
     if operating is None:
         op_image, op_class, op_score, op_iou, op_gt = (
             pred_image, pred_class, pred_score, pred_iou, pred_gt)
         operating_is_ap = True
+        geom_row, geom_box, geom_cut = _geometry(path, data["pred"], pred_order)
     else:
-        op_image, op_class, op_score, op_iou, op_gt = _columns(operating)
+        (op_image, op_class, op_score, op_iou, op_gt), op_order = _columns(operating)
         operating_is_ap = False
+        geom_row, geom_box, geom_cut = _geometry(path, operating, op_order)
 
     gt = data["gt"]
     gt_image = np.asarray(gt["image"], dtype=np.int64)
@@ -314,6 +401,7 @@ def _load_table(path: str, _stamp: tuple) -> MatchTable:
         op_image=op_image, op_class=op_class, op_score=op_score,
         op_iou=op_iou, op_gt=op_gt,
         operating_is_ap=operating_is_ap,
+        op_geom_row=geom_row, op_geom_box=geom_box, geom_cut=geom_cut,
     )
 
 
@@ -442,7 +530,18 @@ class TagDefinition:
 
     @property
     def is_frame(self) -> bool:
-        return self.scope != tag_values.REGION
+        return self.scope not in (tag_values.REGION, PERSON_SCOPE)
+
+    @property
+    def is_person(self) -> bool:
+        return self.scope == PERSON_SCOPE
+
+    @property
+    def kind(self) -> str:
+        """Which population this tag slices, and so which metrics it supports."""
+        if self.is_person:
+            return "person"
+        return "frame" if self.is_frame else "box"
 
     @property
     def display(self) -> str:
@@ -461,9 +560,12 @@ class TagIndex:
     tags: list[TagDefinition]
     image_masks: dict[tuple[str, str], np.ndarray]
     gt_masks: dict[tuple[str, str], np.ndarray]
+    person_masks: dict[tuple[str, str], np.ndarray]
     matched_images: int
     unmatched_images: int
     row_mismatches: int
+    #: The people these masks index, or None where this eval has none.
+    persons: "PersonTable | None" = None
     #: Images the measures sidecar could not be joined to because their basename
     #: occurs under more than one subdirectory. Reported rather than guessed.
     ambiguous_filenames: int = 0
@@ -820,6 +922,32 @@ def _box_measure_tags(table: MatchTable, document: dict) -> tuple[list, dict, in
     return definitions, masks, mismatches
 
 
+def _person_measure_tags(persons) -> tuple[list, dict]:
+    """pose and person size, over people instead of over the boxes on them.
+
+    The same two measures the box-scope builder produces, keyed to a different
+    population -- and that change of population is the whole point. A box-scope
+    pose tag can only describe people who were carrying something worth
+    labelling; this one has a row for everybody the pass saw, which is what a
+    false alarm and a correct rejection need in order to exist.
+    """
+    definitions, masks = [], {}
+
+    pose_definition, pose_masks = _categorical_tag(
+        name=POSE_TAG, label="pose", scope=PERSON_SCOPE,
+        values=persons.pose, choices=persons.poses_declared, total=persons.count)
+    definitions.append(pose_definition)
+    masks.update(pose_masks)
+
+    size_definition, size_masks = _measured_tag(
+        name=PERSON_SIZE_TAG, label="person size",
+        unit="the person's area as a fraction of the frame",
+        scope=PERSON_SCOPE, values=persons.size, valid=persons.size > 0)
+    definitions.append(size_definition)
+    masks.update(size_masks)
+    return definitions, masks
+
+
 def _image_measure_tags(table: MatchTable, document: dict) -> tuple[list, dict, int]:
     """Frame tags for every measure the sidecar carries."""
     by_name, collisions = _measures_by_basename(document)
@@ -844,11 +972,13 @@ def _image_measure_tags(table: MatchTable, document: dict) -> tuple[list, dict, 
 
 
 def build_auto_tags(table: MatchTable, measures: dict | None = None,
-                    box_measures: dict | None = None) -> tuple[list[TagDefinition], dict, dict]:
+                    box_measures: dict | None = None,
+                    persons=None) -> tuple[list[TagDefinition], dict, dict, dict, int]:
     """Every tag this eval can be sliced by without anyone having annotated it."""
     definitions: list[TagDefinition] = []
     image_masks: dict[tuple[str, str], np.ndarray] = {}
     gt_masks: dict[tuple[str, str], np.ndarray] = {}
+    person_masks: dict[tuple[str, str], np.ndarray] = {}
 
     crowding, masks = _crowding_tag(table)
     definitions.append(crowding)
@@ -865,7 +995,16 @@ def build_auto_tags(table: MatchTable, measures: dict | None = None,
         )
     definitions.append(box_size)
 
-    if box_measures:
+    # pose and person size describe a person, so they slice people wherever the
+    # data allows it. Where it does not -- an older sidecar that kept no people,
+    # or a match table with no prediction boxes to place on them -- they stay
+    # box-scope rather than vanishing: the recall-side view they gave before is
+    # still true, and an eval does not lose a tag by being old.
+    if persons is not None and persons.count:
+        person_definitions, masks = _person_measure_tags(persons)
+        definitions.extend(person_definitions)
+        person_masks.update(masks)
+    elif box_measures:
         box_definitions, box_masks, _drift = _box_measure_tags(table, box_measures)
         definitions.extend(box_definitions)
         gt_masks.update(box_masks)
@@ -887,7 +1026,7 @@ def build_auto_tags(table: MatchTable, measures: dict | None = None,
                 name=name, label=label, scope=tag_values.FRAME, widget="radio",
                 source="auto", unit=unit, missing_label=UNMEASURED,
                 status="unavailable", status_detail=NO_MEASURES_DETAIL))
-    return definitions, image_masks, gt_masks, ambiguous
+    return definitions, image_masks, gt_masks, person_masks, ambiguous
 
 
 def build_tag_index(
@@ -899,6 +1038,7 @@ def build_tag_index(
     box_measures: dict | None = None,
     reasons: dict[str, str] | None = None,
     auto: bool = True,
+    persons=None,
 ) -> TagIndex:
     """Turn the tag sidecar into masks aligned with the match table's rows.
 
@@ -1001,6 +1141,7 @@ def build_tag_index(
 
     image_masks: dict[tuple[str, str], np.ndarray] = {}
     gt_masks: dict[tuple[str, str], np.ndarray] = {}
+    person_masks: dict[tuple[str, str], np.ndarray] = {}
 
     for name, definition in definitions.items():
         if definition.is_frame:
@@ -1062,17 +1203,18 @@ def build_tag_index(
 
     ambiguous_filenames = 0
     if auto:
-        auto_definitions, auto_image_masks, auto_gt_masks, ambiguous_filenames = (
-            build_auto_tags(table, measures, box_measures))
+        (auto_definitions, auto_image_masks, auto_gt_masks, auto_person_masks,
+         ambiguous_filenames) = build_auto_tags(table, measures, box_measures, persons)
         image_masks.update(auto_image_masks)
         gt_masks.update(auto_gt_masks)
+        person_masks.update(auto_person_masks)
         for definition in auto_definitions:
             definitions[definition.name] = definition
 
     # Everything is kept. A tag that cannot slice carries its reason instead of
     # disappearing -- "which tags could I have used here" is the question this
     # page exists to answer, and a silent drop answers it wrong.
-    order = {tag_values.FRAME: 0, tag_values.REGION: 1}
+    order = {tag_values.FRAME: 0, PERSON_SCOPE: 1, tag_values.REGION: 2}
     source_order = {"annotator": 0, "auto": 1}
     tags = sorted(
         definitions.values(),
@@ -1082,9 +1224,11 @@ def build_tag_index(
         tags=tags,
         image_masks=image_masks,
         gt_masks=gt_masks,
+        person_masks=person_masks,
         matched_images=matched_images,
         unmatched_images=len(entries) - matched_images,
         row_mismatches=row_mismatches,
+        persons=persons,
         ambiguous_filenames=ambiguous_filenames,
     )
 
@@ -1337,6 +1481,502 @@ def gt_slice_metrics(table: MatchTable, gt_mask: np.ndarray) -> dict:
 
 
 # --------------------------------------------------------------------------
+# People
+# --------------------------------------------------------------------------
+
+#: Slices smaller than this are still computed, but flagged.
+SMALL_SLICE_PERSONS = 30
+
+NO_PERSONS_DETAIL = (
+    "No people were kept for this label set -- either the box measures have "
+    "not been run over it, or they predate per-person rows and recorded only "
+    "each box's pose rather than the person behind it. Run 'Measure box "
+    "statistics' over this label set."
+)
+NO_PREDICTION_GEOMETRY_DETAIL = (
+    "This eval's match table records no prediction boxes, so a prediction "
+    "cannot be attributed to the person it landed on. Run 'Build tag analytics "
+    "data' to rewrite it."
+)
+NO_PEOPLE_FOUND_DETAIL = (
+    "The measures pass ran over these frames and found nobody in them."
+)
+
+#: Rule defaults, used only when the sidecar does not carry the ones its pass
+#: actually ran with. Kept in step with
+#: ``friendy_chachkalica/ml/build_measures.py``, which is authoritative.
+DEFAULT_CONTAINMENT_MIN = 0.7
+DEFAULT_PERSON_IOU_MIN = 0.5
+DEFAULT_PERSON_CLASS_NAMES = ("person", "people", "pedestrian")
+
+
+def _pairwise_intersection(boxes: np.ndarray, others: np.ndarray) -> np.ndarray:
+    """``(N, M)`` intersection areas between two sets of xyxy boxes."""
+    x0 = np.maximum(boxes[:, None, 0], others[None, :, 0])
+    y0 = np.maximum(boxes[:, None, 1], others[None, :, 1])
+    x1 = np.minimum(boxes[:, None, 2], others[None, :, 2])
+    y1 = np.minimum(boxes[:, None, 3], others[None, :, 3])
+    return np.clip(x1 - x0, 0, None) * np.clip(y1 - y0, 0, None)
+
+
+def _box_areas(boxes: np.ndarray) -> np.ndarray:
+    return (np.clip(boxes[:, 2] - boxes[:, 0], 0, None)
+            * np.clip(boxes[:, 3] - boxes[:, 1], 0, None))
+
+
+def attribute_boxes(boxes: np.ndarray, is_person: np.ndarray, people: np.ndarray,
+                    *, containment_min: float, person_iou_min: float) -> np.ndarray:
+    """Which person owns each box, as indices into ``people`` (``-1`` for none).
+
+    The rule is ``friendy_chachkalica/ml/build_measures.py::attribute``, applied
+    to *predictions* here rather than to ground truth -- vectorized, but the same
+    two cases for the same reasons. A box that is itself a person is matched by
+    IoU, because the two boxes describe one object and containment would let a
+    large foreground figure swallow someone standing behind them; anything else
+    is matched by containment, because a helmet's IoU with its own wearer is
+    about 0.02 and an argmax over that is noise. Ties go to the smallest
+    qualifying person for a contained box and to the best overlap for a person.
+
+    Attributing predictions with the rule the ground truth was attributed by is
+    the whole point: score one side by containment and the other by IoU and the
+    per-person table would compare two different notions of "on this person".
+    """
+    if boxes.size == 0 or people.size == 0:
+        return np.full(len(boxes), -1, dtype=np.int64)
+
+    intersection = _pairwise_intersection(boxes, people)
+    own = _box_areas(boxes)[:, None]
+    person_area = _box_areas(people)[None, :]
+
+    contained = intersection / np.maximum(own, 1e-9)
+    iou = intersection / np.maximum(own + person_area - intersection, 1e-9)
+
+    person_rows = is_person[:, None]
+    score = np.where(person_rows, iou, contained)
+    qualifies = score >= np.where(person_rows, person_iou_min, containment_min)
+    # A degenerate box has no area to be contained by anything, and dividing by
+    # the 1e-9 floor above would hand it a containment of zero or infinity
+    # depending on rounding. Excluded outright instead.
+    qualifies &= own > 0
+
+    # One argmin over a rank that encodes both tie-breaks: negated overlap for a
+    # person box (largest wins), person area for a contained box (smallest wins).
+    rank = np.where(person_rows, -score, np.broadcast_to(person_area, score.shape))
+    rank = np.where(qualifies, rank, np.inf)
+    owner = np.argmin(rank, axis=1).astype(np.int64)
+    owner[~qualifies.any(axis=1)] = -1
+    return owner
+
+
+@dataclass
+class PersonTable:
+    """Everyone the measures pass found, and what belongs to whom.
+
+    The unit here is a person, not a box, which is what makes the questions
+    below askable at all: "of the people lying down, how many did the model
+    correctly say were unarmed" needs a row for a person carrying nothing, and
+    a ground-truth box is not that row -- there is no box.
+
+    ``gt_person`` and ``pred_person`` are the two sides of the same join.
+    Ground truth was attributed by the measures pass itself, which numbered the
+    boxes with the loader that numbered them for the match table; predictions
+    are attributed here, from the match table's own geometry, by the same rule.
+    """
+
+    image: np.ndarray            #: (P,) image index per person
+    box: np.ndarray              #: (P, 4) normalized xyxy
+    pose: list                   #: (P,) posture or None where the engine saw none
+    size: np.ndarray             #: (P,) person area as a fraction of the frame
+    poses_declared: list         #: postures the pass could emit, in its own order
+
+    gt_person: np.ndarray        #: (num_gt,) owning person, -1 for none
+    pred_row: np.ndarray         #: (G,) positions into the table's op_* columns
+    pred_person: np.ndarray      #: (G,) owning person per those rows, -1 for none
+
+    #: (num_images,) images the pass actually looked at and whose rows still
+    #: line up. Distinguishing these from the rest is what lets "this box sat on
+    #: nobody" -- a finding about the frame -- be told apart from "nobody looked
+    #: at this frame", which is a finding about the pipeline.
+    measured_mask: np.ndarray
+
+    #: Class ids that *are* people, excluded from the per-person questions.
+    person_class_ids: frozenset
+
+    #: Images whose sidecar rows no longer line up with the labels, skipped
+    #: wholesale rather than attributed to the boxes that now sit on those lines.
+    drifted_images: int = 0
+    #: Images the sidecar measured, i.e. that could contribute people at all.
+    measured_images: int = 0
+
+    #: ``(side, class_id) -> per-person presence``, filled on first use.
+    presence: dict = field(default_factory=dict)
+
+    @property
+    def count(self) -> int:
+        return int(self.image.size)
+
+
+def _person_class_ids(table: MatchTable, names) -> set:
+    lowered = {str(name).lower() for name in names}
+    return {class_id for class_id, name in table.classes.items()
+            if str(name).lower() in lowered}
+
+
+def build_persons(table: MatchTable, document: dict | None) -> PersonTable | None:
+    """Join a box-measure sidecar's people onto a match table, or None.
+
+    None means the question cannot be asked here rather than that the answer is
+    empty -- a version 1 sidecar kept no people, and a match table before
+    version 3 kept no prediction boxes to place on them. Both are sentences the
+    page prints; neither is a zero.
+    """
+    if not isinstance(document, dict):
+        return None
+    if table.version < 3:
+        # Without prediction boxes every prediction would attribute to nobody,
+        # and a per-person table built on that reads as a model that fired at
+        # no one -- a confident, wrong answer. Refuse to build it, so the page
+        # prints why instead.
+        return None
+    images = document.get("images") or {}
+    if not any(isinstance(entry, dict) and "people" in entry for entry in images.values()):
+        return None
+
+    containment_min = float(document.get("containment_min") or DEFAULT_CONTAINMENT_MIN)
+    person_iou_min = float(document.get("person_iou_min") or DEFAULT_PERSON_IOU_MIN)
+    person_ids = _person_class_ids(
+        table, document.get("person_class_names") or DEFAULT_PERSON_CLASS_NAMES)
+
+    image_index = {name: index for index, name in enumerate(table.images)}
+    gt_position = {
+        (int(image), int(row)): position
+        for position, (image, row) in enumerate(zip(table.gt_image, table.gt_row))
+    }
+
+    person_image: list[int] = []
+    person_box: list[list[float]] = []
+    person_pose: list = []
+    person_size: list[float] = []
+    #: image index -> (first person, count), for attributing predictions below
+    per_image: dict[int, tuple[int, int]] = {}
+
+    gt_person = np.full(table.num_gt, -1, dtype=np.int64)
+    measured_mask = np.zeros(table.num_images, dtype=bool)
+    drifted = 0
+    measured = 0
+
+    for filename, entry in images.items():
+        index = image_index.get(filename)
+        if index is None or not isinstance(entry, dict):
+            continue
+        measured += 1
+        people = entry.get("people") or []
+
+        # Same drift guard as the box-scope join, for the same reason: a relabel
+        # moves the rows under the sidecar, and hanging a prediction on the
+        # person of the box that now sits on that line is worse than hanging it
+        # on nobody. One bad row disqualifies the image, people included --
+        # their poses are fine but the boxes attributed to them are not.
+        boxes = entry.get("boxes") or []
+        positions, bad = [], False
+        for box in boxes:
+            position = gt_position.get((index, int(box.get("row", -1))))
+            if position is None or int(table.gt_class[position]) != int(box.get("class_id", -1)):
+                bad = position is not None or bad
+                positions.append(None)
+                continue
+            positions.append(position)
+        if bad:
+            drifted += 1
+            continue
+        measured_mask[index] = True
+
+        offset = len(person_image)
+        # A box's ``person`` is an index into the sidecar's own list, so a
+        # malformed entry may not silently shift the ones after it -- dropping
+        # person 3 would hand every later box to the person standing next to
+        # its owner. Kept as an explicit map rather than as an offset.
+        placed: dict[int, int] = {}
+        for source_index, person in enumerate(people):
+            corners = person.get("box") or []
+            if len(corners) != 4:
+                continue
+            placed[source_index] = len(person_image)
+            person_image.append(index)
+            person_box.append([float(value) for value in corners])
+            pose = person.get("pose")
+            person_pose.append(str(pose) if pose else None)
+            ratio = person.get("size ratio")
+            person_size.append(float(ratio) if isinstance(ratio, (int, float))
+                               and not isinstance(ratio, bool) else 0.0)
+        per_image[index] = (offset, len(person_image) - offset)
+
+        for box, position in zip(boxes, positions):
+            if position is None:
+                continue
+            owner = box.get("person")
+            if isinstance(owner, int) and not isinstance(owner, bool):
+                gt_person[position] = placed.get(owner, -1)
+
+    people_boxes = (np.asarray(person_box, dtype=np.float64) if person_box
+                    else np.zeros((0, 4), dtype=np.float64))
+
+    pred_row, pred_person = _attribute_predictions(
+        table, people_boxes, per_image, person_ids,
+        containment_min=containment_min, person_iou_min=person_iou_min)
+
+    declared = []
+    for measure in (document.get("person_measures") or []):
+        if measure.get("name") == "pose":
+            declared = [str(choice) for choice in (measure.get("choices") or [])]
+    if not declared:
+        declared = sorted({pose for pose in person_pose if pose})
+
+    return PersonTable(
+        image=np.asarray(person_image, dtype=np.int64),
+        box=people_boxes,
+        pose=person_pose,
+        size=np.asarray(person_size, dtype=np.float64),
+        poses_declared=declared,
+        gt_person=gt_person,
+        pred_row=pred_row,
+        pred_person=pred_person,
+        measured_mask=measured_mask,
+        person_class_ids=frozenset(person_ids),
+        drifted_images=drifted,
+        measured_images=measured,
+    )
+
+
+def _attribute_predictions(table: MatchTable, people: np.ndarray, per_image: dict,
+                           person_ids: set, *, containment_min: float,
+                           person_iou_min: float) -> tuple[np.ndarray, np.ndarray]:
+    """Each geometry-carrying prediction's owning person, or ``-1``.
+
+    Walks the geometry rows image by image, because attribution only ever looks
+    inside one frame -- the same locality that lets the match table be sliced at
+    all.
+    """
+    rows = table.op_geom_row
+    owners = np.full(rows.size, -1, dtype=np.int64)
+    if not rows.size or not people.size:
+        return rows, owners
+
+    image_of_row = table.op_image[rows]
+    order = np.argsort(image_of_row, kind="mergesort")
+    grouped = image_of_row[order]
+    boundaries = np.flatnonzero(np.diff(grouped)) + 1
+    for chunk in np.split(order, boundaries):
+        if not chunk.size:
+            continue
+        image = int(image_of_row[chunk[0]])
+        offset, count = per_image.get(image, (0, 0))
+        if not count:
+            continue
+        is_person = np.isin(table.op_class[rows[chunk]], list(person_ids)) \
+            if person_ids else np.zeros(chunk.size, dtype=bool)
+        local = attribute_boxes(
+            table.op_geom_box[chunk], is_person, people[offset:offset + count],
+            containment_min=containment_min, person_iou_min=person_iou_min)
+        owners[chunk] = np.where(local >= 0, local + offset, -1)
+    return rows, owners
+
+
+def _presence(table: MatchTable, persons: PersonTable, class_id: int,
+              side: str) -> np.ndarray:
+    """Per person: does this class appear on them, in ground truth or in output.
+
+    Memoized on the table: a breakdown asks for the same two arrays once per
+    value of a tag, and they are a scan over every box each time.
+    """
+    key = (side, int(class_id))
+    cached = persons.presence.get(key)
+    if cached is not None:
+        return cached
+
+    has = np.zeros(persons.count, dtype=bool)
+    if side == "gt":
+        selected = (persons.gt_person >= 0) & (table.gt_class == class_id)
+        has[persons.gt_person[selected]] = True
+    else:
+        rows = persons.pred_row
+        selected = (
+            (persons.pred_person >= 0)
+            & (table.op_class[rows] == class_id)
+            & (table.op_score[rows] >= table.score_threshold)
+        )
+        has[persons.pred_person[selected]] = True
+    persons.presence[key] = has
+    return has
+
+
+def _rates(hit: int, miss: int, false_alarm: int, correct_reject: int) -> dict:
+    """The five rates a 2x2 confusion table supports, plus what defines them.
+
+    ``has_positives``/``has_predictions`` travel with the numbers because a
+    recall of 0.0 over nothing and a recall of 0.0 over forty boxes are the
+    same float and opposite findings; the page dashes the first.
+    """
+    actual = hit + miss
+    predicted = hit + false_alarm
+    negatives = correct_reject + false_alarm
+    decisions = hit + miss + false_alarm + correct_reject
+    precision = predicted and hit / predicted
+    recall = actual and hit / actual
+    return {
+        "hit": hit, "miss": miss,
+        "false_alarm": false_alarm, "correct_reject": correct_reject,
+        "gt_yes": actual, "predicted_yes": predicted,
+        "precision": float(precision), "recall": float(recall),
+        "f1": _f1(float(precision), float(recall)),
+        "specificity": float(negatives and correct_reject / negatives),
+        "accuracy": float(decisions and (hit + correct_reject) / decisions),
+        "has_positives": bool(actual),
+        "has_predictions": bool(predicted),
+        "has_negatives": bool(negatives),
+    }
+
+
+def scored_class_ids(table: MatchTable, persons: PersonTable) -> list[int]:
+    """The classes a per-person question can be asked about.
+
+    Everything but the person classes themselves: "does this person have a
+    person on them" is not a question, and including it would put a column of
+    near-perfect hits beside the ones a reader is actually reading.
+    """
+    return [class_id for class_id in sorted(table.classes)
+            if class_id not in persons.person_class_ids]
+
+
+def person_slice_metrics(table: MatchTable, persons: PersonTable,
+                         person_mask: np.ndarray) -> dict:
+    """Score a subset of *people*: did the model get each one's contents right.
+
+    One binary decision per person per class -- "is there a weapon on this
+    person", asked of the labels and of the output at the eval's operating
+    confidence -- so this is the one view where a false positive has somewhere
+    to belong and precision, specificity and accuracy exist. The headline
+    numbers are micro-averaged over the classes: every person-class decision
+    counts once, which is what makes them comparable across slices that hold
+    different mixes of classes.
+    """
+    selected = np.nonzero(person_mask)[0]
+    total = int(selected.size)
+
+    per_class = []
+    hit = miss = false_alarm = correct_reject = 0
+    for class_id in scored_class_ids(table, persons):
+        gt_has = _presence(table, persons, class_id, "gt")[selected]
+        pred_has = _presence(table, persons, class_id, "pred")[selected]
+        counts = (
+            int(np.count_nonzero(gt_has & pred_has)),
+            int(np.count_nonzero(gt_has & ~pred_has)),
+            int(np.count_nonzero(~gt_has & pred_has)),
+        )
+        entry = _rates(*counts, total - sum(counts))
+        per_class.append({
+            "class_id": class_id,
+            "class_name": table.classes.get(class_id, str(class_id)),
+            "persons": total, **entry,
+        })
+        hit, miss, false_alarm = (hit + counts[0], miss + counts[1],
+                                  false_alarm + counts[2])
+        correct_reject += total - sum(counts)
+
+    images = np.unique(persons.image[selected]).size if total else 0
+    return {
+        "kind": "person",
+        "persons": total,
+        "images": int(images),
+        "classes_scored": len(per_class),
+        "per_class": per_class,
+        "small": total < SMALL_SLICE_PERSONS,
+        **_rates(hit, miss, false_alarm, correct_reject),
+    }
+
+
+def person_orphans(table: MatchTable, persons: PersonTable) -> dict:
+    """Everything the per-person view could not put on a person.
+
+    The per-person table is a closed accounting of people, which means it is
+    silently *not* an accounting of boxes: a weapon lying on the ground, or one
+    worn by somebody the detector walked past, belongs to no person and appears
+    in none of its rows. Dropping those would let a model look good on people
+    while missing half the weapons in the dataset, so they are counted here,
+    scored on the one thing they support -- was the box found -- and printed
+    beside the per-person numbers rather than behind a link.
+
+    Three reasons a box has no person, kept apart because they call for
+    different actions: nobody was there (a finding), the frame was never
+    measured (run the pass), or its rows drifted (re-sync, then re-run).
+    """
+    measured = persons.measured_mask
+
+    primary = 0.5 if 0.5 in table.iou_thresholds else table.iou_thresholds[0]
+    claim_score, _ = gt_claims(table, primary)
+    found = claim_score >= table.score_threshold
+
+    on_nobody = (persons.gt_person < 0) & measured[table.gt_image]
+    unmeasured = (persons.gt_person < 0) & ~measured[table.gt_image]
+
+    per_class = []
+    for class_id in scored_class_ids(table, persons):
+        in_class = table.gt_class == class_id
+        orphans = int(np.count_nonzero(on_nobody & in_class))
+        if not orphans and not int(np.count_nonzero(unmeasured & in_class)):
+            continue
+        hits = int(np.count_nonzero(on_nobody & in_class & found))
+        per_class.append({
+            "class_id": class_id,
+            "class_name": table.classes.get(class_id, str(class_id)),
+            "gt": int(np.count_nonzero(in_class)),
+            "on_nobody": orphans,
+            "found": hits,
+            "missed": orphans - hits,
+            "recall": float(orphans and hits / orphans),
+            "unmeasured": int(np.count_nonzero(unmeasured & in_class)),
+        })
+
+    # Predictions the same three ways. An operating-point row with no geometry
+    # at all is its own case: the eval knew the box and the table could not
+    # normalize it, which no re-run of the measures pass will fix.
+    operating = table.op_score >= table.score_threshold
+    scored_classes = set(scored_class_ids(table, persons))
+    relevant = operating & np.isin(table.op_class, list(scored_classes)) \
+        if scored_classes else np.zeros(table.op_image.size, dtype=bool)
+    with_geometry = np.zeros(table.op_image.size, dtype=bool)
+    with_geometry[persons.pred_row] = True
+    placed = np.zeros(table.op_image.size, dtype=bool)
+    placed[persons.pred_row[persons.pred_person >= 0]] = True
+
+    predictions = {
+        "total": int(np.count_nonzero(relevant)),
+        "on_person": int(np.count_nonzero(relevant & placed)),
+        "on_nobody": int(np.count_nonzero(
+            relevant & with_geometry & ~placed & measured[table.op_image])),
+        "unmeasured": int(np.count_nonzero(
+            relevant & with_geometry & ~measured[table.op_image])),
+        "no_geometry": int(np.count_nonzero(relevant & ~with_geometry)),
+    }
+
+    return {
+        "gt_total": table.num_gt,
+        "gt_on_person": int(np.count_nonzero(persons.gt_person >= 0)),
+        "gt_on_nobody": int(np.count_nonzero(on_nobody)),
+        "gt_unmeasured": int(np.count_nonzero(unmeasured)),
+        "per_class": per_class,
+        "predictions": predictions,
+        "people": persons.count,
+        "images_measured": persons.measured_images,
+        "images_total": table.num_images,
+        "images_drifted": persons.drifted_images,
+        "images_without_people": int(np.count_nonzero(measured)) - int(
+            np.unique(persons.image).size if persons.count else 0),
+        "score_threshold": table.score_threshold,
+    }
+
+
+# --------------------------------------------------------------------------
 # Filters, cross-tabs, and the report
 # --------------------------------------------------------------------------
 
@@ -1356,44 +1996,109 @@ BOX_METRICS = [
     ("mean_iou", "mean IoU of found boxes"),
     ("mean_score", "mean confidence of found boxes"),
 ]
+#: A person slice is the one kind where a false positive has an owner, so it is
+#: also the only one that can offer specificity and accuracy -- both need the
+#: negatives (people carrying nothing), which neither of the other two
+#: populations contains a row for.
+PERSON_METRICS = [
+    ("f1", "F1"),
+    ("precision", "precision"),
+    ("recall", "recall"),
+    ("specificity", "specificity"),
+    ("accuracy", "accuracy"),
+]
+
+#: Metric set and headline per slice kind, so a caller never has to re-derive
+#: "which metrics does this population support".
+METRICS_BY_KIND = {
+    "frame": (FRAME_METRICS, "map50"),
+    "person": (PERSON_METRICS, "f1"),
+    "box": (BOX_METRICS, "recall"),
+}
+
+#: The denominator each kind counts in, for the column a table puts first.
+POPULATION_BY_KIND = {"frame": "images", "person": "persons", "box": "boxes"}
+
+#: Where that denominator lives in a scored slice. Not the same as the label
+#: above: a box slice counts ground-truth rows and calls them "boxes".
+POPULATION_KEY = {"frame": "images", "person": "persons", "box": "gt"}
+
+
+def overall_metrics(table: MatchTable, index: TagIndex, kind: str) -> dict:
+    """The unfiltered slice of one population — what every row is compared to."""
+    if kind == "person":
+        persons = index.persons
+        return person_slice_metrics(
+            table, persons, np.ones(persons.count, dtype=bool))
+    if kind == "frame":
+        return image_slice_metrics(table, np.ones(table.num_images, dtype=bool))
+    return gt_slice_metrics(table, np.ones(table.num_gt, dtype=bool))
 
 
 class UnknownClause(ValueError):
     """A filter names a tag/value pair this eval's data has no mask for."""
 
 
-def resolve_clauses(table: MatchTable, index: TagIndex, clauses) -> tuple[np.ndarray, np.ndarray, str]:
-    """Intersect ``[(tag, value), ...]`` into (image mask, gt mask, slice kind).
+def resolve_clauses(table: MatchTable, index: TagIndex,
+                    clauses) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    """Intersect ``[(tag, value), ...]`` into (image, gt, person masks, kind).
 
     Clauses are ANDed — that is what a cross-union of tags means here. Mixing a
     frame clause with a box clause is allowed and useful ("occluded boxes, in
     rainy frames"): the frame clause narrows the images, which narrows the
-    boxes. The moment any box clause appears the slice is a set of boxes, and
-    the kind drops to ``box`` — the metrics that survive are the ground-truth
-    side ones.
+    boxes.
+
+    Which population the result *is* follows from the most specific clause
+    present, because that is the one that cannot be expressed in the others:
+    person beats box beats frame. A person clause mixed with a box clause
+    therefore keeps the people who own at least one box the box clause selected
+    — "the people carrying something occluded" — rather than refusing the
+    combination, which would leave the cross-tab unable to pair the two.
     """
+    persons = index.persons
+    person_count = persons.count if persons is not None else 0
+
     image_mask = np.ones(table.num_images, dtype=bool)
     gt_mask = np.ones(table.num_gt, dtype=bool)
+    person_mask = np.ones(person_count, dtype=bool)
     kind = "frame"
+    box_clause = False
 
     for tag, value in clauses:
         key = (str(tag), str(value))
         if key in index.image_masks:
             image_mask = image_mask & index.image_masks[key]
+        elif key in index.person_masks:
+            person_mask = person_mask & index.person_masks[key]
+            kind = "person"
         elif key in index.gt_masks:
             gt_mask = gt_mask & index.gt_masks[key]
-            kind = "box"
+            box_clause = True
+            if kind != "person":
+                kind = "box"
         else:
-            raise UnknownClause(f"no boxes or images carry {tag} = {value}")
+            raise UnknownClause(f"no people, boxes or images carry {tag} = {value}")
 
-    # A box only counts when its image survives the frame clauses.
+    # A box only counts when its image survives the frame clauses, and a person
+    # likewise — both are sub-populations of the images.
     gt_mask = gt_mask & image_mask[table.gt_image]
-    return image_mask, gt_mask, kind
+    if person_count:
+        person_mask = person_mask & image_mask[persons.image]
+        if box_clause:
+            owned = np.zeros(person_count, dtype=bool)
+            owners = persons.gt_person[gt_mask & (persons.gt_person >= 0)]
+            owned[owners] = True
+            person_mask = person_mask & owned
+    return image_mask, gt_mask, person_mask, kind
 
 
 def slice_metrics(table: MatchTable, index: TagIndex, clauses) -> dict:
-    """Score one filter. Frame-only filters get everything; box filters get recall."""
-    image_mask, gt_mask, kind = resolve_clauses(table, index, clauses)
+    """Score one filter, on whatever population the clauses resolved to."""
+    image_mask, gt_mask, person_mask, kind = resolve_clauses(table, index, clauses)
+    if kind == "person":
+        result = person_slice_metrics(table, index.persons, person_mask)
+        result["gt"] = int(np.count_nonzero(gt_mask))
+        return result
     if kind == "frame":
         result = image_slice_metrics(table, image_mask)
         result["boxes"] = gt_slice_metrics(table, gt_mask)
@@ -1411,17 +2116,17 @@ def _row(table: MatchTable, index: TagIndex, definition: TagDefinition, value: s
 
 def tag_breakdown(table: MatchTable, index: TagIndex, definition: TagDefinition) -> dict:
     """Every value of one tag, scored, with the gap against the whole dataset."""
-    overall = (image_slice_metrics(table, np.ones(table.num_images, dtype=bool))
-               if definition.is_frame
-               else gt_slice_metrics(table, np.ones(table.num_gt, dtype=bool)))
-    key = "map50" if definition.is_frame else "recall"
+    kind = definition.kind
+    overall = overall_metrics(table, index, kind)
+    key = METRICS_BY_KIND[kind][1]
+    population = POPULATION_BY_KIND[kind]
 
     rows = [_row(table, index, definition, value) for value in definition.values]
     for row in rows:
         # A value nothing falls into has no score, only zeros. Flag it so the
         # page prints dashes: a row reading "mAP50 0.0000" looks like a model
         # that failed, not like a bucket nobody used.
-        row["empty"] = (row["images"] if definition.is_frame else row["gt"]) == 0
+        row["empty"] = row[POPULATION_KEY[kind]] == 0
         # A frame slice holding no ground truth has no mAP and no recall: both
         # are means over an empty set, which comes out 0.0 and reads as a
         # catastrophic score rather than an undefined one. Empty frames are
@@ -1439,7 +2144,8 @@ def tag_breakdown(table: MatchTable, index: TagIndex, definition: TagDefinition)
         "label": definition.display,
         "scope": definition.scope,
         "widget": definition.widget,
-        "kind": "frame" if definition.is_frame else "box",
+        "kind": kind,
+        "population": population,
         "source": definition.source,
         "unit": definition.unit,
         "cuts": definition.cuts,
@@ -1449,6 +2155,7 @@ def tag_breakdown(table: MatchTable, index: TagIndex, definition: TagDefinition)
         "total": definition.total,
         "truncated": definition.truncated,
         "headline_metric": key,
+        "metrics": METRICS_BY_KIND[kind][0],
         "rows": rows,
         "overall": overall,
     }
@@ -1467,10 +2174,17 @@ def cross_tab(table: MatchTable, index: TagIndex, tag_a: str, tag_b: str, metric
     if first is None or second is None:
         raise UnknownClause(f"unknown tag in cross-tab: {tag_a} x {tag_b}")
 
-    kind = "frame" if (first.is_frame and second.is_frame) else "box"
-    allowed = dict(FRAME_METRICS if kind == "frame" else BOX_METRICS)
+    # The same precedence resolve_clauses applies, worked out once up front so
+    # the grid can label its cells before it has scored any of them.
+    if first.is_person or second.is_person:
+        kind = "person"
+    elif first.is_frame and second.is_frame:
+        kind = "frame"
+    else:
+        kind = "box"
+    allowed = dict(METRICS_BY_KIND[kind][0])
     if metric not in allowed:
-        metric = "map50" if kind == "frame" else "recall"
+        metric = METRICS_BY_KIND[kind][1]
 
     rows = []
     values: list[float] = []
@@ -1480,7 +2194,7 @@ def cross_tab(table: MatchTable, index: TagIndex, tag_a: str, tag_b: str, metric
             entry = slice_metrics(
                 table, index, [(tag_a, row_value), (tag_b, column_value)]
             )
-            population = entry["images"] if kind == "frame" else entry["gt"]
+            population = entry[POPULATION_KEY[kind]]
             value = entry.get(metric) if population else None
             if value is not None:
                 values.append(float(value))
@@ -1510,7 +2224,8 @@ def cross_tab(table: MatchTable, index: TagIndex, tag_a: str, tag_b: str, metric
         "kind": kind,
         "columns": second.values,
         "rows": rows,
-        "population_label": "images" if kind == "frame" else "boxes",
+        "metrics": METRICS_BY_KIND[kind][0],
+        "population_label": POPULATION_BY_KIND[kind],
     }
 
 
@@ -1528,7 +2243,7 @@ def comparable_tags(columns) -> list[dict]:
                 continue
             seen[definition.name] = {
                 "name": definition.name, "label": definition.display,
-                "kind": "frame" if definition.is_frame else "box",
+                "kind": definition.kind,
                 "source": definition.source,
             }
     return list(seen.values())
@@ -1574,9 +2289,14 @@ def compare_tag(columns, tag: str, metric: str) -> dict:
         raise UnknownClause(f"none of the compared evals can be sliced by {tag}")
 
     first = present[0]["index"].tag(tag)
-    allowed = dict(FRAME_METRICS if first.is_frame else BOX_METRICS)
+    # The first column that carries the tag decides which population it is, and
+    # so which metrics the grid may offer. Compared evals can disagree -- one
+    # old enough to have no people still has a box-scope pose tag -- so a column
+    # whose kind differs is scored on its own terms and flagged, rather than
+    # being read off a metric it does not have.
+    allowed = dict(METRICS_BY_KIND[first.kind][0])
     if metric not in allowed:
-        metric = "map50" if first.is_frame else "recall"
+        metric = METRICS_BY_KIND[first.kind][1]
 
     # The first column that has the tag sets the row order; anything only a
     # later column carries follows, so the grid reads like its breakdown table.
@@ -1595,10 +2315,12 @@ def compare_tag(columns, tag: str, metric: str) -> dict:
                 cells.append({"value": None, "population": None, "absent": True})
                 continue
             entry = slice_metrics(column["table"], column["index"], [(tag, value)])
-            population = entry["images"] if entry["kind"] == "frame" else entry["gt"]
+            population = entry[POPULATION_KEY[entry["kind"]]]
+            mismatched = entry["kind"] != first.kind
             cells.append({
-                "value": entry.get(metric) if population else None,
+                "value": None if mismatched or not population else entry.get(metric),
                 "population": population, "absent": False,
+                "mismatched_kind": mismatched, "kind": entry["kind"],
             })
         numbers = [c["value"] for c in cells if c["value"] is not None]
         best = max(numbers) if len(numbers) > 1 and len(set(numbers)) > 1 else None
@@ -1609,16 +2331,21 @@ def compare_tag(columns, tag: str, metric: str) -> dict:
     return {
         "tag": tag, "label": first.display, "metric": metric,
         "metric_label": allowed[metric],
-        "kind": "frame" if first.is_frame else "box",
-        "population_label": "images" if first.is_frame else "boxes",
+        "kind": first.kind,
+        "population_label": POPULATION_BY_KIND[first.kind],
         "columns": [{
             "label": column["label"],
             "absent": column["index"].tag(tag) is None
                       or not column["index"].tag(tag).usable,
         } for column in columns],
         "rows": rows,
-        "metrics": FRAME_METRICS if first.is_frame else BOX_METRICS,
-        "warnings": _comparability_warnings(columns),
+        "metrics": METRICS_BY_KIND[first.kind][0],
+        "warnings": _comparability_warnings(columns) + (
+            ["One of these evals scores this tag over a different population "
+             "(people vs ground-truth boxes), so its column is left blank "
+             "rather than compared against a number that means something else."]
+            if any(cell.get("mismatched_kind")
+                   for row in rows for cell in row["cells"]) else []),
     }
 
 
@@ -1650,6 +2377,102 @@ def _reproduction_check(computed: dict, stored: dict | None) -> dict | None:
     return {"checks": checks, "worst": worst, "agrees": worst <= 1e-4}
 
 
+#: How each population is named where a heading has to name it.
+KIND_LABELS = {
+    "frame": "Frame tags",
+    "person": "Person tags",
+    "box": "Box tags",
+}
+
+
+def all_tags_table(breakdowns: list[dict]) -> list[dict]:
+    """Every value of every tag on one grid, split by the population it scores.
+
+    One table per population rather than one table overall, because the three
+    do not share a metric set and never can: a frame slice has mAP, a person
+    slice has specificity, a box slice has neither. Forcing them into one grid
+    would mean a column that is blank for two thirds of its rows, which reads
+    as missing data rather than as an undefined quantity.
+
+    Shading is normalized **within each tag**, per column: the question a reader
+    brings here is "which of this tag's values does the model struggle on",
+    and scaling across tags would answer a different one -- the darkest cell
+    would just be whichever tag happens to contain the dataset's hardest slice,
+    every time.
+    """
+    groups = []
+    for kind, label in KIND_LABELS.items():
+        metrics = METRICS_BY_KIND[kind][0]
+        entries = []
+        for breakdown in breakdowns:
+            if breakdown["kind"] != kind:
+                continue
+            rows = []
+            for row in breakdown["rows"]:
+                undefined = row["empty"] or row.get("no_ground_truth")
+                rows.append({
+                    "value": row["value"],
+                    "population": row[POPULATION_KEY[kind]],
+                    "empty": row["empty"],
+                    "delta": row["delta"],
+                    "cells": [{"key": key, "share": None,
+                               "value": None if undefined else row.get(key)}
+                              for key, _label in metrics],
+                })
+            for position in range(len(metrics)):
+                numbers = [entry["cells"][position]["value"] for entry in rows
+                           if entry["cells"][position]["value"] is not None]
+                # One number is not a spread, and a row of identically shaded
+                # cells would imply a comparison that was never made.
+                if len(numbers) < 2 or min(numbers) == max(numbers):
+                    continue
+                low, span = min(numbers), max(numbers) - min(numbers)
+                for entry in rows:
+                    cell = entry["cells"][position]
+                    if cell["value"] is not None:
+                        cell["share"] = round((cell["value"] - low) / span, 4)
+            entries.append({
+                "name": breakdown["name"], "label": breakdown["label"],
+                "source": breakdown["source"], "unit": breakdown["unit"],
+                "rows": rows,
+                "overall": [{"key": key, "value": breakdown["overall"].get(key)}
+                            for key, _label in metrics],
+            })
+        if entries:
+            groups.append({
+                "kind": kind, "label": label, "metrics": metrics,
+                "population_label": POPULATION_BY_KIND[kind], "tags": entries,
+            })
+    return groups
+
+
+def person_section(table: MatchTable, index: TagIndex) -> dict:
+    """The per-person view, or the reason this eval cannot have one.
+
+    Everything keyed to people lives here rather than beside the box tables:
+    the numbers answer a different question over a different population, and
+    the one thing guaranteed to mislead is a precision from this section read
+    next to a recall from that one as though they shared a denominator.
+    """
+    persons = index.persons
+    if persons is None:
+        return {"available": False, "detail": (
+            NO_PREDICTION_GEOMETRY_DETAIL if table.version < 3 else NO_PERSONS_DETAIL)}
+    if not persons.count:
+        return {"available": False, "detail": NO_PEOPLE_FOUND_DETAIL}
+
+    return {
+        "available": True,
+        "detail": "",
+        "persons": persons.count,
+        "overall": overall_metrics(table, index, "person"),
+        "orphans": person_orphans(table, persons),
+        "classes": [table.classes.get(class_id, str(class_id))
+                    for class_id in scored_class_ids(table, persons)],
+        "metrics": PERSON_METRICS,
+    }
+
+
 def report(table: MatchTable, index: TagIndex, stored_metrics: dict | None = None) -> dict:
     """Everything the tag analytics page renders on first load."""
     overall_frame = image_slice_metrics(table, np.ones(table.num_images, dtype=bool))
@@ -1661,11 +2484,11 @@ def report(table: MatchTable, index: TagIndex, stored_metrics: dict | None = Non
     usable = [d for d in index.tags if d.usable]
     breakdowns = [tag_breakdown(table, index, definition) for definition in usable]
     frame_tags = [d.name for d in usable if d.is_frame]
-    box_tags = [d.name for d in usable if not d.is_frame]
+    box_tags = [d.name for d in usable if d.kind == "box"]
+    person_tags = [d.name for d in usable if d.is_person]
     tags_without_data = [
         {
-            "name": d.name, "label": d.display,
-            "kind": "frame" if d.is_frame else "box",
+            "name": d.name, "label": d.display, "kind": d.kind,
             "source": d.source, "status": d.status, "detail": d.status_detail,
         }
         for d in index.tags if not d.usable
@@ -1674,14 +2497,17 @@ def report(table: MatchTable, index: TagIndex, stored_metrics: dict | None = Non
     return {
         "overall": overall_frame,
         "overall_boxes": overall_box,
-        "breakdowns": breakdowns,
+        "breakdowns": [b for b in breakdowns if b["kind"] != "person"],
+        "person_breakdowns": [b for b in breakdowns if b["kind"] == "person"],
+        "all_tags": all_tags_table(breakdowns),
+        "persons": person_section(table, index),
         "tags_without_data": tags_without_data,
         "frame_tags": frame_tags,
         "box_tags": box_tags,
+        "person_tags": person_tags,
         "tags": [
             {
-                "name": d.name, "label": d.display,
-                "kind": "frame" if d.is_frame else "box",
+                "name": d.name, "label": d.display, "kind": d.kind,
                 "source": d.source, "usable": d.usable,
                 "values": d.values, "counts": d.counts,
                 "answered": d.answered, "total": d.total,
@@ -1709,5 +2535,6 @@ def report(table: MatchTable, index: TagIndex, stored_metrics: dict | None = Non
         "backfilled": table.backfilled,
         "frame_metrics": FRAME_METRICS,
         "box_metrics": BOX_METRICS,
+        "person_metrics": PERSON_METRICS,
         "check": _reproduction_check(overall_frame, stored_metrics),
     }

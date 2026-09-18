@@ -1,4 +1,11 @@
-"""Per-ground-truth-box measurements: how big the person is, and what they are doing.
+"""The people in each frame, and which ground-truth box belongs to which of them.
+
+Two things come out of one pass. Per ground-truth box: how big the person it
+sits on is, and what they are doing — the box-scope tags the analytics page
+slices by. Per *person*: their box, their posture, and the boxes attributed to
+them — which is what lets a reader ask "of the people lying down, how many did
+the model correctly say were carrying a weapon", a question the box-scope view
+cannot pose because it has no row for a person carrying nothing.
 
 Frame-level measures (brightness, contrast) are a decode and a histogram, so the
 Django app computes those itself. These are different: they need a person
@@ -42,7 +49,7 @@ except ImportError:
     from data import IMAGE_EXTENSIONS, _image_to_label_path, _read_yolo_label_file
     from device import resolve_device
 
-VERSION = 1
+VERSION = 2
 
 #: Share of a ground-truth box that must fall inside a person box for that
 #: person to own it. Containment, not IoU: a helmet is a couple of percent of
@@ -214,7 +221,13 @@ def build_measures(request: dict, *, progress_path: Path | None = None) -> dict:
 
     entries: dict[str, dict] = {}
     totals = {"images": len(images), "images_done": 0, "boxes": 0,
-              "attributed": 0, "without_person": 0, "people_found": 0}
+              "attributed": 0, "without_person": 0, "people_found": 0,
+              # Frames carrying people and no labels at all. They used to be
+              # skipped before the GPU ever saw them; they are now measured,
+              # because a person with nothing on them is exactly the evidence a
+              # per-person score needs and skipping them counted only the
+              # people who happened to be near a labelled box.
+              "images_without_labels": 0}
 
     def _flush_progress(complete: bool) -> None:
         if progress_path is None:
@@ -241,8 +254,7 @@ def build_measures(request: dict, *, progress_path: Path | None = None) -> dict:
         label_path = _image_to_label_path(path, images_dir, labels_dir)
         boxes, labels = _read_yolo_label_file(label_path, width, height)
         if not boxes:
-            totals["images_done"] = position
-            continue
+            totals["images_without_labels"] += 1
 
         moved = frame.to(device)
         pose_rows = predict_adapter(pose_adapter, [moved], score_threshold=pose_threshold)[0]
@@ -279,10 +291,30 @@ def build_measures(request: dict, *, progress_path: Path | None = None) -> dict:
                     float(person_areas[owner]) / frame_area, 6)
                 values["pose"] = poses[owner] or NO_PERSON
                 totals["attributed"] += 1
-            rows.append({"row": row, "class_id": int(label), "values": values})
+            # ``person`` is the same attribution the values above are derived
+            # from, kept as an index rather than only as its consequences: a
+            # per-person score has to group boxes *by person*, and "these two
+            # helmets are on the same standing man" cannot be recovered from
+            # two rows that both say "standing".
+            rows.append({"row": row, "class_id": int(label),
+                         "person": owner, "values": values})
             totals["boxes"] += 1
 
-        entries[path.name] = {"boxes": rows}
+        # Normalized, like the match table's geometry and for the same reason:
+        # the consumer joins these against prediction boxes it reads from that
+        # table, and it has no image to ask for a size.
+        people_rows = [
+            {
+                "box": [round(float(person[0]) / width, 6),
+                        round(float(person[1]) / height, 6),
+                        round(float(person[2]) / width, 6),
+                        round(float(person[3]) / height, 6)],
+                "pose": poses[index],
+                "size ratio": round(float(person_areas[index]) / frame_area, 6),
+            }
+            for index, person in enumerate(people)
+        ]
+        entries[path.name] = {"boxes": rows, "people": people_rows}
         totals["images_done"] = position
         if position % 50 == 0 or position == len(images):
             _flush_progress(False)
@@ -300,12 +332,23 @@ def build_measures(request: dict, *, progress_path: Path | None = None) -> dict:
         "person_source": source.get("kind"),
         "person_checkpoint": str(source.get("checkpoint") or ""),
         "pose_engine": str(pose_engine),
+        # The thresholds this pass actually attributed by, so the consumer
+        # re-attributing *predictions* to these same people uses the rule the
+        # ground-truth side was built with rather than its own copy of it.
+        "containment_min": CONTAINMENT_MIN,
+        "person_iou_min": PERSON_IOU_MIN,
+        "person_class_names": sorted(PERSON_CLASS_NAMES),
         "complete": not stopping["now"],
         "totals": totals,
         "measures": [
             {"name": "pose", "kind": "categorical",
              "choices": [*sorted(set(pose_names.values())), NO_PERSON]},
             {"name": "person size ratio", "kind": "numeric"},
+        ],
+        "person_measures": [
+            {"name": "pose", "kind": "categorical",
+             "choices": sorted(set(pose_names.values()))},
+            {"name": "size ratio", "kind": "numeric"},
         ],
         "images": entries,
     }
@@ -318,7 +361,8 @@ def build_measures(request: dict, *, progress_path: Path | None = None) -> dict:
     os.replace(temporary, out)
     _flush_progress(True)
     print(f"[measures] wrote {out} ({totals['boxes']} boxes, "
-          f"{totals['without_person']} with no person)")
+          f"{totals['without_person']} with no person, "
+          f"{totals['people_found']} people over {totals['images_done']} frames)")
     return {"path": str(out), **totals}
 
 

@@ -300,7 +300,7 @@
   const metricSelect = document.getElementById("tagcmp-metric");
   const out = document.getElementById("tagcmp-out");
   const base = root.dataset.url + "?evals=" + encodeURIComponent(root.dataset.evals);
-  let tags = [], frameMetrics = [], boxMetrics = [], loaded = false;
+  let tags = [], frameMetrics = [], boxMetrics = [], personMetrics = [], loaded = false;
 
   const fill = (select, options) => {
     select.innerHTML = "";
@@ -316,7 +316,7 @@
 
   function refreshMetrics() {
     const tag = tags.find(t => t.name === tagSelect.value);
-    const wanted = tag && tag.kind === "box" ? boxMetrics : frameMetrics;
+    const wanted = {box: boxMetrics, person: personMetrics}[tag && tag.kind] || frameMetrics;
     const previous = metricSelect.value;
     fill(metricSelect, wanted);
     if (wanted.some(([value]) => value === previous)) { metricSelect.value = previous; }
@@ -352,12 +352,14 @@
         tags = data.tags || [];
         frameMetrics = data.frame_metrics || [];
         boxMetrics = data.box_metrics || [];
+        personMetrics = data.person_metrics || [];
         if (!tags.length) {
           out.textContent = "None of these evals can be sliced by a tag yet.";
           return;
         }
+        const scopeSuffix = {box: "  (box-wide)", person: "  (per person)"};
         fill(tagSelect, tags.map(t => [t.name,
-          t.label + (t.kind === "box" ? "  (box-wide)" : "")
+          t.label + (scopeSuffix[t.kind] || "")
                   + (t.source === "auto" ? "  \u00b7 computed" : "")]));
         refreshMetrics();
       })

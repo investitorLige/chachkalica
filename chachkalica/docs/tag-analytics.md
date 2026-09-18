@@ -46,7 +46,9 @@ the images, so one pass serves every annotator's labels and every eval.
 detector and the RTMO posture engine over each frame. It is keyed to *one label
 set*, because its rows are line numbers in those `.txt` files, so start it from
 the eval whose labels you want measured. It takes the trainer's single job slot
-for its duration, so queued evals wait.
+for its duration, so queued evals wait. It runs over **every** frame, including
+the ones with no labels at all: a person standing in an empty frame is the only
+evidence there is that the model was right to say nothing about them.
 
 Where the person boxes come from, in order: the pipeline's own person detector
 if it has one (so "person size" means the crop the model actually saw), else the
@@ -57,6 +59,11 @@ A box the pass found no person around gets the named bucket `(no person)`,
 which is *not* the same as "not measured": the pass looked and found nobody,
 and on a person dataset that bucket is mostly the small and occluded people the
 detector missed — often the interesting slice.
+
+The pass also keeps the **people themselves** — each one's box, posture and
+size, and which person every ground-truth box was attributed to. That is what
+makes the per-person section below possible: "these two helmets are on the same
+standing man" cannot be recovered from two rows that each say only "standing".
 
 Continuous measures (everything but pose) are cut into **terciles** over that eval's own population,
 and the cut points are printed under the tag, because a bucket called "low"
@@ -93,9 +100,11 @@ it prints the comparison. On a 13,374-image eval the largest disagreement is
 the banner turns red and says the slices are not to be trusted, rather than
 quietly showing numbers built on a broken aggregation.
 
-## Frame tags get everything; box tags get recall
+## Three populations, three metric sets
 
-This is the one asymmetry worth understanding before reading the tables.
+This is the one thing worth understanding before reading the tables. A tag does
+not just select a slice — it selects *what kind of thing* the slice is made of,
+and that decides which metrics can honestly be computed.
 
 A **frame tag** selects images. A slice of images is a small dataset like any
 other, so it gets the whole metric set: mAP50, mAP50-95, precision, recall, F1,
@@ -115,9 +124,76 @@ and how well:
 | **mean IoU** | how tightly the found boxes were found |
 | **mean conf** | how confident the model was about them |
 
-Mixing the two is allowed and is usually the interesting question: *occluded
-boxes, in rainy frames*. A frame clause narrows the images, which narrows the
-boxes, and the slice is scored as a set of boxes.
+A **person tag** — `pose` and `person size` — selects *people*, and this is the
+population where precision comes back. See the next section.
+
+Mixing them is allowed and is usually the interesting question: *occluded
+boxes, in rainy frames*. The most specific scope wins: a frame clause narrows
+the images, which narrows the boxes and the people; a person clause makes the
+whole slice a set of people; a person clause paired with a box clause keeps the
+people who own at least one box the box clause selected.
+
+## People: the population where a false positive has an owner
+
+A box tag can only ever describe somebody who was carrying something worth
+labelling. There is no row for the man lying down with no weapon on him, which
+is exactly the row a precision needs.
+
+So the people themselves are the population. Every person the box-measures pass
+found is one row, and every class is one yes/no question asked twice of them —
+*is there a helmet on this person in the labels*, and *did the model say there
+was*, at the eval's operating confidence. That cross-tabulates:
+
+| | model says yes | model says no |
+|---|---|---|
+| **labels say yes** | hit | miss |
+| **labels say no** | false alarm | correct reject |
+
+which gives **precision**, **recall**, **F1**, **specificity** and **accuracy**
+per `pose = lying / standing / sitting` and per person-size tercile. The
+headline numbers are micro-averaged over the classes, so every person-class
+decision counts once and slices holding different class mixes stay comparable.
+
+A prediction is attributed to a person by the same rule the ground truth was:
+containment (≥ 0.7 of the box inside the person), or IoU (≥ 0.5) when the box
+is itself a person, ties to the smallest qualifying person. Scoring one side by
+containment and the other by IoU would compare two different notions of "on
+this person".
+
+### Boxes on nobody
+
+The per-person tables are a closed accounting of *people*, which makes them
+silently **not** an accounting of boxes. A weapon on the ground, or one worn by
+somebody the person detector walked past, belongs to no row in them. Those are
+counted in their own panel and scored on the one thing they support — was the
+box found — so a model cannot look good on people while missing half the
+objects in the dataset. Three reasons a box has no person are kept apart,
+because they call for different actions:
+
+| | |
+|---|---|
+| **on nobody** | the pass looked and there was no person there — a finding |
+| **not measured** | the pass never saw that frame — run it |
+| **drifted** | labels and sidecar disagree about which box is on which line — re-run the measures pass |
+
+Predictions above the operating confidence are accounted for the same way, plus
+a fourth case: a prediction whose record never stored a frame size carries no
+box in the match table at all, which no re-run of the measures pass will fix.
+
+### What it needs
+
+Both halves, or the section prints the reason instead of a table:
+
+- **person boxes** — box measures at sidecar version 2 or later. Version 1 kept
+  only each box's pose, not the person behind it, so re-run *Measure box
+  statistics*.
+- **prediction boxes** — match table version 3 or later. Earlier tables record
+  a prediction's outcome but not where it was, so it cannot be placed on
+  anybody; run *Build tag analytics data* to rewrite the table from the saved
+  predictions (no GPU, no re-inference).
+
+Where either is missing, `pose` and `person size` stay box-scope and give the
+recall-side view they always did — an eval does not lose a tag by being old.
 
 ## The page
 
@@ -129,6 +205,14 @@ boxes, and the slice is scored as a set of boxes.
 - **Whole dataset** — the baseline every row is compared against.
 - **One table per tag** — every value scored, with a signed gap against the
   whole dataset so an outlier is visible without arithmetic.
+- **People** — the per-person confusion above, its per-pose and per-size
+  breakdowns, and the *Boxes on nobody* panel. Boxed off from the rest of the
+  page on purpose: a precision read out of this section and a recall read out
+  of a box table do not share a denominator.
+- **All tags** — every value of every tag on one grid, shaded worst → best down
+  each column *within each tag*. One table per population, because the three do
+  not share a metric set; scaling the shading across tags would just make the
+  darkest cell whichever tag happens to hold the dataset's hardest slice.
 - **Cross-tab** — pick two tags and a metric, get the grid. Cells are
   intersections, shaded from the grid's own worst cell to its best; an empty
   combination stays blank rather than disappearing, because "there are no rainy

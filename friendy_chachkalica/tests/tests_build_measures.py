@@ -10,7 +10,10 @@ import unittest
 import numpy as np
 
 from friendy_chachkalica.ml.build_measures import (
+    CONTAINMENT_MIN,
     NO_PERSON,
+    PERSON_IOU_MIN,
+    VERSION,
     _match_poses,
     attribute,
 )
@@ -101,3 +104,25 @@ class VocabularyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SidecarContractTests(unittest.TestCase):
+    """What the reader on the other side of the repo is entitled to assume.
+
+    ``chachkalica/training/services/tag_analytics.py`` parses this sidecar and
+    cannot import this module (no torch there, no Django here), so the few
+    things it hard-codes are pinned from both ends.
+    """
+
+    def test_the_version_that_carries_people_is_announced(self):
+        # Version 2 added the per-image ``people`` list and each box's owning
+        # person index; version 1 kept only the values derived from them, which
+        # is why a v1 sidecar cannot produce a per-person table.
+        self.assertEqual(VERSION, 2)
+
+    def test_the_attribution_thresholds_match_the_readers_fallbacks(self):
+        # The sidecar writes both into every document, so the reader normally
+        # uses the pass's own numbers. These are the defaults it falls back to
+        # for a document written before that, and they have to agree.
+        self.assertEqual(CONTAINMENT_MIN, 0.7)
+        self.assertEqual(PERSON_IOU_MIN, 0.5)

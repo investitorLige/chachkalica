@@ -19,6 +19,22 @@
                 background: #6b7b8c; border-radius: 3px; padding: 1px 6px; margin-left: 8px;
                 vertical-align: middle; }
   .tga .scope.box { background: #8c6b7b; }
+  .tga .scope.person { background: #5f6b3a; }
+  /* The per-person section is boxed so a precision read out of it is never
+     mistaken for one from the box tables above: different denominator,
+     different question. */
+  .tga .people { border: 1px solid #c9cfae; background: #fbfcf5; padding: 2px 18px 14px;
+                 margin: 14px 0; }
+  .tga .people h3 { margin-top: 1.1em; }
+  .tga .confusion td.hit { background: #e8f6ec; }
+  .tga .confusion td.reject { background: #f4f6f4; }
+  .tga .confusion td.miss, .tga .confusion td.alarm { background: #fdecea; }
+  /* Shaded worst-to-best down each column, within one tag -- see
+     tag_analytics.all_tags_table on why the scale never spans two tags. */
+  .tga td.shaded { background: rgba(198, 40, 40, calc((1 - var(--s)) * 0.55)); color: #222; }
+  .tga tr.tagrow th { background: #f2f2f2; text-align: left; font-size: 12px;
+                      padding-top: 9px; }
+  .tga tr.overall td, .tga tr.overall th { color: #777; font-style: italic; }
   /* Computed tags are badged so a measured slice is never mistaken for one a
      person answered, and vice versa. */
   .tga .scope.auto { background: #4a6a8c; }
@@ -90,6 +106,13 @@
         <td class="rowlabel"><span class="state {{ source.state }}">{{ source.state }}</span></td>
         <td class="rowlabel">{{ source.detail }}
           {% if source.key == "box_measures" and source.state != "ok" %}
+            <form method="post" action="{{ measure_url }}?{{ query }}" style="display:inline">
+              {% csrf_token %}
+              <input type="hidden" name="measure_kind" value="box">
+              <button type="submit" class="button">Measure now</button>
+            </form>
+          {% endif %}
+          {% if source.key == "persons" and source.cause == "measures" %}
             <form method="post" action="{{ measure_url }}?{{ query }}" style="display:inline">
               {% csrf_token %}
               <input type="hidden" name="measure_kind" value="box">
@@ -301,6 +324,188 @@
   {% endif %}
 {% endfor %}
 
+
+<h2>People</h2>
+<p class="note">
+  The one population on this page where a false positive has an owner. Every person the
+  measures pass found is one row, and every class is one yes/no question asked twice of
+  them &mdash; is there a helmet on this person in the labels, and did the model say there
+  was &mdash; so a person carrying nothing is evidence too. That is what precision,
+  specificity and accuracy need in order to exist here and nowhere else on this page: a
+  box tag has no row for the person the model did <em>not</em> fire on.
+</p>
+
+{% if not report.persons.available %}
+  <div class="banner">{{ report.persons.detail }}</div>
+{% else %}
+<div class="people">
+
+  {% with overall=report.persons.overall orphans=report.persons.orphans %}
+  <h3>Every person</h3>
+  <p class="note">
+    {{ report.persons.persons }} person(s), {{ overall.classes_scored }} class(es) asked of
+    each &mdash; {{ report.persons.classes|join:", " }}. Decided at the eval's operating
+    confidence ({{ report.score_threshold|floatformat:3 }}); the headline rates are
+    micro-averaged over the classes, so every person-class decision counts once.
+  </p>
+  <div class="result">
+    <div class="tiles">
+      <div class="tile"><div class="k">people</div><div class="v">{{ overall.persons }}</div></div>
+      <div class="tile"><div class="k">F1</div><div class="v">{{ overall.f1|floatformat:4 }}</div></div>
+      <div class="tile"><div class="k">precision</div><div class="v">{{ overall.precision|floatformat:4 }}</div></div>
+      <div class="tile"><div class="k">recall</div><div class="v">{{ overall.recall|floatformat:4 }}</div></div>
+      <div class="tile"><div class="k">specificity</div><div class="v">{{ overall.specificity|floatformat:4 }}</div></div>
+      <div class="tile"><div class="k">accuracy</div><div class="v">{{ overall.accuracy|floatformat:4 }}</div></div>
+    </div>
+    <table class="confusion">
+      <thead><tr><th class="rowlabel"></th><th>model says yes</th><th>model says no</th></tr></thead>
+      <tbody>
+        <tr><th class="rowlabel">labels say yes</th>
+            <td class="hit">{{ overall.hit }}</td><td class="miss">{{ overall.miss }}</td></tr>
+        <tr><th class="rowlabel">labels say no</th>
+            <td class="alarm">{{ overall.false_alarm }}</td>
+            <td class="reject">{{ overall.correct_reject }}</td></tr>
+      </tbody>
+    </table>
+    <details>
+      <summary>per class</summary>
+      <table>
+        <thead><tr><th class="rowlabel">class</th><th>people</th><th>labelled</th>
+                   <th>hit</th><th>miss</th><th>false alarm</th><th>correct reject</th>
+                   <th>precision</th><th>recall</th><th>F1</th><th>specificity</th></tr></thead>
+        <tbody>
+          {% for row in overall.per_class %}
+            <tr>
+              <td class="rowlabel">{{ row.class_name }}</td>
+              <td>{{ row.persons }}</td><td>{{ row.gt_yes }}</td>
+              <td>{{ row.hit }}</td><td>{{ row.miss }}</td>
+              <td>{{ row.false_alarm }}</td><td>{{ row.correct_reject }}</td>
+              {% if row.has_predictions %}<td>{{ row.precision|floatformat:4 }}</td>
+              {% else %}<td class="na">&mdash;</td>{% endif %}
+              {% if row.has_positives %}<td>{{ row.recall|floatformat:4 }}</td>
+                <td>{{ row.f1|floatformat:4 }}</td>
+              {% else %}<td class="na" colspan="2">nobody carries this class</td>{% endif %}
+              <td>{{ row.specificity|floatformat:4 }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </details>
+  </div>
+
+  {% for breakdown in report.person_breakdowns %}
+    <h3>{{ breakdown.label }}
+      <span class="scope person">per person</span>
+      {% if breakdown.source == 'auto' %}<span class="scope auto">computed</span>{% endif %}
+    </h3>
+    <p class="note">
+      measured on {{ breakdown.answered }} of {{ breakdown.total }} people
+      {% if breakdown.unit %}· {{ breakdown.unit }}{% endif %}
+      {% if breakdown.truncated %}· only the most common values are shown{% endif %}
+    </p>
+    {% if breakdown.cuts %}
+      <p class="cuts">cut into terciles over this eval:
+        {% for cut in breakdown.cuts %}
+          <code>{{ cut.value }}</code>
+          {% if cut.min is None %}&le; {{ cut.max|floatformat:3 }}
+          {% elif cut.max is None %}&gt; {{ cut.min|floatformat:3 }}
+          {% else %}{{ cut.min|floatformat:3 }}&ndash;{{ cut.max|floatformat:3 }}{% endif %}
+          ({{ cut.count }}){% if not forloop.last %} ·{% endif %}
+        {% endfor %}
+      </p>
+    {% endif %}
+    <table>
+      <thead>
+        <tr><th class="rowlabel">value</th><th>people</th><th>labelled</th>
+            <th>hit</th><th>miss</th><th>false alarm</th><th>correct reject</th>
+            <th>F1</th><th>vs all</th><th>precision</th><th>recall</th>
+            <th>specificity</th><th>accuracy</th></tr>
+      </thead>
+      <tbody>
+        {% for row in breakdown.rows %}
+          <tr {% if row.empty %}class="empty"{% endif %}>
+            <td class="rowlabel">{{ row.value }}</td>
+            <td>{{ row.persons }}</td>
+            {% if row.empty %}
+              <td colspan="11">nobody carries this value</td>
+            {% else %}
+              <td>{{ row.gt_yes }}</td>
+              <td>{{ row.hit }}</td><td>{{ row.miss }}</td>
+              <td>{{ row.false_alarm }}</td><td>{{ row.correct_reject }}</td>
+              <td>{{ row.f1|floatformat:4 }}</td>
+              <td class="delta {% if row.delta < 0 %}down{% elif row.delta > 0 %}up{% endif %}">
+                {% if row.delta < 0 %}{{ row.delta|floatformat:3 }}{% else %}+{{ row.delta|floatformat:3 }}{% endif %}</td>
+              {% if row.has_predictions %}<td>{{ row.precision|floatformat:4 }}</td>
+              {% else %}<td class="na">&mdash;</td>{% endif %}
+              {% if row.has_positives %}<td>{{ row.recall|floatformat:4 }}</td>
+              {% else %}<td class="na">&mdash;</td>{% endif %}
+              <td>{{ row.specificity|floatformat:4 }}</td>
+              <td>{{ row.accuracy|floatformat:4 }}</td>
+            {% endif %}
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endfor %}
+
+  <h3>Boxes on nobody</h3>
+  <p class="note">
+    The per-person tables above are a closed accounting of <em>people</em>, which makes them
+    silently not an accounting of boxes: a weapon on the ground, or one worn by somebody the
+    person detector walked past, belongs to no row up there. Those boxes are counted here and
+    scored on the one thing they support &mdash; was it found &mdash; so a model cannot look
+    good on people while missing half the objects in the dataset.
+  </p>
+  <div class="result">
+    <div class="tiles">
+      <div class="tile"><div class="k">gt on a person</div><div class="v">{{ orphans.gt_on_person }}</div></div>
+      <div class="tile"><div class="k">gt on nobody</div><div class="v">{{ orphans.gt_on_nobody }}</div></div>
+      <div class="tile"><div class="k">gt not measured</div><div class="v">{{ orphans.gt_unmeasured }}</div></div>
+      <div class="tile"><div class="k">people</div><div class="v">{{ orphans.people }}</div></div>
+      <div class="tile"><div class="k">frames measured</div><div class="v">{{ orphans.images_measured }} / {{ orphans.images_total }}</div></div>
+    </div>
+    {% if orphans.per_class %}
+      <table>
+        <thead><tr><th class="rowlabel">class</th><th>gt boxes</th><th>on nobody</th>
+                   <th>found</th><th>missed</th><th>recall</th><th>not measured</th></tr></thead>
+        <tbody>
+          {% for row in orphans.per_class %}
+            <tr>
+              <td class="rowlabel">{{ row.class_name }}</td>
+              <td>{{ row.gt }}</td><td>{{ row.on_nobody }}</td>
+              <td>{{ row.found }}</td><td>{{ row.missed }}</td>
+              {% if row.on_nobody %}<td>{{ row.recall|floatformat:4 }}</td>
+              {% else %}<td class="na">&mdash;</td>{% endif %}
+              <td>{{ row.unmeasured }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="note">Every ground-truth box in this eval sits on somebody.</p>
+    {% endif %}
+    <p class="note">
+      Predictions above the operating confidence, the same three ways:
+      <strong>{{ orphans.predictions.on_person }}</strong> landed on a person and are counted
+      in the tables above, <strong>{{ orphans.predictions.on_nobody }}</strong> landed on
+      nobody in a measured frame (false alarms with no owner, so they appear in no per-person
+      rate), <strong>{{ orphans.predictions.unmeasured }}</strong> fell in frames the pass
+      never looked at{% if orphans.predictions.no_geometry %}, and
+      <strong>{{ orphans.predictions.no_geometry }}</strong> carry no box in the match table at
+      all &mdash; their record never stored a frame size, which no re-run of the measures pass
+      will fix{% endif %}.
+      {% if orphans.images_drifted %}
+        {{ orphans.images_drifted }} frame(s) were skipped entirely because their labels and
+        the measures sidecar disagree about which box sits on which line &mdash; re-run the
+        measures pass to line them up.
+      {% endif %}
+    </p>
+  </div>
+  {% endwith %}
+
+</div>
+{% endif %}
+
 {% if report.tags_without_data %}
   <h2>Tags with no data here</h2>
   <p class="note">
@@ -324,11 +529,71 @@
   </table>
 {% endif %}
 
+
+<h2>All tags</h2>
+<p class="note">
+  Every value of every tag on one grid, scored at the eval's operating confidence. One table
+  per population rather than one overall, because the three do not share a metric set and
+  cannot: a frame slice has mAP, a person slice has specificity, a box slice has neither, and
+  forcing them together would spend two thirds of every column on blanks that read as missing
+  data rather than as undefined quantities. Each tag's first row is the whole dataset, for the
+  comparison the shading is against.
+</p>
+<p class="note">
+  Shaded worst &rarr; best down each column, <strong>within each tag</strong>. Scaling across
+  tags would answer a different question &mdash; the darkest cell would just be whichever tag
+  happened to contain the dataset's hardest slice, every time.
+</p>
+
+{% for group in report.all_tags %}
+  <h3>{{ group.label }}
+    <span class="scope {% if group.kind == 'box' %}box{% elif group.kind == 'person' %}person{% endif %}">
+      {{ group.population_label }}</span>
+  </h3>
+  <table>
+    <thead>
+      <tr><th class="rowlabel">value</th><th>{{ group.population_label }}</th>
+        {% for key, label in group.metrics %}<th>{{ label }}</th>{% endfor %}</tr>
+    </thead>
+    <tbody>
+      {% for tag in group.tags %}
+        <tr class="tagrow">
+          <th class="rowlabel" colspan="2">{{ tag.label }}
+            {% if tag.source == 'auto' %}<span class="scope auto">computed</span>{% endif %}
+          </th>
+          {% for cell in tag.overall %}
+            <td>{{ cell.value|floatformat:4 }}</td>
+          {% endfor %}
+        </tr>
+        {% for row in tag.rows %}
+          <tr {% if row.empty %}class="empty"{% endif %}>
+            <td class="rowlabel">{{ row.value }}</td>
+            <td>{{ row.population }}</td>
+            {% for cell in row.cells %}
+              {% if cell.value is None %}
+                <td class="na">&mdash;</td>
+              {% elif cell.share is None %}
+                <td>{{ cell.value|floatformat:4 }}</td>
+              {% else %}
+                <td class="shaded" style="--s: {{ cell.share }}">{{ cell.value|floatformat:4 }}</td>
+              {% endif %}
+            {% endfor %}
+          </tr>
+        {% endfor %}
+      {% endfor %}
+    </tbody>
+  </table>
+{% empty %}
+  <p class="note">No tag can slice this eval, so there is nothing to lay out here.</p>
+{% endfor %}
+
 <h2>Cross-tab</h2>
 <p class="note">
-  One metric over every combination of two tags' values — the intersection, so a cell is the
-  images (or boxes) answering both. Pairing a box tag with anything makes the whole grid a
-  box slice, with only the ground-truth-side metrics on offer.
+  One metric over every combination of two tags' values — the intersection, so a cell is
+  the images, people or boxes answering both. The most specific scope wins: pair a person tag
+  with anything and the grid scores people; pair a box tag with a frame tag and it scores
+  boxes, with only the ground-truth-side metrics on offer. A person tag paired with a box tag
+  keeps the people who own at least one box the box clause selected.
 </p>
 <div class="controls">
   <div><label for="tga-a">rows</label><select id="tga-a"></select></div>
@@ -357,6 +622,7 @@ as page text.{% endcomment %}
 {{ report.tags|json_script:"tga-tags" }}
 {{ report.frame_metrics|json_script:"tga-frame-metrics" }}
 {{ report.box_metrics|json_script:"tga-box-metrics" }}
+{{ report.person_metrics|json_script:"tga-person-metrics" }}
 
 {% endwith %}
 {% endif %}
@@ -370,6 +636,10 @@ as page text.{% endcomment %}
   const TAGS = JSON.parse(tagsNode.textContent);
   const FRAME_METRICS = JSON.parse(document.getElementById("tga-frame-metrics").textContent);
   const BOX_METRICS = JSON.parse(document.getElementById("tga-box-metrics").textContent);
+  const PERSON_METRICS = JSON.parse(document.getElementById("tga-person-metrics").textContent);
+  const METRICS_BY_KIND = {
+    frame: FRAME_METRICS, person: PERSON_METRICS, box: BOX_METRICS,
+  };
   const DATA_URL = "{{ data_url }}?{{ query }}";
   const byName = Object.fromEntries(TAGS.map(t => [t.name, t]));
 
@@ -396,23 +666,29 @@ as page text.{% endcomment %}
   // The option's value stays the tag's real name -- it is the wire key for
   // every slice request -- while the label shows the readable half plus how it
   // was produced, so a measured slice is never mistaken for an annotated one.
+  const SCOPE_SUFFIX = { box: "  (box-wide)", person: "  (per person)", frame: "" };
   const tagOptions = TAGS.map(t => [
     t.name,
     (t.label || t.name)
-      + (t.kind === "box" ? "  (box-wide)" : "")
+      + (SCOPE_SUFFIX[t.kind] || "")
       + (t.source === "auto" ? "  · computed" : ""),
   ]);
   fill(selectA, tagOptions);
   fill(selectB, tagOptions);
   if (TAGS.length > 1) { selectB.selectedIndex = 1; }
 
+  // The same precedence resolve_clauses applies server-side: a person clause
+  // wins, then a box clause, and only two frame tags keep the full frame set.
+  function pairKind(a, b) {
+    const kinds = [(byName[a] || {}).kind, (byName[b] || {}).kind];
+    if (kinds.includes("person")) { return "person"; }
+    return kinds.every(kind => kind === "frame") ? "frame" : "box";
+  }
+
   function refreshMetrics() {
-    // The metric list follows the pair: two frame tags keep the full set, any
-    // box tag drops it to what a set of ground-truth boxes can answer.
-    const kind = (byName[selectA.value] || {}).kind === "frame"
-      && (byName[selectB.value] || {}).kind === "frame" ? "frame" : "box";
+    const kind = pairKind(selectA.value, selectB.value);
     const previous = selectMetric.value;
-    fill(selectMetric, kind === "frame" ? FRAME_METRICS : BOX_METRICS);
+    fill(selectMetric, METRICS_BY_KIND[kind]);
     if ([...selectMetric.options].some(o => o.value === previous)) { selectMetric.value = previous; }
   }
   selectA.addEventListener("change", refreshMetrics);
@@ -500,7 +776,16 @@ as page text.{% endcomment %}
   function renderSlice(data) {
     const target = document.getElementById("tga-slice");
     let tiles = "";
-    if (data.kind === "frame") {
+    if (data.kind === "person") {
+      tiles += tile("people", data.persons) + tile("images", data.images)
+        + tile("hit", data.hit) + tile("miss", data.miss)
+        + tile("false alarm", data.false_alarm)
+        + tile("correct reject", data.correct_reject)
+        + tile("F1", number(data.f1)) + tile("precision", number(data.precision))
+        + tile("recall", number(data.recall))
+        + tile("specificity", number(data.specificity))
+        + tile("accuracy", number(data.accuracy));
+    } else if (data.kind === "frame") {
       tiles += tile("images", data.images) + tile("gt boxes", data.gt)
         + tile("predictions", data.predictions)
         + tile("mAP50", number(data.map50)) + tile("mAP50-95", number(data.map50_95))
@@ -516,8 +801,21 @@ as page text.{% endcomment %}
     }
 
     let classes = "<table><thead><tr><th class='rowlabel'>class</th>";
-    const perClass = data.kind === "frame" ? data.per_class : data.per_class;
-    if (data.kind === "frame") {
+    const perClass = data.per_class;
+    if (data.kind === "person") {
+      classes += "<th>people</th><th>labelled</th><th>hit</th><th>miss</th>"
+        + "<th>false alarm</th><th>correct reject</th><th>precision</th><th>recall</th>"
+        + "<th>F1</th><th>specificity</th></tr></thead><tbody>";
+      perClass.forEach(row => {
+        classes += "<tr><td class='rowlabel'>" + row.class_name + "</td><td>" + row.persons
+          + "</td><td>" + row.gt_yes + "</td><td>" + row.hit + "</td><td>" + row.miss
+          + "</td><td>" + row.false_alarm + "</td><td>" + row.correct_reject + "</td><td>"
+          + (row.has_predictions ? number(row.precision) : "—") + "</td><td>"
+          + (row.has_positives ? number(row.recall) : "—") + "</td><td>"
+          + (row.has_positives ? number(row.f1) : "—") + "</td><td>"
+          + number(row.specificity) + "</td></tr>";
+      });
+    } else if (data.kind === "frame") {
       classes += "<th>gt</th><th>preds</th><th>AP50</th><th>AP50-95</th><th>precision</th>"
         + "<th>recall</th><th>F1</th></tr></thead><tbody>";
       perClass.forEach(row => {
@@ -536,14 +834,21 @@ as page text.{% endcomment %}
     }
     classes += "</tbody></table>";
 
-    const warning = (data.kind === "box" && data.small)
-      ? "<p class='note'>Fewer than 30 boxes in this slice — read these as an indication, not a measurement.</p>"
-      : (data.kind === "frame" && data.gt < 30
-        ? "<p class='note'>Fewer than 30 ground-truth boxes in this slice — read these as an indication, not a measurement.</p>"
-        : "");
-    const caveat = data.kind === "box"
-      ? "<p class='note'>A box slice: no precision or mAP, because a false positive carries no tags to attribute it by.</p>"
-      : "";
+    const warning = (data.kind === "person" && data.small)
+      ? "<p class='note'>Fewer than 30 people in this slice — read these as an indication, not a measurement.</p>"
+      : ((data.kind === "box" && data.small)
+        ? "<p class='note'>Fewer than 30 boxes in this slice — read these as an indication, not a measurement.</p>"
+        : (data.kind === "frame" && data.gt < 30
+          ? "<p class='note'>Fewer than 30 ground-truth boxes in this slice — read these as an indication, not a measurement.</p>"
+          : ""));
+    const CAVEATS = {
+      box: "A box slice: no precision or mAP, because a false positive carries no tags to"
+        + " attribute it by.",
+      person: "A person slice: one yes/no per person per class, so a false positive has an"
+        + " owner and precision exists — but boxes sitting on nobody are outside it entirely."
+        + " See \u201cBoxes on nobody\u201d above for those.",
+    };
+    const caveat = CAVEATS[data.kind] ? "<p class='note'>" + CAVEATS[data.kind] + "</p>" : "";
 
     target.innerHTML = '<div class="result"><div class="tiles">' + tiles + "</div>"
       + warning + caveat + "<details><summary>per class</summary>" + classes + "</details></div>";

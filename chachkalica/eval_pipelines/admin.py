@@ -348,11 +348,19 @@ def _load_tag_analysis(eval_obj):
     detail = f"{artifact.name}, version {table.version}"
     if table.backfilled:
         detail += ", rebuilt from the saved predictions"
+    # Two separate gaps, two separate sentences: version 2 added ground-truth
+    # extents (the box-size tag) and version 3 prediction boxes (the whole
+    # per-person section). Naming only the older one would leave somebody on a
+    # version 2 table wondering why People says nothing.
+    missing = []
+    if not table.has_geometry:
+        missing.append("no per-box geometry, so the box-size tag is unavailable")
+    if table.version < 3:
+        missing.append("no prediction geometry, so people cannot be scored")
     sources = [{
         "key": "match_table", "label": "Match outcomes",
-        "state": "ok" if table.has_geometry else "partial",
-        "detail": detail if table.has_geometry else
-                  detail + " — no per-box geometry, so the box-size tag is unavailable",
+        "state": "ok" if not missing else "partial",
+        "detail": detail + (" — " + "; ".join(missing) if missing else ""),
         "path": str(artifact),
     }]
 
@@ -431,15 +439,42 @@ def _load_tag_analysis(eval_obj):
         box_detail = (
             f"{totals.get('boxes', 0)} box(es) measured against "
             f"{box_measures.get('person_source', 'unknown')} person boxes; "
-            f"{totals.get('without_person', 0)} had no person around them"
+            f"{totals.get('without_person', 0)} had no person around them; "
+            f"{totals.get('people_found', 0)} person(s) found"
         )
     sources.append({"key": "box_measures", "label": "Box measures (person / pose)",
                     "state": box_state, "detail": box_detail,
                     "path": str(labels_dir or "")})
 
+    # People are the third population this page can score, and they need both
+    # halves: the sidecar's person boxes and the match table's prediction
+    # geometry. build_persons returns None when either is missing, and the page
+    # prints which rather than rendering an empty section.
+    persons = tag_analytics.build_persons(table, box_measures)
+    if persons is not None and persons.count:
+        person_detail = (
+            f"{persons.count} person(s) over {persons.measured_images} measured frame(s)"
+            + (f"; {persons.drifted_images} frame(s) skipped for row drift"
+               if persons.drifted_images else ""))
+        person_cause = ""
+    elif table.version < 3:
+        person_detail, person_cause = tag_analytics.NO_PREDICTION_GEOMETRY_DETAIL, "match_table"
+    else:
+        person_detail, person_cause = tag_analytics.NO_PERSONS_DETAIL, "measures"
+    sources.append({
+        "key": "persons", "label": "People (per-person scoring)",
+        "state": "ok" if not person_cause else "missing",
+        # Which pass to run differs by cause, and the page puts the button for
+        # it on this row, so the cause travels rather than being re-guessed
+        # from the wording of the sentence above.
+        "cause": person_cause,
+        "detail": person_detail,
+        "path": str(labels_dir or ""),
+    })
+
     index = tag_analytics.build_tag_index(
         table, document, declared_specs=specs, measures=measures,
-        box_measures=box_measures, reasons=reasons)
+        box_measures=box_measures, reasons=reasons, persons=persons)
     return (table, index, sources), None
 
 
@@ -781,6 +816,7 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin,
                 # needs both lists before the first grid is built.
                 "frame_metrics": tag_analytics.FRAME_METRICS,
                 "box_metrics": tag_analytics.BOX_METRICS,
+                "person_metrics": tag_analytics.PERSON_METRICS,
                 "notes": notes,
             })
 

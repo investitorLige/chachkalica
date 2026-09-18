@@ -307,7 +307,7 @@ class JoinIntegrityTests(TagAnalyticsSetup):
 
     def test_a_future_table_version_is_refused_rather_than_misread(self):
         path = self.root / "eval_matches.json"
-        path.write_text(json.dumps(_table(version=3)), encoding="utf-8")
+        path.write_text(json.dumps(_table(version=4)), encoding="utf-8")
 
         with self.assertRaises(ValueError):
             tag_analytics.load_table(path)
@@ -638,3 +638,552 @@ class BoxMeasureTests(TagAnalyticsSetup):
             definition = index.tag(name)
             self.assertEqual(definition.status, "unavailable")
             self.assertIn("Measure box statistics", definition.status_detail)
+
+
+# Five people over four frames, one scored class. Laid out so every number
+# below can be read off the picture:
+#
+#   img0  P0 standing, wearing a helmet, and the model says so      -> hit
+#         P1 lying,    wearing a helmet, and the model says so      -> hit
+#   img1  P2 standing, wearing nothing, and the model says helmet   -> false alarm
+#         plus a helmet lying on the floor, on nobody               -> an orphan
+#   img2  P3 lying,    wearing a helmet, and the model says nothing -> miss
+#   img3  P4 standing, wearing nothing, and the model agrees        -> correct reject
+def _person_table(**overrides) -> dict:
+    table = {
+        "version": 3,
+        "iou_thresholds": [0.5],
+        "score_threshold": 0.25,
+        "score_floor": 0.001,
+        "operating_nms_threshold": None,
+        # "person" is in the class space and is deliberately never asked about:
+        # "does this person have a person on them" is not a question.
+        "classes": {"0": "helmet", "1": "person"},
+        "images": ["img0.jpg", "img1.jpg", "img2.jpg", "img3.jpg"],
+        "gt": {
+            "image": [0, 0, 1, 2], "class": [0, 0, 0, 0], "row": [0, 1, 0, 0],
+            "w": [0.1, 0.1, 0.1, 0.1], "h": [0.1, 0.1, 0.1, 0.1],
+        },
+        "pred": {
+            "image": [0, 0, 1],
+            "class": [0, 0, 0],
+            "score": [0.9, 0.8, 0.7],
+            "iou": [0.9, 0.8, 0.1],
+            "gt": [0, 1, 2],
+            "geom": {
+                "cut": 0.25,
+                "index": [0, 1, 2],
+                "x0": [0.05, 0.55, 0.15], "y0": [0.05, 0.05, 0.15],
+                "x1": [0.15, 0.65, 0.25], "y1": [0.15, 0.15, 0.25],
+            },
+        },
+        "pred_operating": None,
+    }
+    table.update(overrides)
+    return table
+
+
+def _person_measures(**overrides) -> dict:
+    document = {
+        "version": 2,
+        "kind": "box",
+        "person_source": "detector",
+        "containment_min": 0.7,
+        "person_iou_min": 0.5,
+        "person_class_names": ["person", "people", "pedestrian"],
+        "person_measures": [
+            {"name": "pose", "kind": "categorical",
+             "choices": ["standing", "sitting", "lying"]},
+            {"name": "size ratio", "kind": "numeric"},
+        ],
+        "images": {
+            "img0.jpg": {
+                "people": [
+                    {"box": [0.0, 0.0, 0.4, 1.0], "pose": "standing", "size ratio": 0.40},
+                    {"box": [0.5, 0.0, 0.9, 1.0], "pose": "lying", "size ratio": 0.40},
+                ],
+                "boxes": [
+                    {"row": 0, "class_id": 0, "person": 0, "values": {"pose": "standing"}},
+                    {"row": 1, "class_id": 0, "person": 1, "values": {"pose": "lying"}},
+                ],
+            },
+            "img1.jpg": {
+                "people": [
+                    {"box": [0.1, 0.1, 0.5, 0.9], "pose": "standing", "size ratio": 0.32},
+                ],
+                # The helmet on the floor: measured, and on nobody.
+                "boxes": [{"row": 0, "class_id": 0, "person": None,
+                           "values": {"pose": "(no person)"}}],
+            },
+            "img2.jpg": {
+                "people": [
+                    {"box": [0.0, 0.0, 0.5, 1.0], "pose": "lying", "size ratio": 0.50},
+                ],
+                "boxes": [{"row": 0, "class_id": 0, "person": 0,
+                           "values": {"pose": "lying"}}],
+            },
+            # No labels at all, which is exactly why this frame matters: the
+            # person in it can only ever be a correct rejection.
+            "img3.jpg": {
+                "people": [
+                    {"box": [0.2, 0.2, 0.6, 0.8], "pose": "standing", "size ratio": 0.24},
+                ],
+                "boxes": [],
+            },
+        },
+    }
+    document.update(overrides)
+    return document
+
+
+class PersonScoringTests(TagAnalyticsSetup):
+    """The population where a false positive has an owner."""
+
+    def load_persons(self, table=None, measures=None):
+        path = self.root / "eval_matches.json"
+        path.write_text(json.dumps(table or _person_table()), encoding="utf-8")
+        loaded = tag_analytics.load_table(path)
+        persons = tag_analytics.build_persons(
+            loaded, _person_measures() if measures is None else measures)
+        index = tag_analytics.build_tag_index(
+            loaded, {}, box_measures=_person_measures() if measures is None else measures,
+            persons=persons)
+        return loaded, persons, index
+
+    def test_everybody_the_pass_found_is_a_row_including_the_empty_handed(self):
+        _table, persons, _index = self.load_persons()
+
+        # Four ground-truth boxes but five people: the two the model was right
+        # about carrying nothing have no box to appear as.
+        self.assertEqual(persons.count, 5)
+
+    def test_the_confusion_matches_the_picture_in_the_fixture(self):
+        table, persons, index = self.load_persons()
+
+        metrics = tag_analytics.overall_metrics(table, index, "person")
+
+        self.assertEqual(metrics["hit"], 2)
+        self.assertEqual(metrics["miss"], 1)
+        self.assertEqual(metrics["false_alarm"], 1)
+        self.assertEqual(metrics["correct_reject"], 1)
+        self.assertAlmostEqual(metrics["precision"], 2 / 3)
+        self.assertAlmostEqual(metrics["recall"], 2 / 3)
+        # Two people carry nothing; the model fired on one of them.
+        self.assertAlmostEqual(metrics["specificity"], 0.5)
+        self.assertAlmostEqual(metrics["accuracy"], 0.6)
+
+    def test_pose_slices_people_rather_than_boxes(self):
+        table, _persons, index = self.load_persons()
+
+        pose = index.tag(tag_analytics.POSE_TAG)
+        standing = tag_analytics.slice_metrics(
+            table, index, [(tag_analytics.POSE_TAG, "standing")])
+
+        self.assertEqual(pose.scope, tag_analytics.PERSON_SCOPE)
+        self.assertEqual(pose.kind, "person")
+        self.assertEqual(standing["kind"], "person")
+        # P0 (hit), P2 (false alarm), P4 (correct reject).
+        self.assertEqual(standing["persons"], 3)
+        self.assertEqual(standing["hit"], 1)
+        self.assertEqual(standing["false_alarm"], 1)
+        self.assertEqual(standing["correct_reject"], 1)
+        self.assertAlmostEqual(standing["precision"], 0.5)
+        self.assertAlmostEqual(standing["recall"], 1.0)
+
+    def test_the_lying_slice_is_the_one_the_model_is_worse_on(self):
+        table, _persons, index = self.load_persons()
+
+        lying = tag_analytics.slice_metrics(
+            table, index, [(tag_analytics.POSE_TAG, "lying")])
+
+        self.assertEqual(lying["persons"], 2)
+        self.assertEqual(lying["hit"], 1)
+        self.assertEqual(lying["miss"], 1)
+        self.assertAlmostEqual(lying["recall"], 0.5)
+        # Nothing was predicted wrongly here, so precision is a clean 1.0 --
+        # the failure is entirely on the recall side.
+        self.assertAlmostEqual(lying["precision"], 1.0)
+
+    def test_a_person_class_is_never_asked_about_itself(self):
+        table, persons, _index = self.load_persons()
+
+        self.assertEqual(
+            [table.classes[c] for c in tag_analytics.scored_class_ids(table, persons)],
+            ["helmet"])
+
+    def test_a_box_on_nobody_is_counted_and_scored_apart(self):
+        table, persons, _index = self.load_persons()
+
+        orphans = tag_analytics.person_orphans(table, persons)
+
+        self.assertEqual(orphans["gt_on_person"], 3)
+        self.assertEqual(orphans["gt_on_nobody"], 1)
+        self.assertEqual(orphans["gt_unmeasured"], 0)
+        helmet = orphans["per_class"][0]
+        self.assertEqual(helmet["on_nobody"], 1)
+        # The 0.7 prediction lands near it at IoU 0.1, which is a miss.
+        self.assertEqual(helmet["found"], 0)
+        self.assertAlmostEqual(helmet["recall"], 0.0)
+
+    def test_predictions_are_accounted_for_three_ways(self):
+        table, persons, _index = self.load_persons()
+
+        predictions = tag_analytics.person_orphans(table, persons)["predictions"]
+
+        self.assertEqual(predictions["total"], 3)
+        self.assertEqual(predictions["on_person"], 3)
+        self.assertEqual(predictions["on_nobody"], 0)
+        self.assertEqual(predictions["no_geometry"], 0)
+
+    def test_a_prediction_landing_on_no_one_is_not_silently_dropped(self):
+        table = _person_table()
+        # Move the img1 prediction into a corner no person occupies.
+        table["pred"]["geom"]["x0"][2] = 0.90
+        table["pred"]["geom"]["y0"][2] = 0.90
+        table["pred"]["geom"]["x1"][2] = 0.98
+        table["pred"]["geom"]["y1"][2] = 0.98
+        loaded, persons, index = self.load_persons(table=table)
+
+        orphans = tag_analytics.person_orphans(loaded, persons)
+        metrics = tag_analytics.overall_metrics(loaded, index, "person")
+
+        self.assertEqual(orphans["predictions"]["on_nobody"], 1)
+        # It stops being a false alarm against P2, so P2 becomes a correct
+        # rejection -- and the prediction is now only visible in the orphan
+        # panel, which is why that panel has to exist.
+        self.assertEqual(metrics["false_alarm"], 0)
+        self.assertEqual(metrics["correct_reject"], 2)
+
+    def test_geometry_survives_the_sort_into_score_order(self):
+        table = _person_table()
+        # Same three predictions, written to the file in ascending score, so a
+        # loader that forgot to permute the sparse index would hang each box on
+        # the wrong prediction.
+        table["pred"] = {
+            "image": [1, 0, 0],
+            "class": [0, 0, 0],
+            "score": [0.7, 0.8, 0.9],
+            "iou": [0.1, 0.8, 0.9],
+            "gt": [2, 1, 0],
+            "geom": {
+                "cut": 0.25,
+                "index": [0, 1, 2],
+                "x0": [0.15, 0.55, 0.05], "y0": [0.15, 0.05, 0.05],
+                "x1": [0.25, 0.65, 0.15], "y1": [0.25, 0.15, 0.15],
+            },
+        }
+        loaded, _persons, index = self.load_persons(table=table)
+
+        metrics = tag_analytics.overall_metrics(loaded, index, "person")
+
+        self.assertEqual(metrics["hit"], 2)
+        self.assertEqual(metrics["false_alarm"], 1)
+
+    def test_a_frame_clause_narrows_the_people(self):
+        table, _persons, index = self.load_persons()
+        tags = {
+            "tags": [{"name": "weather", "scope": "frame", "widget": "radio",
+                      "choices": ["sun", "rain"]}],
+            "images": {"img0.jpg": {"frame": {"weather": ["rain"]}},
+                       "img1.jpg": {"frame": {"weather": ["sun"]}},
+                       "img2.jpg": {"frame": {"weather": ["sun"]}},
+                       "img3.jpg": {"frame": {"weather": ["sun"]}}},
+        }
+        index = tag_analytics.build_tag_index(
+            table, tags, box_measures=_person_measures(), persons=index.persons)
+
+        rainy = tag_analytics.slice_metrics(
+            table, index, [(tag_analytics.POSE_TAG, "standing"), ("weather", "rain")])
+
+        # Only P0 stands in the rain.
+        self.assertEqual(rainy["kind"], "person")
+        self.assertEqual(rainy["persons"], 1)
+        self.assertEqual(rainy["hit"], 1)
+
+    def test_a_table_without_prediction_geometry_says_so_instead_of_scoring(self):
+        table = _person_table(version=2)
+        table["pred"].pop("geom")
+        loaded, persons, index = self.load_persons(table=table)
+
+        section = tag_analytics.person_section(loaded, index)
+
+        self.assertIsNone(persons)
+        self.assertFalse(section["available"])
+        self.assertIn("Build tag analytics data", section["detail"])
+
+    def test_an_older_sidecar_keeps_the_box_scope_tables(self):
+        # No "people" key: the measures pass predates per-person rows. The tag
+        # does not vanish, it just answers the smaller question it always did.
+        measures = _person_measures()
+        for entry in measures["images"].values():
+            entry.pop("people")
+        _loaded, persons, index = self.load_persons(measures=measures)
+
+        pose = index.tag(tag_analytics.POSE_TAG)
+
+        self.assertIsNone(persons)
+        self.assertEqual(pose.kind, "box")
+
+    def test_the_section_names_the_pass_that_would_produce_people(self):
+        loaded, _persons, index = self.load_persons(measures={})
+
+        section = tag_analytics.person_section(loaded, index)
+
+        self.assertFalse(section["available"])
+        self.assertIn("Measure box statistics", section["detail"])
+
+
+class AttributionTests(TestCase):
+    """The rule that decides which person a box belongs to."""
+
+    def test_a_small_box_goes_to_the_smallest_person_containing_it(self):
+        people = np.array([[0.0, 0.0, 1.0, 1.0], [0.1, 0.1, 0.3, 0.3]])
+        boxes = np.array([[0.15, 0.15, 0.2, 0.2]])
+
+        owner = tag_analytics.attribute_boxes(
+            boxes, np.array([False]), people,
+            containment_min=0.7, person_iou_min=0.5)
+
+        # Both contain it; the tighter enclosure is the wearer far more often
+        # than the large figure in the foreground.
+        self.assertEqual(int(owner[0]), 1)
+
+    def test_a_box_that_is_itself_a_person_is_matched_by_overlap(self):
+        people = np.array([[0.0, 0.0, 1.0, 1.0], [0.1, 0.1, 0.3, 0.3]])
+        boxes = np.array([[0.1, 0.1, 0.3, 0.3]])
+
+        owner = tag_analytics.attribute_boxes(
+            boxes, np.array([True]), people,
+            containment_min=0.7, person_iou_min=0.5)
+
+        # Containment would have handed this to the full-frame person, which is
+        # a different human being.
+        self.assertEqual(int(owner[0]), 1)
+
+    def test_a_box_inside_nobody_belongs_to_nobody(self):
+        people = np.array([[0.0, 0.0, 0.2, 0.2]])
+        boxes = np.array([[0.8, 0.8, 0.9, 0.9]])
+
+        owner = tag_analytics.attribute_boxes(
+            boxes, np.array([False]), people,
+            containment_min=0.7, person_iou_min=0.5)
+
+        self.assertEqual(int(owner[0]), -1)
+
+    def test_a_box_half_out_of_a_person_is_not_theirs(self):
+        people = np.array([[0.0, 0.0, 0.5, 1.0]])
+        boxes = np.array([[0.4, 0.4, 0.6, 0.6]])
+
+        owner = tag_analytics.attribute_boxes(
+            boxes, np.array([False]), people,
+            containment_min=0.7, person_iou_min=0.5)
+
+        # Half its area falls outside, which is under the 0.7 containment floor.
+        self.assertEqual(int(owner[0]), -1)
+
+    def test_the_rule_constants_match_the_pass_that_wrote_the_sidecar(self):
+        # friendy_chachkalica/ml/build_measures.py pins the same two numbers and
+        # writes them into every sidecar it produces. These defaults are only
+        # reached for a sidecar that predates that, so they have to agree.
+        self.assertEqual(tag_analytics.DEFAULT_CONTAINMENT_MIN, 0.7)
+        self.assertEqual(tag_analytics.DEFAULT_PERSON_IOU_MIN, 0.5)
+
+
+class AllTagsGridTests(TagAnalyticsSetup):
+    """The one grid at the end that lays every tag's values side by side."""
+
+    def test_each_population_gets_its_own_table(self):
+        table, index = self.load()
+        report = tag_analytics.report(table, index)
+
+        kinds = [group["kind"] for group in report["all_tags"]]
+
+        # Frame and box tags never share a metric set, so they never share a
+        # table either.
+        self.assertIn("frame", kinds)
+        self.assertIn("box", kinds)
+        for group in report["all_tags"]:
+            self.assertEqual(
+                [key for key, _label in group["metrics"]],
+                [key for key, _label in tag_analytics.METRICS_BY_KIND[group["kind"]][0]])
+
+    def test_shading_is_normalized_inside_one_tag_not_across_them(self):
+        table, index = self.load()
+        report = tag_analytics.report(table, index)
+
+        for group in report["all_tags"]:
+            for tag in group["tags"]:
+                for position in range(len(group["metrics"])):
+                    shares = [row["cells"][position]["share"] for row in tag["rows"]
+                              if row["cells"][position]["share"] is not None]
+                    if not shares:
+                        continue
+                    # Worst and best of *this tag's* values pin the ends.
+                    self.assertAlmostEqual(min(shares), 0.0)
+                    self.assertAlmostEqual(max(shares), 1.0)
+
+    def test_a_single_valued_column_is_left_unshaded(self):
+        table, index = self.load()
+        report = tag_analytics.report(table, index)
+
+        for group in report["all_tags"]:
+            for tag in group["tags"]:
+                for position in range(len(group["metrics"])):
+                    values = [row["cells"][position]["value"] for row in tag["rows"]
+                              if row["cells"][position]["value"] is not None]
+                    if len(set(values)) > 1:
+                        continue
+                    # One number is not a spread; shading it would imply a
+                    # comparison nobody made.
+                    for row in tag["rows"]:
+                        self.assertIsNone(row["cells"][position]["share"])
+
+
+class PersonPageTests(TagAnalyticsSetup):
+    """The page itself, which is where a scope mistake actually shows up."""
+
+    def _report(self, table=None, measures=None):
+        path = self.root / "eval_matches.json"
+        path.write_text(json.dumps(table or _person_table()), encoding="utf-8")
+        loaded = tag_analytics.load_table(path)
+        document = _person_measures() if measures is None else measures
+        persons = tag_analytics.build_persons(loaded, document)
+        index = tag_analytics.build_tag_index(
+            loaded, _tags(), box_measures=document, persons=persons)
+        return loaded, index, tag_analytics.report(loaded, index)
+
+    def _render(self, report):
+        from django.template.loader import render_to_string
+        return render_to_string("admin/eval_pipelines/tag_analytics.html", {
+            "report": report, "sources": [], "subject_name": "eval", "dataset": "ds",
+            "fatal": "", "data_url": "/data", "query": "id=1", "title": "t",
+        })
+
+    def test_the_person_section_reaches_the_page(self):
+        _table, _index, report = self._report()
+
+        html = self._render(report)
+
+        self.assertIn("<h3>Boxes on nobody</h3>", html)
+        self.assertIn("correct reject", html)
+        self.assertIn("specificity", html)
+
+    def test_an_eval_too_old_for_people_gets_the_reason_not_an_empty_table(self):
+        table = _person_table(version=2)
+        table["pred"].pop("geom")
+        _table, _index, report = self._report(table=table)
+
+        html = self._render(report)
+
+        self.assertFalse(report["persons"]["available"])
+        self.assertIn("Build tag analytics data", html)
+        self.assertNotIn("<h3>Boxes on nobody</h3>", html)
+
+    def test_person_breakdowns_are_kept_out_of_the_box_section(self):
+        _table, _index, report = self._report()
+
+        kinds = {breakdown["kind"] for breakdown in report["breakdowns"]}
+        person_kinds = {b["kind"] for b in report["person_breakdowns"]}
+
+        # Otherwise the same tag would render twice, once under a metric set it
+        # does not have.
+        self.assertNotIn("person", kinds)
+        self.assertEqual(person_kinds, {"person"})
+
+    def test_the_all_tags_grid_gains_a_person_table(self):
+        _table, _index, report = self._report()
+
+        groups = {group["kind"]: group for group in report["all_tags"]}
+
+        self.assertIn("person", groups)
+        self.assertEqual(groups["person"]["population_label"], "persons")
+        self.assertIn("specificity",
+                      [label for _key, label in groups["person"]["metrics"]])
+
+    def test_a_cross_tab_pairing_a_person_tag_scores_people(self):
+        table, index, _report = self._report()
+
+        grid = tag_analytics.cross_tab(
+            table, index, tag_analytics.POSE_TAG, "weather", "f1")
+
+        self.assertEqual(grid["kind"], "person")
+        self.assertEqual(grid["population_label"], "persons")
+
+    def test_a_person_slice_survives_json_serialization(self):
+        from django.core.serializers.json import DjangoJSONEncoder
+        table, index, _report = self._report()
+
+        payload = tag_analytics.slice_metrics(
+            table, index, [(tag_analytics.POSE_TAG, "standing")])
+
+        # numpy scalars serialize to nothing useful, so the endpoint would 500
+        # long after this module looked correct.
+        json.dumps(payload, cls=DjangoJSONEncoder)
+
+    def test_comparing_evals_that_disagree_about_the_population_blanks_the_cell(self):
+        old = _person_table(version=2)
+        old["pred"].pop("geom")
+        new_table, new_index, _ = self._report()
+        old_table, old_index, _ = self._report(table=old)
+
+        grid = tag_analytics.compare_tag(
+            [{"label": "new", "dataset": "ds", "table": new_table, "index": new_index},
+             {"label": "old", "dataset": "ds", "table": old_table, "index": old_index}],
+            tag_analytics.POSE_TAG, "f1")
+
+        mismatched = [cell for row in grid["rows"] for cell in row["cells"]
+                      if cell.get("mismatched_kind")]
+        self.assertTrue(mismatched)
+        self.assertTrue(all(cell["value"] is None for cell in mismatched))
+        self.assertTrue(any("different population" in warning
+                            for warning in grid["warnings"]))
+
+
+class PersonJoinIntegrityTests(TagAnalyticsSetup):
+    """Ways the two sidecars can disagree, and what each one costs."""
+
+    def _load(self, measures):
+        path = self.root / "eval_matches.json"
+        path.write_text(json.dumps(_person_table()), encoding="utf-8")
+        table = tag_analytics.load_table(path)
+        return table, tag_analytics.build_persons(table, measures)
+
+    def test_a_malformed_person_does_not_shift_the_ones_after_it(self):
+        measures = _person_measures()
+        # A first person with no box at all. The helmet on img0 row1 still
+        # names person 1, and person 1 is still the one lying down.
+        measures["images"]["img0.jpg"]["people"].insert(0, {"pose": "sitting"})
+        for box in measures["images"]["img0.jpg"]["boxes"]:
+            box["person"] += 1
+        table, persons = self._load(measures)
+
+        owners = persons.gt_person[:2]
+
+        self.assertEqual(persons.count, 5)
+        self.assertEqual([persons.pose[owner] for owner in owners],
+                         ["standing", "lying"])
+
+    def test_a_box_naming_a_person_that_is_not_there_lands_on_nobody(self):
+        measures = _person_measures()
+        measures["images"]["img0.jpg"]["boxes"][0]["person"] = 9
+        _table, persons = self._load(measures)
+
+        # Attributed to nobody rather than to whoever happens to be at index 9
+        # once the frames are concatenated -- which would be someone in another
+        # image entirely.
+        self.assertEqual(int(persons.gt_person[0]), -1)
+
+    def test_a_drifted_frame_contributes_neither_people_nor_boxes(self):
+        measures = _person_measures()
+        for box in measures["images"]["img0.jpg"]["boxes"]:
+            box["class_id"] = 7
+        table, persons = self._load(measures)
+
+        self.assertEqual(persons.count, 3)
+        self.assertEqual(persons.drifted_images, 1)
+        self.assertFalse(bool(persons.measured_mask[0]))
+        # Its boxes are "not measured", not "on nobody" -- a different fact,
+        # calling for a different fix.
+        orphans = tag_analytics.person_orphans(table, persons)
+        self.assertEqual(orphans["gt_unmeasured"], 2)
+        self.assertEqual(orphans["gt_on_nobody"], 1)

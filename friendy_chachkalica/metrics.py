@@ -1283,7 +1283,7 @@ def _f1(precision: float, recall: float) -> float:
 #: without re-reading the label files (whose row semantics are this module's,
 #: not theirs). A version 1 table is still perfectly readable; it simply has
 #: no geometry, and a reader should say so rather than guess.
-MATCH_TABLE_VERSION = 2
+MATCH_TABLE_VERSION = 3
 
 
 def _remap_target_rows(target, id_to_name, eval_name_to_id):
@@ -1345,23 +1345,36 @@ def _best_same_class_gt(prediction, target) -> tuple[torch.Tensor, torch.Tensor]
     return best_iou, torch.where(has_gt, best_gt, torch.full_like(best_gt, -1))
 
 
-def _prediction_block(predictions, targets, gt_offsets) -> dict:
-    """Columnar per-prediction rows: image, class, score, iou, matched gt row."""
+def _prediction_block(predictions, targets, gt_offsets, *, geometry_cut=None) -> dict:
+    """Columnar per-prediction rows: image, class, score, iou, matched gt row.
+
+    ``geometry_cut`` adds a sparse ``geom`` sub-block carrying each prediction's
+    normalized box — but only for rows scoring at or above the cut. Sparse
+    because it has to be: the rows here run down to the AP score floor (0.001),
+    and four more full-length float columns roughly triple a table that is
+    already tens of megabytes. What geometry is *for* is attributing a
+    prediction to the person it landed on, which is a question asked at the
+    operating point, so the operating point is what gets carried.
+    """
     images: list[int] = []
     classes: list[int] = []
     scores: list[float] = []
     ious: list[float] = []
     gts: list[int] = []
+    geom_index: list[int] = []
+    geom_boxes: list[list[float]] = [[], [], [], []]
 
     for image_index, (prediction, target) in enumerate(zip(predictions, targets)):
         count = int(prediction['labels'].numel())
         if count == 0:
             continue
+        base = len(images)
         best_iou, best_gt = _best_same_class_gt(prediction, target)
         offset = gt_offsets[image_index]
+        row_scores = [round(float(value), 6) for value in prediction['scores'].tolist()]
         images.extend([image_index] * count)
         classes.extend(int(value) for value in prediction['labels'].tolist())
-        scores.extend(round(float(value), 6) for value in prediction['scores'].tolist())
+        scores.extend(row_scores)
         # Six decimals, not fewer: an IoU is compared against the thresholds, so
         # a coarser rounding lets a 0.4999996 overlap cross 0.5 and flip one
         # prediction's verdict. The consumer cross-checks itself against the
@@ -1372,7 +1385,31 @@ def _prediction_block(predictions, targets, gt_offsets) -> dict:
             for value in best_gt.tolist()
         )
 
-    return {"image": images, "class": classes, "score": scores, "iou": ious, "gt": gts}
+        if geometry_cut is None:
+            continue
+        height, width = [int(value) for value in target['orig_size'].tolist()[:2]]
+        if width <= 0 or height <= 0:
+            # No frame size to normalize against, so this image's predictions
+            # simply have no geometry. They stay in the rows above and out of
+            # the sparse block, which is what "index" being sparse is for --
+            # a fabricated ratio would place a box on a person by accident.
+            continue
+        for row, box in enumerate(prediction['boxes'].tolist()):
+            if row_scores[row] < geometry_cut:
+                continue
+            geom_index.append(base + row)
+            for column, value in enumerate(
+                    (box[0] / width, box[1] / height, box[2] / width, box[3] / height)):
+                geom_boxes[column].append(round(float(value), 6))
+
+    block = {"image": images, "class": classes, "score": scores, "iou": ious, "gt": gts}
+    if geometry_cut is not None:
+        block["geom"] = {
+            "cut": float(geometry_cut), "index": geom_index,
+            "x0": geom_boxes[0], "y0": geom_boxes[1],
+            "x1": geom_boxes[2], "y1": geom_boxes[3],
+        }
+    return block
 
 
 def match_table(
@@ -1413,9 +1450,9 @@ def match_table(
     concatenates them in before its stable sort — so a consumer's stable sort
     lands on the same tie order too.
 
-    Shape (all coordinates already gone; only outcomes remain)::
+    Shape (outcomes, plus geometry only where something needs it)::
 
-        {"version": 2,
+        {"version": 3,
          "iou_thresholds": [0.5, ...],
          "score_threshold": 0.25,          # the headline operating point
          "score_floor": 0.001,             # lowest score present in the rows
@@ -1425,7 +1462,10 @@ def match_table(
          "gt":   {"image": [...], "class": [...], "row": [...],
                   "w": [...], "h": [...]},
          "pred": {"image": [...], "class": [...], "score": [...],
-                  "iou": [...], "gt": [...]},
+                  "iou": [...], "gt": [...],
+                  "geom": {"cut": 0.25, "index": [...],
+                           "x0": [...], "y0": [...],
+                           "x1": [...], "y1": [...]}},
          "pred_operating": {...} | null}
 
     ``pred.gt`` indexes the ``gt`` arrays (or -1 for a prediction with no
@@ -1441,6 +1481,16 @@ def match_table(
     recall, F1, prediction counts) are computed from that suppressed set
     instead — the same split ``evaluate_detection`` makes internally. When it
     is absent the two sets are identical and the one table serves both.
+
+    ``geom`` (version 3) carries prediction boxes as fractions of their frame,
+    on whichever block is the operating set, for rows scoring at or above
+    ``cut`` — ``index`` gives each one's position in that block's own arrays.
+    It exists so a reader can ask which *person* a prediction landed on, which
+    needs a box and cannot be answered from a match outcome. Sparse, and only
+    at the operating point, because the full set down to the score floor would
+    triple the file for rows no such question is ever asked of; a consumer
+    can therefore raise the confidence cut on a per-person view but not lower
+    it below ``cut``, the same shape of limit ``score_floor`` already sets.
     """
     thresholds = [float(value) for value in (iou_thresholds or DEFAULT_IOU_THRESHOLDS)]
     if not thresholds:
@@ -1518,7 +1568,13 @@ def match_table(
                 gt_width.append(-1.0)
                 gt_height.append(-1.0)
 
-    pred_block = _prediction_block(prepared_predictions, prepared_targets, gt_offsets)
+    # Geometry rides on whichever block *is* the operating set, because that is
+    # the one whose rows a per-person question is asked of. With no operating
+    # NMS the two sets are the same object and ``pred`` carries it.
+    pred_block = _prediction_block(
+        prepared_predictions, prepared_targets, gt_offsets,
+        geometry_cut=None if operating_nms_threshold is not None else operating_threshold,
+    )
 
     operating_block = None
     if operating_nms_threshold is not None:
@@ -1527,7 +1583,8 @@ def match_table(
             for prediction in prepared_predictions
         ]
         operating_block = _prediction_block(
-            operating_predictions, prepared_targets, gt_offsets
+            operating_predictions, prepared_targets, gt_offsets,
+            geometry_cut=operating_threshold,
         )
 
     if image_names is None:
