@@ -17,6 +17,7 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 
 from fleet.models import AnnotationTag, Dataset
+from fleet.services import lsapi
 
 _FIELD = re.compile(r"^tag-(\d+)-name$")
 
@@ -55,12 +56,23 @@ def posted_rows(post) -> list[dict]:
             max_rating = int(post.get(f"tag-{index}-max_rating") or 5)
         except ValueError:
             max_rating = 0  # out of range; the model's clean() reports it
+        widget = (post.get(f"tag-{index}-widget") or AnnotationTag.RADIO).strip()
+        # The editor only *hides* the Options box when the widget takes no
+        # options, and a hidden input still posts — so a row switched to stars
+        # would otherwise store the option list it used to have. Label Studio
+        # ignores it, but it comes back the moment someone switches the widget
+        # again, so drop it here rather than storing a dead list.
+        choices = (
+            split_choices(post.get(f"tag-{index}-choices") or "")
+            if widget in lsapi.CHOICE_WIDGETS
+            else []
+        )
         rows.append({
             "index": index,
             "scope": (post.get(f"tag-{index}-scope") or AnnotationTag.FRAME).strip(),
             "name": name,
-            "widget": (post.get(f"tag-{index}-widget") or AnnotationTag.RADIO).strip(),
-            "choices": split_choices(post.get(f"tag-{index}-choices") or ""),
+            "widget": widget,
+            "choices": choices,
             "max_rating": max_rating,
             "required": bool(post.get(f"tag-{index}-required")),
         })

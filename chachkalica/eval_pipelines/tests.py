@@ -1,9 +1,12 @@
 """Tests for chachak pipeline evals: request generation and metric ingest."""
 
+import codecs
 import json
+import re
 import tempfile
 from pathlib import Path
 from unittest import mock
+from urllib.parse import parse_qsl, urlparse
 
 import yaml
 from django.contrib.admin.sites import AdminSite
@@ -432,6 +435,27 @@ class TagAnalyticsViewTests(PipelineEvalSetup):
         self.assertIn("weather", [b["name"] for b in report["breakdowns"]])
         self.assertContains(response, "Tag analytics")
         self.assertContains(response, "weather")
+
+    def test_the_pages_data_url_is_usable_as_a_url(self):
+        # The page hands its whole JS a single DATA_URL built from the same
+        # ?kind=&eval= the view was addressed with. HTML-escaped, its "&" comes
+        # out "&amp;", the eval parameter arrives named "amp;eval", the data
+        # endpoint 404s, and every fetch on the page parses the 404 page as
+        # JSON. Assert on the query the browser would actually send.
+        er = self._eval_with_table(table=_MATCH_TABLE, tags=_TAG_DOCUMENT)
+
+        response = self._get(er)
+        response.render()
+
+        rendered = response.content.decode()
+        data_url = re.search(r'const DATA_URL = "(.*?)";', rendered).group(1)
+        # The literal the browser evaluates, not the source of it: escapejs
+        # writes "&" as the \u0026 escape, which is that same character.
+        url = codecs.decode(data_url, "unicode_escape")
+        self.assertEqual(
+            dict(parse_qsl(urlparse(url).query)),
+            {"kind": CombinedEval.BASE, "eval": str(er.pk)},
+        )
 
     def test_the_data_endpoint_scores_an_arbitrary_intersection(self):
         er = self._eval_with_table(table=_MATCH_TABLE, tags=_TAG_DOCUMENT)

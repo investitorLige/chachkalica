@@ -402,7 +402,11 @@ def build_eval_request(eval_run, output_dir: Path | str, ts: TrainingSettings | 
 
     ``classes`` is the *eval dataset's* class space (the target labels); the
     model's own train-class space is read from the checkpoint — or, for an
-    exported artifact, from its ``.meta.json`` — by the trainer.
+    exported artifact, from its ``.meta.json`` — by the trainer. ``class_map``,
+    when the operator set one, translates the former into the latter before
+    scoring, so a test set labelled in a finer taxonomy than the model predicts
+    is scorable at all — see :mod:`training.services.class_sync`. It is emitted
+    only when non-empty, so an ordinary eval's request YAML is unchanged.
     When ``eval_run`` combines 2+ models, ``extra_checkpoints`` carries the
     others' checkpoint paths and the trainer merges all models' predictions
     into one result (see ``eval_checkpoint.eval_combined_checkpoints``).
@@ -424,6 +428,9 @@ def build_eval_request(eval_run, output_dir: Path | str, ts: TrainingSettings | 
         ds, eval_run.label_source, eval_run.annotator, eval_run.explicit_labels_path)
     if labels is not None:
         data["labels"] = str(labels)
+
+    if eval_run.class_map:
+        data["class_map"] = dict(eval_run.class_map)
 
     extra_checkpoints = combined_checkpoints(eval_run)
     if extra_checkpoints:
@@ -577,6 +584,11 @@ def build_pipeline_request(pe, output_dir: Path | str, ts: TrainingSettings | No
     labels = resolve_label_dir(ds, pe.label_source, pe.annotator, pe.explicit_labels_path)
     if labels is not None:
         data["labels"] = str(labels)
+
+    # Same translation the base eval sends, read by chachak.config the way the
+    # trainer's eval_checkpoint reads it. Only emitted when set.
+    if pe.class_map:
+        data["class_map"] = dict(pe.class_map)
 
     if pe.pipeline == PipelineEvalRun.CHAIN and pe.chain:
         data["chain"] = list(pe.chain)

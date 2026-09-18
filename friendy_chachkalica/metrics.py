@@ -12,6 +12,95 @@ except ImportError:
 DEFAULT_IOU_THRESHOLDS = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
 
 
+def apply_class_map(
+    classes,
+    class_map: Optional[Dict[str, Optional[str]]],
+) -> tuple[Dict[int, str], Dict[int, str]]:
+    """Translate a dataset's class space through an operator's class map.
+
+    Returns ``(target_classes, eval_classes)`` as :func:`evaluate_detection`
+    wants them: ``target_classes`` names every *dataset* class id the way the
+    model names it, and ``eval_classes`` is the deduplicated space those names
+    live in.
+
+    ``class_map`` is ``{dataset_class_name: model_class_name}``. A name mapped
+    to ``None`` or ``""`` is dropped from the eval entirely — neither scored nor
+    counted as a miss — and a dataset class the map does not mention passes
+    through unchanged. An empty or absent map is therefore an exact identity:
+    the dataset's own space, scored the way it is scored without one.
+
+    Collapsing is the point. Mapping ``handgun``, ``rifle`` and ``knife`` all
+    onto a single-class model's ``gun`` merges three dataset classes into one
+    eval class, which is what makes a fine-grained test set scorable against a
+    coarse model at all; without it the two taxonomies share no name and the
+    run scores nothing (see :func:`_effective_eval_classes`).
+    """
+    if isinstance(classes, dict):
+        source = {int(key): str(value) for key, value in classes.items()}
+    else:
+        source = {index: str(name) for index, name in enumerate(classes)}
+
+    mapping = {str(key): value for key, value in (class_map or {}).items()}
+
+    target_classes: Dict[int, str] = {}
+    eval_classes: Dict[int, str] = {}
+    eval_ids: Dict[str, int] = {}
+    for class_id, name in sorted(source.items()):
+        mapped = mapping.get(name, name)
+        if mapped is None or str(mapped) == "":
+            continue
+        mapped = str(mapped)
+        if mapped not in eval_ids:
+            eval_ids[mapped] = len(eval_ids)
+            eval_classes[eval_ids[mapped]] = mapped
+        target_classes[class_id] = mapped
+    return target_classes, eval_classes
+
+
+def _effective_eval_classes(
+    eval_classes: Optional[Dict[int, str]],
+    prediction_classes: Optional[Dict[int, str]],
+    *,
+    strict: bool = False,
+) -> Optional[Dict[int, str]]:
+    """``eval_classes`` restricted to what the model can actually predict.
+
+    A class the model was never trained on scores a hard AP of 0 and drags the
+    mean down with it, so evaluation is confined to the intersection *by name*.
+
+    When ``strict`` and that intersection comes out empty, this raises rather
+    than returning an empty space. Two disjoint class spaces are a taxonomy
+    mismatch, not a result: the remap that follows drops every prediction and
+    every ground-truth box, and the run then reports 0.0 for mAP, precision and
+    recall over zero classes — indistinguishable from a model that genuinely
+    detects nothing, which is the reading it invites. ``strict`` is off for the
+    after-the-fact artifact writers, which must not sink an eval that already
+    has its metrics.
+    """
+    if eval_classes is None or prediction_classes is None:
+        return eval_classes
+
+    prediction_names = {str(name) for name in prediction_classes.values()}
+    effective = {
+        class_id: name
+        for class_id, name in eval_classes.items()
+        if str(name) in prediction_names
+    }
+    if strict and eval_classes and not effective:
+        raise ValueError(
+            "The model's class space and the eval dataset's have no class name in "
+            "common, so every prediction and every ground-truth box would be "
+            "dropped and the run would report 0.0 for every metric.\n"
+            f"  model predicts: {sorted(prediction_names)}\n"
+            f"  dataset labels: {sorted(str(name) for name in eval_classes.values())}\n"
+            "Map the dataset's classes onto the model's — or drop the ones it "
+            "cannot predict — with the eval's class map, or score against a "
+            "dataset labelled in the model's own taxonomy."
+        )
+    return effective
+
+
+
 def evaluate_detection(
     predictions: Sequence[torch.Tensor],
     targets: Sequence[Dict[str, Any]],
@@ -52,17 +141,12 @@ def evaluate_detection(
         for prediction, target in zip(predictions, prepared_targets)
     ]
 
-    # When both eval_classes and prediction_classes are given, restrict evaluation
-    # to the intersection by name so classes the model was never trained on don't
-    # count as AP=0 in the average.
-    effective_eval_classes = eval_classes
-    if eval_classes is not None and prediction_classes is not None:
-        prediction_names = {str(name) for name in prediction_classes.values()}
-        effective_eval_classes = {
-            class_id: name
-            for class_id, name in eval_classes.items()
-            if str(name) in prediction_names
-        }
+    # Restricted to the intersection by name, so classes the model was never
+    # trained on don't count as AP=0 in the average — and refused outright when
+    # that intersection is empty, which is a taxonomy mismatch rather than a
+    # score of zero.
+    effective_eval_classes = _effective_eval_classes(
+        eval_classes, prediction_classes, strict=True)
 
     class_ids = _resolve_class_ids(
         prepared_predictions,
@@ -319,15 +403,10 @@ def select_hard_images(
         for prediction, target in zip(predictions, prepared_targets)
     ]
 
-    # Mirror evaluate_detection's eval-class remap so class ids/names match the metrics.
-    effective_eval_classes = eval_classes
-    if eval_classes is not None and prediction_classes is not None:
-        prediction_names = {str(name) for name in prediction_classes.values()}
-        effective_eval_classes = {
-            class_id: name
-            for class_id, name in eval_classes.items()
-            if str(name) in prediction_names
-        }
+    # Mirror evaluate_detection's eval-class remap so class ids/names match the
+    # metrics. Not strict: this runs after the metrics are already computed, and
+    # an artifact writer must never sink an eval that succeeded.
+    effective_eval_classes = _effective_eval_classes(eval_classes, prediction_classes)
     if effective_eval_classes is not None:
         prepared_predictions, prepared_targets = _remap_to_eval_classes(
             prepared_predictions,

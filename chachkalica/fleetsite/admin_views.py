@@ -1,6 +1,6 @@
 """Standalone admin pages and endpoints that aren't tied to a single model.
 
-Two of them:
+Four of them:
 
 - the TRT/ONNX/PT benchmark console: a read-only dark "instrument console"
   rendering the results of ``inferlica/benchmark`` (run in the trainer
@@ -13,6 +13,9 @@ Two of them:
   It lives here rather than on a ModelAdmin because both inference surfaces (the
   video "Run model inference..." wizard and the camera live-inference inline) call
   the same one, and it belongs to neither.
+- :func:`class_sync_view`, the same idea for the "Check classes" button on the
+  dataset-eval form: it compares the selected model's class space against the
+  dataset's and proposes a translation between them.
 - :func:`dataset_tags_view`, which renders the "what can this eval be sliced by"
   panel for both evaluate forms. Same reason it is here: the model-side form
   starts from a checkpoint and the dataset-side one from a dataset, and neither
@@ -115,6 +118,60 @@ def bundle_sync_view(request):
     # than the fetch failing with an opaque 500.
     try:
         return JsonResponse(bundles.validate(bundle, load_test=load_test))
+    except Exception as exc:  # noqa: BLE001 - surfaced in the checklist
+        return JsonResponse({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+
+
+@require_POST
+def class_sync_view(request):
+    """Compare the selected model's class space against a dataset's.
+
+    The endpoint behind the "Check classes" button on the Datasets tab's
+    *Evaluate a model on this dataset…* form. POST the ``model_source``, the
+    matching model field (``trained_model`` / ``artifact_path`` /
+    ``bundle_path``) and the ``dataset`` pk; the response is
+    :func:`training.services.class_sync.report` verbatim — ``{ok, name, checks,
+    model_classes, dataset_classes, suggested, ...}`` — which the page renders as
+    a checklist plus a prefilled mapping table.
+
+    The dataset arrives as a **pk**, not a name: the name is a path segment under
+    the dataset source root, and a name posted by the client would be one.
+
+    POST-only and staff-only for the same reasons as :func:`bundle_sync_view`,
+    though this one only reads sidecars and a classes.txt — no weights are
+    loaded and no GPU is taken.
+    """
+    from fleet.models import Dataset
+    from training.services import class_sync, config_gen, inference_form
+
+    model_source = (request.POST.get("model_source") or "").strip()
+    if model_source not in dict(inference_form.MODEL_SOURCE_CHOICES):
+        return JsonResponse({"error": "Unknown model source."}, status=400)
+
+    # filter(pk=...) *raises* on a non-numeric pk rather than coming back empty,
+    # so a hand-rolled POST would 500 instead of being told no.
+    try:
+        dataset = Dataset.objects.filter(pk=int(request.POST.get("dataset"))).first()
+    except (TypeError, ValueError):
+        dataset = None
+    if dataset is None:
+        return JsonResponse({"error": "No such dataset."}, status=400)
+
+    try:
+        dataset_classes = config_gen.dataset_classes(dataset)
+    except OSError as exc:
+        return JsonResponse(
+            {"error": f"{dataset.name}: cannot read its classes.txt ({exc})."}, status=400)
+    if not dataset_classes:
+        return JsonResponse(
+            {"error": f"{dataset.name} has no classes.txt, so there is nothing to "
+                      "score against or to map."}, status=400)
+
+    # Mirrors bundle_sync_view: report() is written not to raise for a model it
+    # cannot read, so anything escaping it is a bug and the button should say so
+    # rather than the fetch failing opaquely.
+    try:
+        return JsonResponse(class_sync.report(model_source, request.POST, dataset_classes))
     except Exception as exc:  # noqa: BLE001 - surfaced in the checklist
         return JsonResponse({"error": f"{type(exc).__name__}: {exc}"}, status=500)
 

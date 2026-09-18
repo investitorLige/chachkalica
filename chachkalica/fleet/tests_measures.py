@@ -297,3 +297,83 @@ class BoxMeasureRequestTests(MeasuresSetup):
             config_gen.write_measures_request(self._run())
 
         self.assertIn("rtmo-posture-bundle", str(caught.exception))
+
+
+class BoxMeasurePollingTests(BoxMeasureRequestTests):
+    """What the job makes of each status the trainer can actually report.
+
+    The trainer's vocabulary is running / ok / error, plus unknown when it has
+    no record of the job (friendy_chachkalica/service.py::_job_status, and
+    runner.fetch_measures_status's 404 branch). Polling for any other name
+    silently waits out MAX_WAIT instead, so each one is pinned here.
+    """
+
+    def _prepared(self):
+        from training.services import config_gen
+        run = DatasetMeasureRun.objects.create(
+            dataset=self.dataset, kind=DatasetMeasureRun.BOX,
+            label_source="source")
+        config_gen.write_measures_request(run)
+        return run
+
+    def _drive(self, statuses, run=None):
+        """Run the job against a scripted sequence of trainer replies."""
+        from unittest import mock
+        from training import jobs
+
+        run = run or self._prepared()
+        with mock.patch.object(jobs.runner, "launch_measures"), \
+             mock.patch.object(jobs.runner, "fetch_measures_status",
+                               side_effect=statuses), \
+             mock.patch.object(jobs.time, "sleep"):
+            result = jobs.build_box_measures(run.pk)
+        run.refresh_from_db()
+        return run, result
+
+    def test_ok_finishes_the_run(self):
+        run, result = self._drive([
+            {"status": "running", "progress": {"images": 4, "images_done": 2, "boxes": 5}},
+            {"status": "ok", "progress": {"images": 4, "images_done": 4, "boxes": 9,
+                                          "without_person": 1}},
+        ])
+
+        self.assertEqual(run.status, DatasetMeasureRun.OK)
+        self.assertEqual(run.images_processed, 4)
+        self.assertEqual(run.boxes_measured, 9)
+        self.assertEqual(run.boxes_without_person, 1)
+        self.assertEqual(result["boxes"], 9)
+
+    def test_error_fails_the_run_instead_of_reporting_success(self):
+        # The bug this pins: "error" was not the name the loop watched for, so
+        # a failed pass ran out the poll window and was then marked OK.
+        with self.assertRaises(RuntimeError) as caught:
+            self._drive([{"status": "error", "log_tail": "CUDA out of memory"}])
+
+        self.assertIn("CUDA out of memory", str(caught.exception))
+        run = DatasetMeasureRun.objects.order_by("-pk").first()
+        self.assertEqual(run.status, DatasetMeasureRun.ERROR)
+        self.assertIn("CUDA out of memory", run.error)
+
+    def test_a_lost_job_passes_when_the_sidecar_is_there(self):
+        # The trainer keeps jobs in memory, so a restart loses them. The
+        # measurements are the product; if they were written, the pass is done.
+        run = self._prepared()
+        Path(run.labels_dir_snapshot).mkdir(parents=True, exist_ok=True)
+        (Path(run.labels_dir_snapshot) / tag_analytics.BOX_MEASURES_FILENAME).write_text(
+            json.dumps({"version": 1, "measures": []}), encoding="utf-8")
+
+        run, _result = self._drive([{"status": "unknown"}], run=run)
+
+        self.assertEqual(run.status, DatasetMeasureRun.OK)
+
+    def test_a_lost_job_fails_when_nothing_was_written(self):
+        run, = (self._prepared(),)
+        sidecar = Path(run.labels_dir_snapshot) / tag_analytics.BOX_MEASURES_FILENAME
+        self.assertFalse(sidecar.exists())
+
+        with self.assertRaises(RuntimeError) as caught:
+            self._drive([{"status": "unknown"}], run=run)
+
+        self.assertIn("lost", str(caught.exception))
+        run.refresh_from_db()
+        self.assertEqual(run.status, DatasetMeasureRun.ERROR)

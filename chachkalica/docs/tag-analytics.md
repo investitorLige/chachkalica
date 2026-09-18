@@ -210,9 +210,15 @@ recall-side view they always did — an eval does not lose a tag by being old.
   page on purpose: a precision read out of this section and a recall read out
   of a box table do not share a denominator.
 - **All tags** — every value of every tag on one grid, shaded worst → best down
-  each column *within each tag*. One table per population, because the three do
-  not share a metric set; scaling the shading across tags would just make the
-  darkest cell whichever tag happens to hold the dataset's hardest slice.
+  each column *within each tag*. Scaling the shading across tags would just make
+  the darkest cell whichever tag happens to hold the dataset's hardest slice.
+  Each tag is banded under its own population and scored on that population's
+  metrics, dashing the columns it cannot answer — a box band has no precision, a
+  person band no mAP. A **confidence slider** re-scores the whole grid at any
+  operating point down to the match table's score floor; nothing is re-run for
+  it, because every prediction above that floor is already on disk. The mAP
+  columns are marked as the ones the slider cannot move: average precision
+  integrates the whole curve, so a confidence cut does not change it.
 - **Cross-tab** — pick two tags and a metric, get the grid. Cells are
   intersections, shaded from the grid's own worst cell to its best; an empty
   combination stays blank rather than disappearing, because "there are no rainy

@@ -1606,16 +1606,24 @@ class AnnotationTagConfigTests(TestCase):
         self.assertIn("&amp;", xml)
         self.assertNotIn('value="a & "b""', xml)
 
-    def test_frame_tags_get_headers_and_region_tags_get_none(self):
+    def test_every_tag_is_captioned_with_its_name(self):
         xml = lsapi.tags_xml([
             {"scope": lsapi.TAG_FRAME, "name": "weather", "widget": "dropdown", "choices": ["sun"]},
             {"scope": lsapi.TAG_REGION, "name": "occlusion", "widget": "radio", "choices": ["none"]},
         ])
-        # The frame tag is captioned; a header next to a perRegion control would
-        # be stranded on the canvas, so the region tag gets no caption at all.
         self.assertIn('<Header value="Frame tags" size="4"/>', xml)
-        self.assertIn('<Header value="weather" size="6"/>', xml)
-        self.assertNotIn('value="occlusion" size="6"', xml)
+        self.assertIn('<Header value="Box tags" size="4"/>', xml)
+        self.assertIn('<Header value="weather" size="5"/>', xml)
+        self.assertIn('<Header value="occlusion" size="5"/>', xml)
+
+    def test_box_tag_captions_are_hidden_until_a_region_is_selected(self):
+        # A perRegion control hides itself with no region selected but a Header
+        # has no such logic, so the whole box block rides on the View's
+        # visibility instead of leaving captions stranded on the canvas.
+        xml = lsapi.tags_xml([
+            {"scope": lsapi.TAG_REGION, "name": "occlusion", "widget": "radio", "choices": ["none"]},
+        ])
+        self.assertIn('visibleWhen="region-selected"', xml)
 
     def test_region_controls_sit_outside_the_frame_view(self):
         xml = lsapi.tags_xml([
@@ -1623,6 +1631,7 @@ class AnnotationTagConfigTests(TestCase):
             {"scope": lsapi.TAG_REGION, "name": "occlusion", "widget": "radio", "choices": ["none"]},
         ])
         self.assertLess(xml.index("</View>"), xml.index('name="occlusion"'))
+        self.assertNotIn('visibleWhen', xml.split("</View>")[0])
 
     def test_tags_join_the_drawing_controls_in_one_valid_document(self):
         from xml.etree import ElementTree
@@ -1715,6 +1724,16 @@ class AnnotationTagFormTests(TestCase):
         self.assertEqual([r["name"] for r in rows], ["a", "b", "c"])
         self.assertEqual([r["required"] for r in rows], [False, False, True])
         self.assertEqual(rows[0]["choices"], ["x", "y"])
+
+    def test_a_widget_that_takes_no_options_stores_none(self):
+        # The editor's Options box is hidden, not removed, for stars and free
+        # text — and a hidden input still posts whatever it held before.
+        rows = annotation_tags_svc.posted_rows(self._post(
+            (0, {"scope": "region", "name": "severity", "widget": "rating",
+                 "choices": "low,high", "max_rating": "5"}),
+            (1, {"scope": "frame", "name": "notes", "widget": "text", "choices": "stale"}),
+        ))
+        self.assertEqual([r["choices"] for r in rows], [[], []])
 
     def test_order_counts_within_a_section_so_a_deleted_row_leaves_no_gap(self):
         rows = annotation_tags_svc.posted_rows(self._post(

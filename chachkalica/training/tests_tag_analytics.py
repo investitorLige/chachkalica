@@ -1187,3 +1187,230 @@ class PersonJoinIntegrityTests(TagAnalyticsSetup):
         orphans = tag_analytics.person_orphans(table, persons)
         self.assertEqual(orphans["gt_unmeasured"], 2)
         self.assertEqual(orphans["gt_on_nobody"], 1)
+
+
+class ScoreCutTests(TagAnalyticsSetup):
+    """Scoring at a confidence other than the one the eval ran at.
+
+    The match table keeps every prediction down to its score floor, so a
+    different operating point is a filter over rows already on disk rather than
+    a re-run. These pin the parts of that which are easy to get wrong.
+    """
+
+    def test_absent_cut_is_the_evals_own_operating_point(self):
+        table, _index = self.load()
+
+        self.assertEqual(tag_analytics.resolve_score_cut(table, None),
+                         table.score_threshold)
+
+    def test_a_cut_below_the_floor_clamps_to_it(self):
+        # Below the floor there are no stored predictions to read, so honouring
+        # the request would report a slice as emptier than it really is.
+        table, _index = self.load()
+
+        self.assertEqual(tag_analytics.resolve_score_cut(table, 0.0), table.score_floor)
+        self.assertEqual(tag_analytics.resolve_score_cut(table, -5.0), table.score_floor)
+
+    def test_a_cut_above_one_clamps_to_one(self):
+        table, _index = self.load()
+
+        self.assertEqual(tag_analytics.resolve_score_cut(table, 4.2), 1.0)
+
+    def test_raising_the_cut_drops_predictions_and_recall(self):
+        table, _index = self.load()
+        mask = np.ones(table.num_images, dtype=bool)
+
+        low = tag_analytics.image_slice_metrics(table, mask, 0.001)
+        high = tag_analytics.image_slice_metrics(table, mask, 0.75)
+
+        self.assertGreater(low["predictions"], high["predictions"])
+        self.assertGreater(low["recall"], high["recall"])
+
+    def test_average_precision_does_not_move_with_the_cut(self):
+        # AP integrates the whole precision-recall curve down to the score
+        # floor, so the operating confidence cannot change it. The page marks
+        # those columns "fixed" on the strength of this.
+        table, _index = self.load()
+        mask = np.ones(table.num_images, dtype=bool)
+
+        low = tag_analytics.image_slice_metrics(table, mask, 0.001)
+        high = tag_analytics.image_slice_metrics(table, mask, 0.75)
+
+        self.assertAlmostEqual(low["map50"], high["map50"], places=9)
+
+    def test_a_box_slice_finds_fewer_boxes_as_the_cut_rises(self):
+        table, _index = self.load()
+        mask = np.ones(table.num_gt, dtype=bool)
+
+        low = tag_analytics.gt_slice_metrics(table, mask, 0.001)
+        high = tag_analytics.gt_slice_metrics(table, mask, 0.75)
+
+        self.assertGreaterEqual(low["found"], high["found"])
+        self.assertGreaterEqual(low["recall"], high["recall"])
+
+
+class ScorecardPersonTests(TagAnalyticsSetup):
+    """The scorecard over the third population.
+
+    The one-table view and the per-person population were written against each
+    other and met in a merge: the table knew two populations, and a person tag
+    landing in it would otherwise have been scored as a bag of boxes and
+    labelled as one. These pin that it reads the tag's own population instead.
+    """
+
+    def load_persons(self, measures=None):
+        path = self.root / "eval_matches.json"
+        path.write_text(json.dumps(_person_table()), encoding="utf-8")
+        loaded = tag_analytics.load_table(path)
+        measures = _person_measures() if measures is None else measures
+        persons = tag_analytics.build_persons(loaded, measures)
+        index = tag_analytics.build_tag_index(
+            loaded, {}, box_measures=measures, persons=persons)
+        return loaded, index
+
+    def _person_groups(self, card):
+        return [group for group in card["groups"] if group["kind"] == "person"]
+
+    def test_a_person_tag_is_counted_in_people_not_boxes(self):
+        table, index = self.load_persons()
+
+        card = tag_analytics.scorecard(table, index)
+        groups = self._person_groups(card)
+
+        self.assertTrue(groups, "the fixture's person tags reached no group")
+        for group in groups:
+            self.assertEqual(group["population_label"], "persons")
+            # Scored on what people support, not on a box tag's recall.
+            self.assertEqual(group["headline_metric"], "f1")
+
+    def test_a_person_row_dashes_the_metrics_people_cannot_answer(self):
+        table, index = self.load_persons()
+
+        card = tag_analytics.scorecard(table, index)
+
+        for group in self._person_groups(card):
+            for row in group["rows"]:
+                if row["empty"]:
+                    continue
+                # No average precision over a population of binary decisions...
+                self.assertIsNone(row["metrics"]["map50"])
+                self.assertIsNone(row["metrics"]["map50_95"])
+                # ...but precision is real here, which is the whole point of
+                # scoring people: a false positive has somebody to belong to.
+                self.assertIsNotNone(row["metrics"]["precision"])
+
+    def test_the_slider_moves_a_person_row(self):
+        # The per-person decision reads the prediction side at the cut, so
+        # raising it past the fixture's false alarm has to change the numbers.
+        # A memo keyed on the class alone would answer both cuts identically.
+        table, index = self.load_persons()
+
+        low = tag_analytics.scorecard(table, index, table.score_floor)
+        high = tag_analytics.scorecard(table, index, 0.99)
+
+        def overalls(card):
+            return [group["overall"] for group in self._person_groups(card)]
+
+        self.assertTrue(overalls(low))
+        self.assertNotEqual(overalls(low), overalls(high))
+
+
+class ScorecardTests(TagAnalyticsSetup):
+    """Every tag value in one table, for "which slice is worst anywhere"."""
+
+    def test_it_reports_every_usable_tag(self):
+        table, index = self.load()
+
+        card = tag_analytics.scorecard(table, index)
+
+        usable = {tag.name for tag in index.tags if tag.usable}
+        self.assertEqual({group["name"] for group in card["groups"]}, usable)
+
+    def test_it_says_which_columns_the_slider_moves(self):
+        table, index = self.load()
+
+        card = tag_analytics.scorecard(table, index)
+
+        swept = {column["key"]: column["swept"] for column in card["columns"]}
+        self.assertFalse(swept["map50"])
+        self.assertFalse(swept["map50_95"])
+        self.assertTrue(swept["precision"])
+        self.assertTrue(swept["recall"])
+
+    def test_it_reports_the_cut_it_actually_used(self):
+        table, index = self.load()
+
+        card = tag_analytics.scorecard(table, index, 0.0)
+
+        self.assertEqual(card["score_cut"], table.score_floor)
+        self.assertFalse(card["at_eval_threshold"])
+        self.assertTrue(tag_analytics.scorecard(table, index)["at_eval_threshold"])
+
+    def test_shading_is_bounded_per_column_within_one_tag(self):
+        # A column is shaded against itself: precision and recall move in
+        # opposite directions as the cut rises, so one scale for the tag would
+        # flatten whichever of them happened to span less.
+        table, index = self.load()
+
+        card = tag_analytics.scorecard(table, index)
+
+        for group in card["groups"]:
+            for key, bounds in group["bounds"].items():
+                if bounds is None:
+                    continue
+                shades = [row["intensity"][key] for row in group["rows"]
+                          if row["intensity"][key] is not None]
+                if len(set(shades)) > 1:
+                    self.assertAlmostEqual(min(shades), 0.0, places=6)
+                    self.assertAlmostEqual(max(shades), 1.0, places=6)
+
+    def test_a_flat_column_is_left_unshaded_rather_than_painted(self):
+        table, index = self.load()
+
+        card = tag_analytics.scorecard(table, index)
+
+        for group in card["groups"]:
+            for key, bounds in group["bounds"].items():
+                if bounds is None or bounds["low"] != bounds["high"]:
+                    continue
+                self.assertTrue(all(row["intensity"][key] is None
+                                    for row in group["rows"]))
+
+    def test_a_frame_slice_with_no_ground_truth_reports_no_metrics(self):
+        # mAP and recall over an empty ground-truth set come out 0.0, which
+        # reads as a catastrophic score rather than an undefined one. The row
+        # stays -- it is where false positives live -- but the numbers go.
+        # Ground truth only on img0/img1, so img3 keeps its prediction and has
+        # nothing to score it against. Its claim is -1: nothing matched it.
+        table = _table()
+        table["gt"] = {"image": [0, 0, 1], "class": [0, 0, 0], "row": [0, 1, 0]}
+        table["pred"] = {
+            "image": [0, 0, 1, 3], "class": [0, 0, 0, 0],
+            "score": [0.9, 0.8, 0.7, 0.3], "iou": [0.9, 0.8, 0.1, 0.0],
+            "gt": [0, 1, 2, -1],
+        }
+        loaded, index = self.load(table)
+
+        card = tag_analytics.scorecard(loaded, index)
+        crowding = next(g for g in card["groups"] if g["name"] == "auto:crowding")
+        bare = [row for row in crowding["rows"] if row["no_ground_truth"]]
+
+        self.assertTrue(bare)
+        for row in bare:
+            self.assertIsNone(row["headline"])
+            self.assertTrue(all(value is None for value in row["metrics"].values()))
+
+    def test_a_box_tag_carries_only_the_metrics_a_box_slice_can_answer(self):
+        table, index = self.load(_table_v2())
+
+        card = tag_analytics.scorecard(table, index)
+        box_groups = [g for g in card["groups"] if g["kind"] == "box"]
+
+        self.assertTrue(box_groups)
+        for group in box_groups:
+            for row in group["rows"]:
+                if row["empty"]:
+                    continue
+                self.assertIsNone(row["metrics"]["precision"])
+                self.assertIsNone(row["metrics"]["map50"])
+                self.assertIsNotNone(row["metrics"]["recall"])

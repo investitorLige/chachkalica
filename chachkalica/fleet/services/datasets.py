@@ -31,12 +31,16 @@ def labels_source_dir(dataset: Dataset, fs: FleetSettings | None = None) -> Path
 def detect_labels(dataset: Dataset, *, persist: bool = True) -> bool:
     """Return whether the dataset has a non-empty source labels/ folder.
 
+    Scans recursively (``rglob``) rather than just the top level, since some
+    datasets keep their ``.txt`` labels under split/class subfolders — a flat
+    ``iterdir()`` scan would miss those and wrongly report no labels.
+
     When ``persist`` is set and the result differs from the stored flag, update
     ``Dataset.has_labels`` so the admin and project-creation path can rely on it.
     """
     labels_dir = labels_source_dir(dataset)
     has = labels_dir.is_dir() and any(
-        path.suffix.lower() == ".txt" for path in labels_dir.iterdir()
+        path.suffix.lower() == ".txt" for path in labels_dir.rglob("*")
     )
     if persist and dataset.has_labels != has:
         dataset.has_labels = has

@@ -20,7 +20,13 @@ subprocess, mirroring ``run.py``:
 
 Request YAML fields: checkpoint_path, images, labels, classes (list/mapping),
 output_dir, and optional name, score_threshold, map_score_threshold, nms_threshold,
-iou_thresholds, batch_size, num_workers, device.
+iou_thresholds, batch_size, num_workers, device, class_map.
+
+``class_map`` translates the dataset's class names into the model's before
+scoring — ``{handgun: gun, rifle: gun, bat: null}`` collapses two of a test
+set's classes onto a single-class model's one and drops the third. Absent or
+empty it is an identity, which is the ordinary case. See
+``metrics.apply_class_map``.
 """
 
 import argparse
@@ -42,6 +48,7 @@ try:
     from ..device import resolve_device
     from ..metrics import (
         EVAL_HARD_IMAGES_FRACTION,
+        apply_class_map,
         evaluate_detection,
         remap_raw_predictions_to_eval_classes,
     )
@@ -74,6 +81,7 @@ except ImportError:
     from device import resolve_device
     from metrics import (
         EVAL_HARD_IMAGES_FRACTION,
+        apply_class_map,
         evaluate_detection,
         remap_raw_predictions_to_eval_classes,
     )
@@ -216,9 +224,16 @@ def eval_checkpoint(
     batch_size: int = 4,
     num_workers: int = 4,
     device: str = "auto",
+    class_map: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
     checkpoint_path = Path(checkpoint_path)
-    eval_classes = _as_class_map(classes)
+    # Three class spaces, not one. `dataset_classes` is what the label files are
+    # indexed in and is what the loader validates their ids against;
+    # `target_classes` names each of those ids the way the *model* names it; and
+    # `eval_classes` is the deduplicated space the scoring happens in. Without a
+    # class_map all three coincide, which is the case this module always had.
+    dataset_classes = _as_class_map(classes)
+    target_classes, eval_classes = apply_class_map(dataset_classes, class_map)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -232,8 +247,11 @@ def eval_checkpoint(
     batch_size = _clamp_batch_size(adapter, batch_size)
 
     dataset_config = DatasetConfig(
+        # The dataset's own space, not the eval space: the loader checks the raw
+        # ids in the label files against this list, and a class_map must not make
+        # a correctly-labelled file look out of range.
         name=f"{name}-data", images=Path(images), labels=Path(labels) if labels else None,
-        classes=eval_classes, role="test",
+        classes=dataset_classes, role="test",
     )
     evaluation = EvaluationConfig(
         batch_size=batch_size, num_workers=num_workers,
@@ -257,7 +275,7 @@ def eval_checkpoint(
         adapter, loader, dev, prediction_path, config,
         num_classes=num_classes,
         prediction_classes=train_classes,
-        target_classes=eval_classes,
+        target_classes=target_classes,
         eval_classes=eval_classes,
         operating_nms_threshold=resolve_operating_nms_threshold(config, config.models[0]),
         compute_metrics=labels is not None,
@@ -273,6 +291,11 @@ def eval_checkpoint(
         "labels": str(labels) if labels is not None else None,
         "metrics": metrics,
     }
+    # Recorded only when it did something, so an ordinary eval's result file is
+    # byte-for-byte what it always was — and a collapsed one says so on its face
+    # rather than leaving "why is this scored against one class?" to be inferred.
+    if class_map:
+        result["class_map"] = dict(class_map)
     result_path = output_dir / "eval_result.yaml"
     _write_yaml(result_path, _to_builtin(result))
     print(f"[eval] Wrote eval result: {result_path}")
@@ -322,6 +345,7 @@ def eval_combined_checkpoints(
     batch_size: int = 4,
     num_workers: int = 4,
     device: str = "auto",
+    class_map: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
     """Evaluate 2+ checkpoints combined: merge their predictions into one result.
 
@@ -340,7 +364,9 @@ def eval_combined_checkpoints(
     if len(checkpoint_paths) < 2:
         raise ValueError("eval_combined_checkpoints needs at least 2 checkpoints.")
 
-    eval_classes = _as_class_map(classes)
+    # Same three spaces as :func:`eval_checkpoint` — see the comment there.
+    dataset_classes = _as_class_map(classes)
+    target_classes, eval_classes = apply_class_map(dataset_classes, class_map)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     dev = resolve_device(device)
@@ -353,8 +379,9 @@ def eval_combined_checkpoints(
         train_classes_list.append(train_classes)
 
     dataset_config = DatasetConfig(
+        # The dataset's own space: the loader validates raw label ids against it.
         name=f"{name}-data", images=Path(images), labels=Path(labels) if labels else None,
-        classes=eval_classes, role="test",
+        classes=dataset_classes, role="test",
     )
     evaluation = EvaluationConfig(
         batch_size=batch_size, num_workers=num_workers,
@@ -426,7 +453,7 @@ def eval_combined_checkpoints(
         # Merged predictions are already remapped into eval_classes, so this
         # remap step inside evaluate_detection is an identity mapping.
         prediction_classes=eval_classes,
-        target_classes=eval_classes,
+        target_classes=target_classes,
         eval_classes=eval_classes,
         operating_nms_threshold=operating_nms_threshold,
     ) if labels is not None else {"prediction_only": True})
@@ -439,7 +466,7 @@ def eval_combined_checkpoints(
             records,
             config=config,
             prediction_classes=eval_classes,
-            target_classes=eval_classes,
+            target_classes=target_classes,
             eval_classes=eval_classes,
             operating_nms_threshold=operating_nms_threshold,
             top_k_fraction=EVAL_HARD_IMAGES_FRACTION,
@@ -452,7 +479,7 @@ def eval_combined_checkpoints(
             config=config,
             num_classes=len(eval_classes),
             prediction_classes=eval_classes,
-            target_classes=eval_classes,
+            target_classes=target_classes,
             eval_classes=eval_classes,
             operating_nms_threshold=operating_nms_threshold,
         )
@@ -466,6 +493,8 @@ def eval_combined_checkpoints(
         "labels": str(labels) if labels is not None else None,
         "metrics": metrics,
     }
+    if class_map:
+        result["class_map"] = dict(class_map)
     result_path = output_dir / "eval_result.yaml"
     _write_yaml(result_path, _to_builtin(result))
     print(f"[eval] Wrote eval result: {result_path}")
@@ -491,6 +520,7 @@ def eval_from_request(request_path: Union[str, Path]) -> Dict[str, Any]:
             batch_size=request.get("batch_size", 4),
             num_workers=request.get("num_workers", 4),
             device=request.get("device", "auto"),
+            class_map=request.get("class_map"),
         )
     return eval_checkpoint(
         checkpoint_path=request["checkpoint_path"],
@@ -507,6 +537,7 @@ def eval_from_request(request_path: Union[str, Path]) -> Dict[str, Any]:
         batch_size=request.get("batch_size", 4),
         num_workers=request.get("num_workers", 4),
         device=request.get("device", "auto"),
+        class_map=request.get("class_map"),
     )
 
 

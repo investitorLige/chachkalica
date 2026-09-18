@@ -243,12 +243,30 @@ def build_box_measures(run_id: int) -> dict:
                     "without_person", run.boxes_without_person)
                 run.save(update_fields=["images_total", "images_processed",
                                         "boxes_measured", "boxes_without_person"])
+            # The trainer's vocabulary is running / ok / error, plus unknown
+            # when it has no record of the job at all (see service.py's
+            # _job_status and runner.fetch_measures_status). Polling for
+            # "finished"/"failed" -- names it never emits -- meant a finished
+            # pass span out the full MAX_WAIT and a *failed* one did too, then
+            # fell through to the OK below: a failure reported as a success,
+            # 48 hours late. Mirrors run_eval above, which had it right.
             state = status.get("status")
-            if state in ("finished", "unknown"):
+            if state == "ok":
                 break
-            if state == "failed":
+            if state == "error":
                 raise RuntimeError(
                     status.get("log_tail") or "the measuring pass failed; see the trainer log")
+            if state == "unknown":
+                # The trainer forgot the job (it keeps jobs in memory, so a
+                # restart loses them). The sidecar is the product, so trust it
+                # if it is there and fail loudly if it is not, rather than
+                # treating a lost job as a completed one.
+                from training.services import tag_analytics
+                if tag_analytics.load_box_measures(run.labels_dir_snapshot):
+                    break
+                raise RuntimeError(
+                    "the trainer lost this measuring pass and no measurements "
+                    "were written; re-run it")
     except Exception as exc:
         run.status = DatasetMeasureRun.ERROR
         run.error = str(exc)

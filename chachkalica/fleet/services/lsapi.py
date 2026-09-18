@@ -219,19 +219,39 @@ def tag_control_xml(spec: dict, *, indent: str = "  ") -> str:
     return f"{head}>\n{body}\n{indent}</{tag}>"
 
 
+#: The wrapper each tag section gets: a rule above it so the tag block reads as
+#: its own panel rather than more of the image.
+_SECTION_STYLE = "border-top: 1px solid #ccc; margin-top: 12px; padding-top: 8px;"
+
+
+def _tag_section(title: str, specs: list, *, attrs: str = "") -> str:
+    """One bordered ``<View>`` holding a section heading and the tags under it."""
+    rows: list[str] = []
+    for spec in specs:
+        rows.append(f'    <Header value="{escape(str(spec["name"]))}" size="5"/>')
+        rows.append(tag_control_xml(spec, indent="    "))
+    body = "\n".join(rows)
+    return (
+        f'  <View style="{_SECTION_STYLE}"{attrs}>\n'
+        f'    <Header value="{escape(title)}" size="4"/>\n'
+        f"{body}\n"
+        "  </View>"
+    )
+
+
 def tags_xml(specs) -> str:
     """Render every tag spec into the two blocks that go inside the root View.
 
-    Frame-wide tags are wrapped in a bordered ``<View>`` with a section heading
-    and one ``<Header>`` per tag, because they render on the canvas underneath
-    the image and need to be told apart there.
+    Both blocks are a bordered ``<View>`` with a section heading and one
+    ``<Header>`` per tag: a bare control renders as nothing but its own answers,
+    so a column of star rows or radio lists is unreadable without captions.
 
-    Box-wide tags get no headers at all. ``perRegion`` controls are pulled out
-    of the canvas into the selected region's details panel, but ``<Header>`` is
-    not perRegion-aware — a header emitted next to one would stay behind on the
-    canvas as a floating caption for a control that isn't there. In the region
-    panel each control is labelled with its own ``name``, which is why a tag's
-    name is what the annotator reads.
+    The box-wide block additionally carries ``visibleWhen="region-selected"``.
+    A ``perRegion`` control is not moved into the region details panel — it
+    renders in place under the image and hides itself until a region is
+    selected — and ``<Header>`` has no such logic of its own, so an unwrapped
+    header would sit on the canvas captioning a control that isn't showing.
+    Wrapping the block makes the captions come and go with the controls.
     """
     specs = list(specs)
     frame = [s for s in specs if s.get("scope") != TAG_REGION]
@@ -239,18 +259,11 @@ def tags_xml(specs) -> str:
 
     blocks: list[str] = []
     if frame:
-        rows = []
-        for spec in frame:
-            rows.append(f'    <Header value="{escape(str(spec["name"]))}" size="6"/>')
-            rows.append(tag_control_xml(spec, indent="    "))
-        inner = "\n".join(rows)
+        blocks.append(_tag_section("Frame tags", frame))
+    if region:
         blocks.append(
-            '  <View style="border-top: 1px solid #ccc; margin-top: 12px; padding-top: 8px;">\n'
-            '    <Header value="Frame tags" size="4"/>\n'
-            f"{inner}\n"
-            "  </View>"
+            _tag_section("Box tags", region, attrs=' visibleWhen="region-selected"')
         )
-    blocks.extend(tag_control_xml(spec) for spec in region)
     return "\n".join(blocks)
 
 

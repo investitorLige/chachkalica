@@ -11,6 +11,7 @@ from django.urls import include, path
 from fleetsite.admin_views import (
     benchmark_console_view,
     bundle_sync_view,
+    class_sync_view,
     dataset_tags_view,
 )
 
@@ -32,6 +33,12 @@ urlpatterns = [
         "admin/bundles/sync/",
         admin.site.admin_view(bundle_sync_view),
         name="bundle-sync",
+    ),
+    # Same shape, for the "Check classes" button on the dataset-eval form.
+    path(
+        "admin/classes/sync/",
+        admin.site.admin_view(class_sync_view),
+        name="class-sync",
     ),
     # The tag-availability panel both evaluate forms show; same rules as above.
     path(

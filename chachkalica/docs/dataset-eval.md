@@ -50,6 +50,66 @@ The scoring's own knobs:
   so the precision-recall curve is swept rather than truncated.
 - **Label source** — the dataset's own `labels/`, one annotator's output, or an
   explicit path.
+- **Classes** — *Check classes*, and the class map it produces. See below.
+
+## Classes: when the model and the dataset disagree
+
+An eval matches predictions to ground truth **by class name**. Both spaces are
+remapped onto their intersection and everything outside it is dropped — the
+right default, since a class the model was never trained on would otherwise
+score a hard AP of 0 and drag the mean down.
+
+But two taxonomies that share *no* name produce an eval of nothing: every
+prediction and every ground-truth box dropped, `0.0` reported for mAP, precision
+and recall, and `num_eval_classes: 0` as the only hint. A single-class `gun`
+detector scored against a `handgun / rifle / knife / bat` test set is exactly
+that, and the zeros are indistinguishable from a model that detects nothing.
+
+Two things address it:
+
+**Before the run — the *Check classes* button.** It reads the selected model's
+class space (a catalogued model's own row, an artifact's `.meta.json`, a
+bundle's model sidecar — no weights are loaded) and reports how the two line up:
+which names are scored as-is, which are silently dropped, and which the model
+predicts but the dataset never labels. When they don't line up it builds one row
+per dataset class where each is mapped onto a class the model *does* predict —
+or dropped:
+
+| Dataset class | | Model class |
+|---|---|---|
+| `handgun` | → | `gun` |
+| `rifle` | → | `gun` |
+| `knife` | → | `gun` |
+| `bat` | → | *— drop from this eval —* |
+
+Several dataset classes may collapse onto the same model class; that is the
+point. The proposal is only a prefill — every row is editable before anything
+runs.
+
+**Leaving it alone is a supported answer.** Don't press the button and no map is
+posted, no `class_map` is stored, the request YAML doesn't mention one, and the
+eval runs exactly as it did before this existed.
+
+**During the run — a disjoint pair is refused.** `evaluate_detection` now raises
+naming both class lists rather than reporting zeros, so the mismatch cannot
+reach you as a metrics table again.
+
+A dropped class is dropped from the *ground truth*, not from the model: its
+boxes are neither scored nor counted as misses, but a detection that lands on
+one is still a false positive. That is the honest reading — you said the eval is
+not about bats, not that the model didn't fire.
+
+The stored map travels with the eval: `class_map` on the row, `class_map` in the
+request YAML, a **class map** line on the eval's detail page, and `class_map` in
+the trainer's own `eval_result.yaml`. What the metrics mean depends on it, so it
+is recorded everywhere the metrics are.
+
+Implementation: `training.services.class_sync` (compare + propose + validate),
+`fleetsite.admin_views.class_sync_view` (the JSON endpoint),
+`training/static/training/class_sync.js` (the button), and
+`friendy_chachkalica.metrics.apply_class_map` (what the trainer does with it —
+it rewrites the *target* class names and leaves the loader's own view of the
+dataset alone, so label ids are still validated against the real `classes.txt`).
 
 ## What it creates
 

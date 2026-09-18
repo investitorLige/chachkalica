@@ -423,7 +423,7 @@ def _read_label_shapes(label_dir, image_path, class_names):
 @admin.register(Dataset)
 class DatasetAdmin(admin.ModelAdmin):
     form = DatasetAdminForm
-    list_display = ["name", "storage_type", "storage_root", "has_labels"]
+    list_display = ["name", "storage_type", "storage_root", "has_labels_display"]
     readonly_fields = ["has_labels"]
     search_fields = ["name"]
     actions = [
@@ -460,6 +460,14 @@ class DatasetAdmin(admin.ModelAdmin):
         # so the flag reflects whether a source labels/ folder is present.
         super().save_model(request, obj, form, change)
         datasets_svc.detect_labels(obj)
+
+    @admin.display(boolean=True, ordering="has_labels", description="Has labels")
+    def has_labels_display(self, obj):
+        # The stored flag is only refreshed at specific call sites (save,
+        # promote, grounding-SAM generation, fleet_setup_dataset), so labels
+        # dropped onto disk out-of-band would otherwise show as absent here
+        # until something happens to re-save the row. Recompute live instead.
+        return datasets_svc.detect_labels(obj, persist=False)
 
     def _save_posted_tags(self, request, dataset):
         """Save the tag editor's rows onto a dataset.
@@ -1070,6 +1078,16 @@ class DatasetAdmin(admin.ModelAdmin):
 
         # ------------------------------------------ step 2: render the full form
         from training.models import EvalRun
+        from training.services import config_gen
+
+        # The dataset's own class names, so the "Check classes" block can render
+        # one row per class before anything is fetched. A dataset with no
+        # classes.txt renders the block empty and says so rather than 500-ing a
+        # form whose other half is still usable.
+        try:
+            dataset_class_names = config_gen.dataset_classes(dataset)
+        except OSError:
+            dataset_class_names = []
 
         model_ctx = inference_form.model_context(model_source, request.POST)
         context = {
@@ -1085,6 +1103,8 @@ class DatasetAdmin(admin.ModelAdmin):
                           if directory.is_dir() else str(directory),
             "visible_to_trainer": dataset_inference.visible_to_trainer(directory),
             "shared_data_root": str(dataset_inference.shared_data_root()),
+            "class_sync_url": reverse("class-sync"),
+            "dataset_class_names": dataset_class_names,
         }
         # The dataset is fixed here, but label_source/annotator are not -- and
         # they are what decides which tag answers a later Tag analytics page
@@ -1118,7 +1138,7 @@ class DatasetAdmin(admin.ModelAdmin):
         from eval_pipelines.models import PipelineEvalRun
         from training import jobs as training_jobs
         from training.models import EvalRun
-        from training.services import bundles, config_gen
+        from training.services import bundles, class_sync, config_gen
 
         model_fields, error = inference_form.parse_model_source(request.POST, model_source)
         if error:
@@ -1166,6 +1186,20 @@ class DatasetAdmin(admin.ModelAdmin):
             return None, (f"{dataset.name}: no labels directory at {labels} — there "
                           "is nothing to score against.")
 
+        # The optional class map from the "Check classes" block, read only once
+        # the dataset itself has checked out. Absent — the operator never pressed
+        # the button — is an empty map, which scores the dataset's own classes
+        # exactly as every eval did before that block existed. A dataset with no
+        # classes.txt can't have produced a map either, so it degrades to that
+        # same empty map rather than failing a form whose other half is fine.
+        try:
+            names = config_gen.dataset_classes(dataset)
+        except OSError:
+            names = []
+        class_map, error = class_sync.parse_posted(request.POST, names)
+        if error:
+            return None, error
+
         # A bundle's geometry is the bundle's, not the form's — the server-side
         # half of the locked fields on the page, re-read from the manifest so a
         # stale page (or one whose "Sync bundle" was never pressed) still
@@ -1184,6 +1218,7 @@ class DatasetAdmin(admin.ModelAdmin):
             annotator=annotator,
             explicit_labels_path=explicit,
             map_score_threshold=map_score_threshold,
+            class_map=class_map,
             score_threshold=knobs.pop("score_threshold"),
             model_source=model_source,
             **model_fields,

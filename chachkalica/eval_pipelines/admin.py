@@ -178,6 +178,21 @@ class EvalDisplayMixin:
                                  eval_analytics.summary(obj))
         return mark_safe(html)
 
+    @admin.display(description="class map")
+    def class_map_display(self, obj):
+        """How the dataset's classes were translated before scoring, if at all.
+
+        Worth a row of its own rather than a raw JSONField dump: it is the one
+        thing that changes what the metrics beside it *mean*. An eval that
+        collapsed four weapon classes onto a single-class detector, or dropped
+        the two it could not predict, does not report the same number as one
+        that scored the dataset as labelled — and months later the request YAML
+        is not where anyone looks first.
+        """
+        from training.services import class_sync
+
+        return class_sync.describe(obj.class_map) or "— scored the dataset's own classes"
+
     @admin.display(description="models")
     def models_display(self, obj):
         """The primary model, plus any combined ones ("A + B").
@@ -533,6 +548,9 @@ class TagAnalyticsMixin:
 
 @admin.register(BaseEval)
 class BaseEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin, admin.ModelAdmin):
+    # Rendered by class_map_display instead — the raw JSONField would show the
+    # same thing again, as an editable widget on an otherwise read-only page.
+    exclude = ["class_map"]
     promote_kind = "base"
     list_display = ["__str__", "models_display", "dataset", "status_badge",
                     "map50", "map50_95", "eval_time", "created_at"]
@@ -543,6 +561,7 @@ class BaseEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin, adm
         "trained_model", "model_source", "artifact_path", "bundle_path",
         "model_label_snapshot",
         "dataset", "label_source", "annotator", "explicit_labels_path",
+        "class_map_display",
         "score_threshold",
         "status", "request_yaml_path", "output_dir", "metrics_pretty", "last_error",
         "started_at", "finished_at", "created_at",
@@ -590,6 +609,9 @@ class PipelineEvalRunAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMix
     every row in a given list shares it.
     """
 
+    # Rendered by class_map_display instead — the raw JSONField would show the
+    # same thing again, as an editable widget on an otherwise read-only page.
+    exclude = ["class_map"]
     promote_kind = "pipeline"
     list_display = ["__str__", "models_display", "dataset", "status_badge",
                     "map50", "map50_95", "eval_time", "created_at"]
@@ -600,6 +622,7 @@ class PipelineEvalRunAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMix
         "trained_model", "model_source", "artifact_path", "bundle_path",
         "model_label_snapshot",
         "dataset", "label_source", "annotator", "explicit_labels_path",
+        "class_map_display",
         "pipeline", "detector_checkpoint", "detector_expand_ratio",
         "tile_width_pct", "tile_height_pct", "overlap", "chain",
         "score_threshold",
@@ -833,7 +856,13 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin,
 
         ``?mode=slice&clauses=[["weather","rain"],["shift","night"]]`` intersects
         the clauses; ``?mode=cross&tag_a=&tag_b=&metric=`` fills a grid with one
-        metric over every combination of two tags' values.
+        metric over every combination of two tags' values;
+        ``?mode=scorecard`` scores every value of every usable tag at once.
+
+        All three accept ``&threshold=`` to score at a confidence other than the
+        eval's own. Nothing is re-run for it: the match table holds every
+        prediction down to its score floor, so a different cut is a filter over
+        rows already on disk (see ``tag_analytics.resolve_score_cut``).
         """
         eval_obj, _kind = _resolve_eval_for_tags(request)
         loaded, problem = _load_tag_analysis(eval_obj)
@@ -842,17 +871,26 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin,
         table, index, _sources = loaded
 
         try:
+            # Absent means "the eval's own operating point"; a blank or
+            # unparseable one is a client bug worth reporting, not worth
+            # silently scoring at a threshold nobody asked for.
+            raw_threshold = request.GET.get("threshold")
+            threshold = None if raw_threshold in (None, "") else float(raw_threshold)
+
+            if request.GET.get("mode") == "scorecard":
+                return JsonResponse(tag_analytics.scorecard(table, index, threshold))
             if request.GET.get("mode") == "cross":
                 return JsonResponse(tag_analytics.cross_tab(
                     table, index,
                     request.GET.get("tag_a", ""), request.GET.get("tag_b", ""),
-                    request.GET.get("metric", ""),
+                    request.GET.get("metric", ""), threshold,
                 ))
             clauses = json.loads(request.GET.get("clauses") or "[]")
             if not isinstance(clauses, list):
                 raise ValueError("clauses must be a list of [tag, value] pairs")
             pairs = [(str(pair[0]), str(pair[1])) for pair in clauses]
-            return JsonResponse(tag_analytics.slice_metrics(table, index, pairs))
+            return JsonResponse(
+                tag_analytics.slice_metrics(table, index, pairs, threshold))
         except tag_analytics.UnknownClause as exc:
             return JsonResponse({"error": str(exc)}, status=400)
         except (ValueError, TypeError, IndexError) as exc:

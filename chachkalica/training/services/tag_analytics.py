@@ -1307,7 +1307,20 @@ def _mean(values) -> float:
     return float(sum(values) / len(values)) if values else 0.0
 
 
-def image_slice_metrics(table: MatchTable, image_mask: np.ndarray) -> dict:
+def resolve_score_cut(table: MatchTable, score_cut: float | None) -> float:
+    """The confidence to score at: the eval's own, or an operator's override.
+
+    Clamped into ``[score_floor, 1]``. The floor is where the stored table stops
+    — asking for less is asking about predictions that were never written, and
+    answering it would quietly report a slice as emptier than it is.
+    """
+    if score_cut is None:
+        return table.score_threshold
+    return float(min(max(float(score_cut), table.score_floor), 1.0))
+
+
+def image_slice_metrics(table: MatchTable, image_mask: np.ndarray,
+                        score_cut: float | None = None) -> dict:
     """The full metric set for a subset of images.
 
     Mirrors ``metrics.evaluate_detection``: AP integrates the raw NMS-free set
@@ -1316,11 +1329,17 @@ def image_slice_metrics(table: MatchTable, image_mask: np.ndarray) -> dict:
     set. The mAP means skip classes with no ground truth in the slice, for the
     same reason the trainer's do — averaging a hard zero over a class the slice
     never contains deflates the number without saying anything about the model.
+
+    ``score_cut`` overrides the eval's own operating confidence, which is what
+    lets the page sweep a threshold without re-running anything: the table keeps
+    every prediction down to ``score_floor``, so any cut at or above that floor
+    is a filter over rows already on disk. Below the floor there is no data to
+    read, so it clamps rather than inventing an emptier slice than the truth.
     """
     keep_pred = image_mask[table.pred_image]
     keep_op = image_mask[table.op_image] if not table.operating_is_ap else keep_pred
     keep_gt = image_mask[table.gt_image]
-    cut = table.score_threshold
+    cut = resolve_score_cut(table, score_cut)
 
     gt_classes = table.gt_class[keep_gt]
     op_scores_all = table.op_score[keep_op]
@@ -1425,15 +1444,19 @@ def gt_claims(table: MatchTable, threshold: float) -> tuple[np.ndarray, np.ndarr
     return score, iou
 
 
-def gt_slice_metrics(table: MatchTable, gt_mask: np.ndarray) -> dict:
+def gt_slice_metrics(table: MatchTable, gt_mask: np.ndarray,
+                     score_cut: float | None = None) -> dict:
     """What a subset of *ground-truth boxes* can honestly be scored on.
 
     Recall, misses, and how well the boxes that were found were found (IoU,
     confidence). No precision and no AP: a false positive is a prediction, and
     a prediction has no tags, so there is no way to say which slice it belongs
     to. See this module's docstring.
+
+    ``score_cut`` overrides the eval's operating confidence, as in
+    :func:`image_slice_metrics` — here it moves which boxes count as found.
     """
-    cut = table.score_threshold
+    cut = resolve_score_cut(table, score_cut)
     primary = 0.5 if 0.5 in table.iou_thresholds else table.iou_thresholds[0]
     score, iou = gt_claims(table, primary)
 
@@ -1608,7 +1631,9 @@ class PersonTable:
     #: Images the sidecar measured, i.e. that could contribute people at all.
     measured_images: int = 0
 
-    #: ``(side, class_id) -> per-person presence``, filled on first use.
+    #: ``(side, class_id[, cut]) -> per-person presence``, filled on first use.
+    #: The confidence is part of the key on the prediction side only — see
+    #: :func:`_presence`.
     presence: dict = field(default_factory=dict)
 
     @property
@@ -1783,13 +1808,18 @@ def _attribute_predictions(table: MatchTable, people: np.ndarray, per_image: dic
 
 
 def _presence(table: MatchTable, persons: PersonTable, class_id: int,
-              side: str) -> np.ndarray:
+              side: str, cut: float | None = None) -> np.ndarray:
     """Per person: does this class appear on them, in ground truth or in output.
 
     Memoized on the table: a breakdown asks for the same two arrays once per
-    value of a tag, and they are a scan over every box each time.
+    value of a tag, and they are a scan over every box each time. ``cut`` is
+    part of the memo key, not just an argument: the confidence slider asks for
+    the same class at a dozen confidences in one page load, and a cache keyed
+    on the class alone would answer every one of them with the first cut it
+    saw. It is ignored on the ``gt`` side, which no confidence can move.
     """
-    key = (side, int(class_id))
+    cut = table.score_threshold if cut is None else float(cut)
+    key = (side, int(class_id)) if side == "gt" else (side, int(class_id), cut)
     cached = persons.presence.get(key)
     if cached is not None:
         return cached
@@ -1803,7 +1833,7 @@ def _presence(table: MatchTable, persons: PersonTable, class_id: int,
         selected = (
             (persons.pred_person >= 0)
             & (table.op_class[rows] == class_id)
-            & (table.op_score[rows] >= table.score_threshold)
+            & (table.op_score[rows] >= cut)
         )
         has[persons.pred_person[selected]] = True
     persons.presence[key] = has
@@ -1849,7 +1879,8 @@ def scored_class_ids(table: MatchTable, persons: PersonTable) -> list[int]:
 
 
 def person_slice_metrics(table: MatchTable, persons: PersonTable,
-                         person_mask: np.ndarray) -> dict:
+                         person_mask: np.ndarray,
+                         score_cut: float | None = None) -> dict:
     """Score a subset of *people*: did the model get each one's contents right.
 
     One binary decision per person per class -- "is there a weapon on this
@@ -1859,7 +1890,13 @@ def person_slice_metrics(table: MatchTable, persons: PersonTable,
     numbers are micro-averaged over the classes: every person-class decision
     counts once, which is what makes them comparable across slices that hold
     different mixes of classes.
+
+    ``score_cut`` overrides that operating confidence, as in
+    :func:`image_slice_metrics`. It moves only the prediction side of each
+    decision: raising it turns false alarms into correct rejections and hits
+    into misses, which is exactly the trade the slider exists to show.
     """
+    cut = resolve_score_cut(table, score_cut)
     selected = np.nonzero(person_mask)[0]
     total = int(selected.size)
 
@@ -1867,7 +1904,7 @@ def person_slice_metrics(table: MatchTable, persons: PersonTable,
     hit = miss = false_alarm = correct_reject = 0
     for class_id in scored_class_ids(table, persons):
         gt_has = _presence(table, persons, class_id, "gt")[selected]
-        pred_has = _presence(table, persons, class_id, "pred")[selected]
+        pred_has = _presence(table, persons, class_id, "pred", cut)[selected]
         counts = (
             int(np.count_nonzero(gt_has & pred_has)),
             int(np.count_nonzero(gt_has & ~pred_has)),
@@ -2024,15 +2061,22 @@ POPULATION_BY_KIND = {"frame": "images", "person": "persons", "box": "boxes"}
 POPULATION_KEY = {"frame": "images", "person": "persons", "box": "gt"}
 
 
-def overall_metrics(table: MatchTable, index: TagIndex, kind: str) -> dict:
-    """The unfiltered slice of one population — what every row is compared to."""
+def overall_metrics(table: MatchTable, index: TagIndex, kind: str,
+                    score_cut: float | None = None) -> dict:
+    """The unfiltered slice of one population — what every row is compared to.
+
+    ``score_cut`` has to travel with it: a row scored at the slider's
+    confidence and a baseline scored at the eval's would make every delta on
+    the page the sum of two different questions.
+    """
     if kind == "person":
         persons = index.persons
         return person_slice_metrics(
-            table, persons, np.ones(persons.count, dtype=bool))
+            table, persons, np.ones(persons.count, dtype=bool), score_cut)
     if kind == "frame":
-        return image_slice_metrics(table, np.ones(table.num_images, dtype=bool))
-    return gt_slice_metrics(table, np.ones(table.num_gt, dtype=bool))
+        return image_slice_metrics(
+            table, np.ones(table.num_images, dtype=bool), score_cut)
+    return gt_slice_metrics(table, np.ones(table.num_gt, dtype=bool), score_cut)
 
 
 class UnknownClause(ValueError):
@@ -2092,18 +2136,19 @@ def resolve_clauses(table: MatchTable, index: TagIndex,
     return image_mask, gt_mask, person_mask, kind
 
 
-def slice_metrics(table: MatchTable, index: TagIndex, clauses) -> dict:
+def slice_metrics(table: MatchTable, index: TagIndex, clauses,
+                  score_cut: float | None = None) -> dict:
     """Score one filter, on whatever population the clauses resolved to."""
     image_mask, gt_mask, person_mask, kind = resolve_clauses(table, index, clauses)
     if kind == "person":
-        result = person_slice_metrics(table, index.persons, person_mask)
+        result = person_slice_metrics(table, index.persons, person_mask, score_cut)
         result["gt"] = int(np.count_nonzero(gt_mask))
         return result
     if kind == "frame":
-        result = image_slice_metrics(table, image_mask)
-        result["boxes"] = gt_slice_metrics(table, gt_mask)
+        result = image_slice_metrics(table, image_mask, score_cut)
+        result["boxes"] = gt_slice_metrics(table, gt_mask, score_cut)
         return result
-    result = gt_slice_metrics(table, gt_mask)
+    result = gt_slice_metrics(table, gt_mask, score_cut)
     result["images"] = int(np.count_nonzero(image_mask))
     return result
 
@@ -2161,13 +2206,138 @@ def tag_breakdown(table: MatchTable, index: TagIndex, definition: TagDefinition)
     }
 
 
-def cross_tab(table: MatchTable, index: TagIndex, tag_a: str, tag_b: str, metric: str) -> dict:
+#: What the scorecard reports per row, by slice kind. Frame rows carry the full
+#: set; box rows carry only what a set of ground-truth boxes can answer, so the
+#: same column reads as a real number in one row and a dash in the next.
+#:
+#: ``swept`` says whether the confidence slider moves the column. Average
+#: precision integrates the whole precision-recall curve down to the score
+#: floor, so a confidence cut cannot change it — the mAP columns sit still
+#: while the slider repaints the rest. Saying so in the data keeps the page
+#: from looking broken at exactly the moment someone first drags it.
+SCORECARD_COLUMNS = [
+    ("map50", "mAP50", False),
+    ("map50_95", "mAP50-95", False),
+    ("precision", "precision", True),
+    ("recall", "recall", True),
+    ("f1", "F1", True),
+]
+
+
+def scorecard(table: MatchTable, index: TagIndex,
+              score_cut: float | None = None) -> dict:
+    """Every value of every usable tag, scored, in one table.
+
+    The per-tag breakdowns answer "how does this one tag split the model"; this
+    answers "which slice anywhere in the eval is worst", which is the question
+    that actually starts an investigation and which no single breakdown can be
+    read for.
+
+    Every cell is shaded, and the bounds are per (tag, column): one scale for
+    the whole table would rank a box row's recall against a frame row's mAP,
+    which do not mean the same thing, and a single scale per tag would flatten
+    precision against recall when the slider pulls them in opposite directions.
+    Shading a column against itself, within one tag, is the only comparison on
+    this page that is honest in both directions.
+
+    Recomputed per ``score_cut`` rather than cached: that is the point of the
+    slider, and it costs one pass over masks already built.
+    """
+    cut = resolve_score_cut(table, score_cut)
+    groups = []
+    for definition in index.tags:
+        if not definition.usable:
+            continue
+        # Three populations share these columns, and each dashes out the ones
+        # it cannot answer (a box row has no precision, a person row no mAP).
+        # The alternative — a table per population — would put the worst slice
+        # in the eval in whichever of three tables you had not scrolled to,
+        # which is the one thing this view exists to prevent.
+        kind = definition.kind
+        overall = overall_metrics(table, index, kind, cut)
+        key = METRICS_BY_KIND[kind][1]
+
+        rows = []
+        for value in definition.values:
+            metrics = slice_metrics(table, index, [(definition.name, value)], cut)
+            population = metrics[POPULATION_KEY[kind]]
+            empty = population == 0
+            # A frame slice with predictions but no ground truth has no mAP and
+            # no recall — both are means over an empty set. It is a real slice
+            # worth seeing (it is where false positives live), so the row stays
+            # and only the undefined numbers drop out. The crowding tag makes
+            # this bucket guaranteed rather than incidental.
+            no_gt = kind == "frame" and not empty and metrics["gt"] == 0
+            rows.append({
+                "value": value,
+                "population": int(population),
+                "gt": int(metrics["gt"]),
+                "empty": bool(empty),
+                "no_ground_truth": bool(no_gt),
+                "headline": None if (empty or no_gt) else metrics.get(key),
+                "delta": (None if (empty or no_gt)
+                          else metrics.get(key, 0.0) - overall.get(key, 0.0)),
+                "metrics": {
+                    name: (None if (empty or no_gt) else metrics.get(name))
+                    for name, _label, _swept in SCORECARD_COLUMNS
+                },
+            })
+
+        # Shading bounds per column, over this tag's rows only. A column whose
+        # values are all equal (or has one usable row) spans nothing; it is sent
+        # as null so the page leaves those cells unpainted rather than painting
+        # an arbitrary extreme across a tag that does not actually vary.
+        intensities = {}
+        for name, _label, _swept in SCORECARD_COLUMNS:
+            seen = [row["metrics"][name] for row in rows
+                    if row["metrics"].get(name) is not None]
+            low, high = (min(seen), max(seen)) if seen else (None, None)
+            span = (high - low) if seen else 0.0
+            for row in rows:
+                value = row["metrics"].get(name)
+                row.setdefault("intensity", {})[name] = (
+                    None if value is None or not span else round((value - low) / span, 4)
+                )
+            intensities[name] = {"low": low, "high": high} if seen else None
+
+        scored = [row["headline"] for row in rows if row["headline"] is not None]
+        groups.append({
+            "name": definition.name,
+            "label": definition.display,
+            "kind": kind,
+            "source": definition.source,
+            "unit": definition.unit,
+            "headline_metric": key,
+            "population_label": POPULATION_BY_KIND[kind],
+            "bounds": intensities,
+            "worst": min(scored) if scored else None,
+            "best": max(scored) if scored else None,
+            "overall": overall.get(key),
+            "rows": rows,
+        })
+
+    return {
+        "score_cut": cut,
+        "score_threshold": table.score_threshold,
+        "score_floor": table.score_floor,
+        "at_eval_threshold": abs(cut - table.score_threshold) < 1e-9,
+        "columns": [{"key": key, "label": label, "swept": swept}
+                    for key, label, swept in SCORECARD_COLUMNS],
+        "groups": groups,
+    }
+
+
+def cross_tab(table: MatchTable, index: TagIndex, tag_a: str, tag_b: str, metric: str,
+              score_cut: float | None = None) -> dict:
     """One metric over every combination of two tags' values.
 
     The intersection, not the union: a cell is images (or boxes) answering both
     ``tag_a = row`` and ``tag_b = column``. Empty combinations are kept as
     blanks rather than dropped, because "no rainy night frames exist" is itself
     worth seeing in the grid.
+
+    ``score_cut`` scores the whole grid at a confidence other than the eval's,
+    as everywhere else on this page.
     """
     first = index.tag(tag_a)
     second = index.tag(tag_b)
@@ -2192,7 +2362,7 @@ def cross_tab(table: MatchTable, index: TagIndex, tag_a: str, tag_b: str, metric
         cells = []
         for column_value in second.values:
             entry = slice_metrics(
-                table, index, [(tag_a, row_value), (tag_b, column_value)]
+                table, index, [(tag_a, row_value), (tag_b, column_value)], score_cut
             )
             population = entry[POPULATION_KEY[kind]]
             value = entry.get(metric) if population else None
