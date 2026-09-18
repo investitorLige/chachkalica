@@ -118,7 +118,15 @@ def test_signatures_stay_in_step():
 #   loop over a handful of scalars: on the GPU every comparison is a separate
 #   sync, so a torch twin would be slower than the ``.cpu()`` copy of the two
 #   already-NMS'd output tensors (a few KB) that the fallback pays once.
-NUMPY_PATH_ARCHS = {"rtmo"}
+#
+#   scrfd — its graph deliberately ships without NMS (the landmarks would have
+#   no indices to be gathered by), so the handler runs suppression itself, in
+#   the inclusive-pixel ``(x1 - x0 + 1)`` convention InsightFace trained and
+#   verified SCRFD against. ``torchvision.ops.nms`` does not use that
+#   convention and would keep a different set on near-touching faces, so a
+#   torch twin here would mean porting the greedy loop rather than calling one
+#   kernel — for a ``.cpu()`` copy of 512 already-top-K'd rows per frame.
+NUMPY_PATH_ARCHS = {"rtmo", "scrfd"}
 
 
 @pytest.mark.parametrize("arch", sorted(set(ARCH_REGISTRY) - NUMPY_PATH_ARCHS))

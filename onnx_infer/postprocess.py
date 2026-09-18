@@ -10,6 +10,13 @@ own input-pixel frame (Contract A). This module only:
   3. converts to normalized ``(x_center, y_center, width, height)`` and appends
      ``(confidence, class_id)`` — matching ``friendy_chachkalica.formats``.
 
+:func:`keypoints_to_normalized` does steps 1 and 2 for a pose arch's optional
+joint array, so that a handler that has joints (rtmo) can hand the caller the
+*same* detections in the *same* frame without any of it entering the ``(N, 6)``
+tensor. Kept here, beside ``to_friendy``, because the two must apply the same
+threshold mask and the same inverse transform: joints that survive a different
+set of rows than their boxes would be drawn on the wrong people.
+
 Clipping to image bounds is opt-in per arch via the meta's ``clip_boxes``:
 ``xyxy_prediction_to_friendy`` does not clip, so this must clip exactly for the
 archs whose adapter clips before calling it, and no others.
@@ -101,3 +108,47 @@ def to_friendy(
         [xywhn, scores.reshape(-1, 1), labels.reshape(-1, 1).astype(np.float32)],
         axis=1,
     ).astype(np.float32)
+
+
+def keypoints_to_normalized(
+    keypoints: np.ndarray,
+    scores: np.ndarray,
+    transform: Transform,
+    score_threshold: float,
+    box_coords: str = "input_pixels",
+) -> np.ndarray:
+    """keypoints ``[N,K,3]`` + scores ``[N]`` -> ``[M,K,3]``, normalized.
+
+    The joint twin of :func:`to_friendy`, and deliberately a mirror of it: the
+    same ``scores >= score_threshold`` mask so row ``i`` here is row ``i``
+    there, the same inverse of the recorded resize+pad, and the same
+    normalization by the original image's size. What comes back is ``x, y`` in
+    ``0..1`` over the frame — the units every consumer of a Friendy box already
+    reads — with each joint's own confidence carried through untouched in the
+    third column.
+
+    Never clipped, unlike the boxes: a joint is a *point*, and a wrist the model
+    put slightly outside the frame is an extrapolation worth drawing as one. A
+    box clamped to the frame still bounds its subject; a joint clamped to the
+    frame is a limb bent to the edge of the picture.
+    """
+    keypoints = np.asarray(keypoints, dtype=np.float32)
+    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+    if keypoints.ndim != 3 or keypoints.shape[0] == 0:
+        return np.zeros((0, keypoints.shape[1] if keypoints.ndim == 3 else 0, 3),
+                        dtype=np.float32)
+
+    keypoints = keypoints[scores >= score_threshold]
+    if keypoints.shape[0] == 0:
+        return np.zeros((0, keypoints.shape[1], 3), dtype=np.float32)
+
+    keypoints = keypoints.copy()
+    if box_coords == "input_pixels":
+        keypoints[:, :, 0] = (keypoints[:, :, 0] - transform.pad_x) / transform.scale_x
+        keypoints[:, :, 1] = (keypoints[:, :, 1] - transform.pad_y) / transform.scale_y
+        keypoints[:, :, 0] /= transform.orig_w
+        keypoints[:, :, 1] /= transform.orig_h
+    # ``input_normalized`` — already 0..1 over a model input whose frame *is*
+    # the original image's (those archs stretch, so there is no padding to
+    # undo). Nothing to do, same as the box path.
+    return keypoints.astype(np.float32)

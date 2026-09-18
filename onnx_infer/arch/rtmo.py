@@ -8,14 +8,19 @@ Unlike every other arch here, the graph's own two raw outputs are not
   * ``keypoints`` ``[K, 17, 3]`` — COCO-17 ``x, y, score`` per person, gathered
     by the *same* NMS indices as ``dets`` row-for-row, in the same pixel frame.
 
-Contract A has no field for a per-detection keypoint array, and nothing
-downstream of it knows what to do with one — a Friendy ``(N,6)`` row is
-``cx, cy, w, h, confidence, class_id`` and that is all. But the keypoints are
-the reason this arch exists: this handler spends them on a **posture
-classification** (standing / sitting / lying), computed once per person from
-joint geometry, and emits *that* as Contract A's ``labels`` — three classes
-rather than the raw keypoints Contract A could never carry anyway. The
-keypoints themselves are discarded right after.
+Contract A has no field for a per-detection keypoint array — a Friendy
+``(N,6)`` row is ``cx, cy, w, h, confidence, class_id`` and that is all. So the
+keypoints are spent on a **posture classification** (standing / sitting /
+lying), computed once per person from joint geometry, and emitted as Contract
+A's ``labels`` — three classes where the raw keypoints could never go.
+
+They are also handed out *unspent*, by :meth:`RTMOHandler.adapt_keypoints`:
+the same array, row-for-row with the boxes, on the optional second seam
+(``ArchHandler.adapt_keypoints``) that sits beside Contract A rather than
+inside it. A caller that wants joints asks for them and gets them; every caller
+that reshapes predictions to six columns — eval, benchmarking, label promotion
+— sees exactly what it saw before. This is what lets Marketing Studio render a
+clip of this bundle as skeletons rather than as rectangles.
 
 Graph-side NMS: the exporter's ``NonMaxSuppression`` node is baked in and
 TensorRT's own ONNX parser converts it to an internal NMS layer with no graph
@@ -196,3 +201,17 @@ class RTMOHandler(ArchHandler):
             dtype=np.int64,
         )
         return boxes, scores, labels
+
+    def adapt_keypoints(self, outputs: list[np.ndarray]) -> np.ndarray | None:
+        """``[N, 17, 3]`` COCO joints, in the same pixel frame as the boxes.
+
+        Re-read off the graph's own second output rather than remembered from
+        :meth:`adapt_outputs`: the two are called on the same ``outputs`` list
+        one after the other, a reshape costs nothing, and a handler instance is
+        shared by every model of this arch in the process (see
+        ``arch/__init__.py``'s registry), so anything stashed on ``self`` would
+        be one concurrent request away from being another image's joints.
+        """
+        if len(outputs) != 2:
+            return None
+        return np.asarray(outputs[1], dtype=np.float32).reshape(-1, 17, 3)

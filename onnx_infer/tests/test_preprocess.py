@@ -103,3 +103,90 @@ def test_to_friendy_threshold_and_empty():
     empty = to_friendy(np.zeros((0, 4), np.float32), np.zeros((0,), np.float32),
                        np.zeros((0,), np.int64), tf, 0.5)
     assert empty.shape == (0, 6)
+
+
+# --------------------------------------------------------------- pose keypoints
+
+def _rtmo_outputs(dets, keypoints):
+    return [np.asarray(dets, dtype=np.float32), np.asarray(keypoints, dtype=np.float32)]
+
+
+def test_rtmo_hands_out_the_joints_it_spends_on_the_label():
+    """The posture label and the raw joints come off the same graph outputs.
+
+    The handler's whole reason for existing is that Contract A has nowhere to
+    put a keypoint array, so the joints get turned into a class. They are still
+    the most informative thing the graph produced, and ``adapt_keypoints`` is
+    how a caller that can draw them gets them — unchanged, and row-matched to
+    the boxes ``adapt_outputs`` returns from the same list.
+    """
+    from onnx_infer.arch import get_handler
+
+    handler = get_handler("rtmo")
+    joints = np.zeros((2, 17, 3), dtype=np.float32)
+    joints[:, :, 2] = 0.9
+    outputs = _rtmo_outputs([[10, 20, 30, 120, 0.9], [40, 50, 60, 150, 0.8]], joints)
+
+    boxes, scores, labels = handler.adapt_outputs(outputs)
+    carried = handler.adapt_keypoints(outputs)
+
+    assert carried.shape == (boxes.shape[0], 17, 3)
+    np.testing.assert_array_equal(carried, joints)
+    assert scores.shape == labels.shape == (2,)
+
+
+def test_a_box_arch_has_no_joints_to_hand_out():
+    """``None``, not an empty array: "this graph has no keypoints" and "this pose
+    graph found nobody" are different answers and callers branch on which."""
+    from onnx_infer.arch import get_handler
+
+    outputs = [np.zeros((1, 4), np.float32), np.zeros((1,), np.float32),
+               np.zeros((1,), np.int64)]
+    assert get_handler("retinanet").adapt_keypoints(outputs) is None
+
+
+def test_keypoints_land_in_the_same_frame_as_their_boxes():
+    """Joints normalize through the same inverse transform the boxes do.
+
+    Built as the exact letterbox case the rtmo bundle runs: a 100x50 image
+    scaled by 2 into a padded canvas. A joint at the middle of the subject must
+    come back at the middle of the *original* image, or a skeleton would be
+    drawn offset from the person it belongs to by the padding.
+    """
+    from onnx_infer.postprocess import keypoints_to_normalized
+
+    transform = Transform(scale_x=2.0, scale_y=2.0, pad_x=10, pad_y=30,
+                          orig_w=100, orig_h=50)
+    joints = np.array([[[110.0, 80.0, 0.9], [210.0, 130.0, 0.4]]], dtype=np.float32)
+
+    out = keypoints_to_normalized(joints, np.array([0.9]), transform, 0.5)
+
+    assert out.shape == (1, 2, 3)
+    # (110 - 10) / 2 = 50 px of 100 wide; (80 - 30) / 2 = 25 px of 50 tall.
+    np.testing.assert_allclose(out[0, 0, :2], [0.5, 0.5], atol=1e-6)
+    np.testing.assert_allclose(out[0, 1, :2], [1.0, 1.0], atol=1e-6)
+    # Joint confidences are carried, not recomputed.
+    np.testing.assert_allclose(out[0, :, 2], [0.9, 0.4], atol=1e-6)
+
+
+def test_dropped_detections_drop_their_joints_too():
+    """One threshold mask for both, so row i is the same person in each.
+
+    Off-by-one here is the failure that matters: the skeletons would still be
+    drawn, just on the wrong people.
+    """
+    from onnx_infer.postprocess import keypoints_to_normalized
+
+    transform = Transform(scale_x=1.0, scale_y=1.0, pad_x=0, pad_y=0,
+                          orig_w=10, orig_h=10)
+    scores = np.array([0.9, 0.1, 0.7], dtype=np.float32)
+    joints = np.zeros((3, 17, 3), dtype=np.float32)
+    joints[:, 0, 0] = [1.0, 2.0, 3.0]  # a per-person marker in the first joint
+
+    boxes = np.tile(np.array([[0.0, 0.0, 10.0, 10.0]], dtype=np.float32), (3, 1))
+    labels = np.zeros(3, dtype=np.int64)
+    friendy = to_friendy(boxes, scores, labels, transform, 0.5)
+    out = keypoints_to_normalized(joints, scores, transform, 0.5)
+
+    assert out.shape[0] == friendy.shape[0] == 2
+    np.testing.assert_allclose(out[:, 0, 0] * transform.orig_w, [1.0, 3.0], atol=1e-6)

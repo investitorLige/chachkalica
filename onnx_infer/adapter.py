@@ -18,7 +18,7 @@ import numpy as np
 
 from .arch import get_handler
 from .meta import ModelMeta
-from .postprocess import to_friendy
+from .postprocess import keypoints_to_normalized, to_friendy
 from .preprocess import preprocess
 from .session import OnnxModel
 
@@ -39,8 +39,15 @@ class OnnxAdapter:
     def eval(self) -> "OnnxAdapter":  # parity with nn.Module-style adapters
         return self
 
-    def predict(self, images, score_threshold: Optional[float] = None):
-        """List of CHW float [0,1] tensors -> list of Friendy ``(N,6)`` tensors."""
+    def predict(self, images, score_threshold: Optional[float] = None,
+                with_keypoints: bool = False):
+        """List of CHW float [0,1] tensors -> list of Friendy ``(N,6)`` tensors.
+
+        ``with_keypoints`` returns ``(friendy, keypoints)`` pairs instead, the
+        second being a ``[M,K,3]`` normalized array row-matched to the first (or
+        ``None`` for an arch with no joints) — see ``TrtAdapter.predict``, whose
+        contract this mirrors so the two formats of one bundle behave alike.
+        """
         import torch
 
         threshold = self.score_threshold if score_threshold is None else score_threshold
@@ -50,12 +57,21 @@ class OnnxAdapter:
             batched, transform = preprocess(chw, self.meta)
             raw = self._model.run(batched)
             boxes, scores, labels = self._handler.adapt_outputs(raw)
-            friendy = to_friendy(
+            friendy = torch.from_numpy(to_friendy(
                 boxes, scores, labels, transform, threshold,
                 clip_boxes=self.meta.clip_boxes,
                 box_coords=self.meta.box_coords,
-            )
-            results.append(torch.from_numpy(friendy))
+            ))
+            if not with_keypoints:
+                results.append(friendy)
+                continue
+            joints = self._handler.adapt_keypoints(raw)
+            if joints is not None:
+                joints = keypoints_to_normalized(
+                    joints, scores, transform, threshold,
+                    box_coords=self.meta.box_coords,
+                )
+            results.append((friendy, joints))
         return results
 
 

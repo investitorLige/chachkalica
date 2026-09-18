@@ -52,6 +52,16 @@ EFFICIENTNMS_OUTPUTS = ("num_detections", "detection_boxes", "detection_scores",
 # TensorRT reports each image's real count directly via the output allocator.
 RTMO_OUTPUTS = ("dets", "keypoints")
 
+# SCRFD (face) engine outputs — see onnx_infer/arch/scrfd.py. A detection triple
+# in shape but not in content: its graph bakes the anchor decode and a fixed
+# top-K in but deliberately leaves NMS out (the landmarks would have no indices
+# to be gathered by), so the third tensor is a 5-point landmark per row and
+# there is no ``labels`` at all. Named here rather than left to the
+# declaration-order fallback below: the rows still need splitting per image and
+# the ArchHandler (which NMSes them itself) reads them positionally, so the
+# order has to be this file's statement, not the engine's tensor order.
+SCRFD_OUTPUTS = ("boxes", "scores", "kps")
+
 
 def _torch_dtype_for(trt, torch, trt_dtype):
     """Map a TensorRT ``DataType`` to the matching torch dtype (version-tolerant)."""
@@ -169,11 +179,14 @@ class TrtModel:
             else:
                 self._output_names.append(tname)
         self.input_name = self._input_names[0]
-        # Three graph output layouts, auto-detected by tensor name:
+        # Four graph output layouts, auto-detected by tensor name:
         #   * EfficientNMS_TRT (retinanet/yolox): 4 fixed-size outputs; unpack to
         #     (boxes, scores, labels) by slicing to num_detections.
         #   * rtmo (pose): (dets, keypoints) — not a detection triple; handed to
         #     the ArchHandler as that pair, one per image.
+        #   * scrfd (face): (boxes, scores, kps) — split per image like a
+        #     passthrough, but unsuppressed and label-less; its ArchHandler runs
+        #     the NMS and supplies the single class.
         #   * passthrough (rtdetr/rfdetr): already (boxes, scores, labels).
         self._efficientnms = set(EFFICIENTNMS_OUTPUTS).issubset(set(self._output_names))
         # Set EQUALITY, not issubset (which is right only for EfficientNMS's fixed
@@ -181,10 +194,16 @@ class TrtModel:
         # subset test would claim one of those as rtmo and hand keypoint code a
         # tensor that isn't keypoints — with nothing raising.
         self._rtmo = set(RTMO_OUTPUTS) == set(self._output_names)
+        # Equality again, and checked before the canonical test: ``boxes`` and
+        # ``scores`` are two thirds of Contract A, so a subset test would match
+        # an scrfd engine on those two and then read ``kps`` as ``labels``.
+        self._scrfd = set(SCRFD_OUTPUTS) == set(self._output_names)
         if self._efficientnms:
             self._emit_order = list(EFFICIENTNMS_OUTPUTS)
         elif self._rtmo:
             self._emit_order = list(RTMO_OUTPUTS)
+        elif self._scrfd:
+            self._emit_order = list(SCRFD_OUTPUTS)
         elif set(CANONICAL_OUTPUTS).issubset(set(self._output_names)):
             self._emit_order = list(CANONICAL_OUTPUTS)
         else:
@@ -384,6 +403,11 @@ def _unpack_efficientnms(ordered: list, batch_size: int) -> list:
 def _split_passthrough(ordered: list, batch_size: int) -> list:
     """Passthrough outputs (ecdet/rtdetr/rfdetr/dfine) -> one ``[boxes, scores, labels]``
     triple per image.
+
+    scrfd rides this too, and is the reason nothing here touches the third
+    tensor beyond indexing it: for that arch it is ``kps[...,5,2]``, not labels,
+    and only its ArchHandler knows that. Splitting is the same work either way —
+    the batch axis is a property of the graph, not of what the tensors mean.
 
     **Batch axis detected by rank, not assumed.** These archs' export wrappers used
     to index the batch axis away before baking the head math (a single ``[0]`` on

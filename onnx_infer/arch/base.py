@@ -28,6 +28,25 @@ class ArchHandler:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         raise NotImplementedError
 
+    def adapt_keypoints(self, outputs: list[np.ndarray]) -> np.ndarray | None:
+        """Per-detection joints ``[N, K, 3]`` (``x, y, score``), or ``None``.
+
+        Contract A carries boxes, scores and labels and has nowhere to put a
+        keypoint array, so a pose arch's joints would be lost between the graph
+        and the caller. This is the second, optional seam that carries them: the
+        ``x, y`` are in the **same frame as** :meth:`adapt_outputs`' boxes (the
+        graph's input pixels), row ``i`` describes the same detection as box
+        ``i``, and the array is left out of the Friendy ``(N, 6)`` tensor
+        entirely — only callers that ask for it (see
+        ``onnx_infer.postprocess.keypoints_to_normalized``) ever see it, so
+        every consumer that reshapes predictions to six columns is untouched.
+
+        ``None`` — the default, and every arch but rtmo — means "this graph has
+        no joints", which is different from an empty array (a pose graph that
+        found nobody).
+        """
+        return None
+
 
 class PassthroughHandler(ArchHandler):
     """Graph outputs are already ``(boxes[N,4], scores[N], labels[N])`` in order."""

@@ -87,30 +87,71 @@ def _load_image_tensor(image_path: Union[str, Path], device) -> torch.Tensor:
 
 
 def _to_box_dicts(
-    predictions: torch.Tensor, class_map: Optional[Dict[int, str]]
+    predictions: torch.Tensor,
+    class_map: Optional[Dict[int, str]],
+    keypoints: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Turn a Friendy ``(N, 6)`` tensor into JSON-friendly box dicts.
 
     Columns are ``[x_center, y_center, width, height, confidence, class_id]``,
     all normalized to the frame (see ``friendy_chachkalica/formats.py``).
+
+    ``keypoints``, when a pose arch supplied one, is an ``[N, K, 3]`` array of
+    ``x, y, score`` joints row-matched to those predictions and normalized to
+    the same frame — so box ``i`` gets a ``keypoints`` key holding *its*
+    person's joints, in the same units as its own ``cx/cy/w/h``. The key is
+    absent, not empty, for every model that has no joints: a consumer tells
+    "this model does not do keypoints" from "it found nobody" by whether the key
+    is there.
     """
     class_map = class_map or {}
+    joints = None
+    if keypoints is not None:
+        joints = [person.tolist() if hasattr(person, "tolist") else list(person)
+                  for person in keypoints]
     boxes: List[Dict[str, Any]] = []
-    for row in predictions.detach().cpu().tolist():
+    for index, row in enumerate(predictions.detach().cpu().tolist()):
         cx, cy, w, h, conf, class_id = row[:6]
         class_id = int(class_id)
-        boxes.append(
-            {
-                "cx": cx,
-                "cy": cy,
-                "w": w,
-                "h": h,
-                "confidence": conf,
-                "class_id": class_id,
-                "class_name": class_map.get(class_id, str(class_id)),
-            }
-        )
+        box = {
+            "cx": cx,
+            "cy": cy,
+            "w": w,
+            "h": h,
+            "confidence": conf,
+            "class_id": class_id,
+            "class_name": class_map.get(class_id, str(class_id)),
+        }
+        # Guarded on the row count rather than trusted: the two come from one
+        # threshold mask and should never disagree, and if they ever did, a
+        # skeleton drawn on the wrong person is worse than no skeleton.
+        if joints is not None and len(joints) == predictions.shape[0]:
+            box["keypoints"] = joints[index]
+        boxes.append(box)
     return boxes
+
+
+def _predict_with_keypoints(adapter, image, score_threshold):
+    """``(predictions, keypoints|None)`` for one image from any adapter.
+
+    ``with_keypoints`` is an opt-in the ONNX and TensorRT adapters grew for pose
+    archs; a trained-torch adapter (and any older one) has never heard of it.
+    Asked of the signature rather than discovered by catching ``TypeError`` off
+    the call, which is what ``predict_adapter`` does for ``score_threshold``: a
+    ``TypeError`` raised *inside* an adapter that does support the keyword would
+    be indistinguishable from one raised by rejecting it, and the fallback would
+    then quietly re-run the model and drop the joints instead of failing.
+    """
+    import inspect
+
+    try:
+        supported = "with_keypoints" in inspect.signature(adapter.predict).parameters
+    except (TypeError, ValueError):  # a callable without an introspectable signature
+        supported = False
+    if not supported:
+        return predict_adapter(adapter, [image], score_threshold)[0], None
+    return adapter.predict(
+        [image], score_threshold=score_threshold, with_keypoints=True)[0]
 
 
 def predict_one(
@@ -151,11 +192,19 @@ def predict_one_raw(
     """Run one image directly through the raw ``adapter`` (no pipeline).
 
     Takes the same optional ``timings`` dict as :func:`predict_one`.
+
+    A pose arch's joints come back on the boxes here (see
+    :func:`_predict_with_keypoints`), which is the whole reason a raw bundle of
+    one can be rendered as a skeleton. Only this entry point: the pipeline path
+    tiles and crops and merges, and a keypoint array remapped through all of
+    that is a question nobody has needed answered — a pose model runs whole-frame
+    ``raw`` because that is what it is for.
     """
     with _stage(timings, "load_ms", device):
         image = _load_image_tensor(image_path, device)
     with _stage(timings, "infer_ms", device):
-        predictions = predict_adapter(adapter, [image], score_threshold)[0]
+        predictions, keypoints = _predict_with_keypoints(
+            adapter, image, score_threshold)
     with _stage(timings, "format_ms", device):
-        boxes = _to_box_dicts(predictions, info.get("train_classes"))
+        boxes = _to_box_dicts(predictions, info.get("train_classes"), keypoints)
     return boxes

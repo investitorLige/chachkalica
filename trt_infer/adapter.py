@@ -31,7 +31,7 @@ import numpy as np
 
 from onnx_infer.arch import get_handler
 from onnx_infer.meta import ModelMeta
-from onnx_infer.postprocess import to_friendy
+from onnx_infer.postprocess import keypoints_to_normalized, to_friendy
 
 from .session import TrtModel
 
@@ -52,7 +52,8 @@ class TrtAdapter:
     def eval(self) -> "TrtAdapter":  # parity with nn.Module-style adapters
         return self
 
-    def predict(self, images, score_threshold: Optional[float] = None):
+    def predict(self, images, score_threshold: Optional[float] = None,
+                with_keypoints: bool = False):
         """List of CHW float [0,1] tensors -> list of Friendy ``(N,6)`` CPU tensors.
 
         Images whose preprocessed shape comes out identical (always true when
@@ -66,10 +67,17 @@ class TrtAdapter:
         never changes what each image sees.
 
         Everything up to the final ``.cpu()`` stays in device memory. The one
-        exception is an arch whose handler overrides ``adapt_outputs``: none do
-        today, and :func:`~trt_infer.postprocess_torch.adapt_outputs_torch`
-        declines rather than guessing, so such an arch takes the numpy path below
-        and is merely slow instead of wrong.
+        exception is an arch whose handler overrides ``adapt_outputs`` (rtmo,
+        whose graph emits a pose model's native output pair): the torch twin
+        :func:`~trt_infer.postprocess_torch.adapt_outputs_torch` declines rather
+        than guessing, so such an arch takes the numpy path below and is merely
+        slow instead of wrong.
+
+        ``with_keypoints`` changes what this returns: ``(friendy, keypoints)``
+        pairs instead of bare tensors, where ``keypoints`` is a ``[M,K,3]``
+        normalized array row-matched to ``friendy``, or ``None`` for an arch
+        with no joints. Opt-in, and never folded into the tensor, because every
+        other consumer of this adapter reshapes what it gets to six columns.
         """
         import torch
 
@@ -97,10 +105,10 @@ class TrtAdapter:
         for index, (_batched, transform) in enumerate(prepared):
             raw = raw_by_index[index]
             adapted = adapt_outputs_torch(self._handler, raw)
+            joints = None
             if adapted is None:
-                boxes, scores, labels = self._handler.adapt_outputs(
-                    [tensor.detach().cpu().numpy() for tensor in raw]
-                )
+                outputs = [tensor.detach().cpu().numpy() for tensor in raw]
+                boxes, scores, labels = self._handler.adapt_outputs(outputs)
                 friendy = torch.from_numpy(
                     to_friendy(
                         boxes, scores, labels, transform, threshold,
@@ -108,13 +116,21 @@ class TrtAdapter:
                         box_coords=self.meta.box_coords,
                     )
                 )
+                if with_keypoints:
+                    raw_joints = self._handler.adapt_keypoints(outputs)
+                    if raw_joints is not None:
+                        joints = keypoints_to_normalized(
+                            raw_joints, scores, transform, threshold,
+                            box_coords=self.meta.box_coords,
+                        )
             else:
                 friendy = to_friendy_torch(
                     *adapted, transform, threshold,
                     clip_boxes=self.meta.clip_boxes,
                     box_coords=self.meta.box_coords,
                 )
-            results.append(friendy.detach().cpu())
+            friendy = friendy.detach().cpu()
+            results.append((friendy, joints) if with_keypoints else friendy)
         return results
 
 
