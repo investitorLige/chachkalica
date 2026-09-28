@@ -1,7 +1,8 @@
 {% extends "admin/base_site.html" %}
 
 {% block content %}
-<p>Evaluate a model against <strong>{{ dataset.name }}</strong>&rsquo;s labels — mAP, precision,
+<p>Evaluate a model against {% if datasets|length > 1 %}the labels of <strong>{{ datasets|length }} test
+sets</strong> ({% for d in datasets %}{{ d.name }}{% if not forloop.last %}, {% endif %}{% endfor %}){% else %}<strong>{{ dataset.name }}</strong>&rsquo;s labels{% endif %} — mAP, precision,
 recall and the confusion matrix, scored exactly as the Models tab scores a checkpoint.</p>
 <p class="help">First, pick where the model comes from — the next page shows the matching
 model list plus the pipeline the images are run through. All three are evaluable, which is

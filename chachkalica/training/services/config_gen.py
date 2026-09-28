@@ -265,7 +265,12 @@ def build_experiment_dict(experiment: Experiment, output_dir: Path | str) -> dic
     """Assemble the full friendy_chachkalica experiment dict.
 
     Raises ``ValueError`` if the roster is invalid (no train dataset, more than
-    one val/test, or no models) — surfaced by the admin action.
+    one val, or no models) — surfaced by the admin action.
+
+    Several test datasets are allowed, but friendy_chachkalica's in-run test
+    pass takes one, so the first (in the order the rows were added) goes to it.
+    Every one of them gets the full post-training eval regardless — see
+    ``autoeval.schedule_test_evals``, which is where they are compared.
     """
     rows = list(experiment.datasets.all())
     train = [dataset_entry(r) for r in rows if r.role == ExperimentDataset.TRAIN]
@@ -276,8 +281,6 @@ def build_experiment_dict(experiment: Experiment, output_dir: Path | str) -> dic
         raise ValueError("Add at least one train dataset.")
     if len(vals) > 1:
         raise ValueError("At most one val dataset is allowed.")
-    if len(tests) > 1:
-        raise ValueError("At most one test dataset is allowed.")
 
     models = list(experiment.models.all())
     if not models:

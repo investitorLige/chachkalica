@@ -37,7 +37,7 @@ from fleet.services.paths import source_root
 from training import jobs
 from training.admin import _hard_image_path_from_request, _hard_image_token, _preview_index
 from training.models import EvalRun
-from training.services import config_gen, eval_analytics, runner, tag_analytics
+from training.services import config_gen, eval_analytics, runner, tag_analytics, test_sets
 
 from eval_pipelines.models import (
     BaseEval,
@@ -741,6 +741,9 @@ class CombinedEvalAdmin(EvalDisplayMixin, PromoteLabelsMixin, TagAnalyticsMixin,
             "query": urlencode({"kind": kind, "eval": eval_obj.pk}),
             "data_url": reverse("admin:eval_pipelines_combinedeval_tag_analytics_data"),
             "measure_url": reverse("admin:eval_pipelines_combinedeval_tag_measure"),
+            # Independent of this eval's own table: a set still running (or one
+            # that failed) should not hide how its siblings did.
+            "test_sets": test_sets.section(eval_obj, kind),
         }
         if loaded is not None:
             table, index, sources = loaded

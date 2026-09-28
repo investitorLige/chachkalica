@@ -2,7 +2,16 @@
 {% load static %}
 
 {% block content %}
+{% if datasets|length > 1 %}
+<p>Evaluate a model against <strong>{{ datasets|length }} test sets</strong>:
+{% for d in datasets %}<strong>{{ d.name }}</strong>{% if not forloop.last %}, {% endif %}{% endfor %}.</p>
+<p class="help">One eval per set, queued one after another. Each one&rsquo;s Tag analytics
+page gets a <em>Test sets</em> section comparing them side by side, plus all sets pooled.
+The class check and <em>Sliceable by</em> below describe <strong>{{ dataset.name }}</strong>;
+a class map applies to every set by class name.</p>
+{% else %}
 <p>Evaluate a model against <strong>{{ dataset.name }}</strong>&rsquo;s labels.</p>
+{% endif %}
 <p class="help">Queued like any other eval: it runs on the trainer and lands in
 <em>Eval Pipelines</em> (raw models under &ldquo;Base Eval&rdquo;, pipelined ones under their
 pipeline), where it can be compared against the checkpoint&rsquo;s own numbers, sliced by

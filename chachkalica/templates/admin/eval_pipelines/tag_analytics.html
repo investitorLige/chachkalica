@@ -103,6 +103,14 @@
   .tga table.card th.fixed { color: #8a8a8a; }
   .tga table.card th.fixed::after { content: " \00b7 fixed"; font-size: 10px; font-weight: 400; }
   .tga .sweep-busy { opacity: .45; transition: opacity .12s; }
+
+  /* ---- Test sets: the evals one request queued on several datasets ---- */
+  .tga table.sets tr.current td { background: #f4f7fb; }
+  .tga table.sets tr.summary td { border-top: 2px solid #ccc; font-weight: 600; }
+  .tga table.sets td.best { color: #147837; font-weight: 700; }
+  .tga table.sets td.worst { color: #c62828; font-weight: 700; }
+  .tga table.sets .evalref { color: #999; font-size: 11px; font-weight: 400; margin-left: 6px; }
+  .tga table.sets td.sub { font-weight: 400; color: #777; }
 </style>
 {% endblock %}
 
@@ -116,6 +124,7 @@
 
 {% if fatal %}
   <div class="banner">{{ fatal }}</div>
+  {% if test_sets %}{% include "admin/eval_pipelines/_test_sets.html" %}{% endif %}
 {% else %}
 
 <h2>Data sources</h2>
@@ -236,6 +245,8 @@
     <div class="tile"><div class="k">gt boxes</div><div class="v">{{ report.overall.gt }}</div></div>
   </div>
 </div>
+
+{% if test_sets %}{% include "admin/eval_pipelines/_test_sets.html" %}{% endif %}
 
 {% for breakdown in report.breakdowns %}
   <h3>{{ breakdown.label }}

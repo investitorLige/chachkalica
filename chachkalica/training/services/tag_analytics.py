@@ -2547,6 +2547,243 @@ def _reproduction_check(computed: dict, stored: dict | None) -> dict | None:
     return {"checks": checks, "worst": worst, "agrees": worst <= 1e-4}
 
 
+# --------------------------------------------------------------------------
+# Test sets: one model, several datasets
+# --------------------------------------------------------------------------
+#
+# An eval queued against several test datasets at once is several ordinary
+# evals sharing a ``test_group`` (see ``training.services.test_sets``), so each
+# set keeps its own page, hard images and comparison. What none of them can
+# show on its own is the spread between sets, and the number for all of them
+# together -- which is the same one-property argument as every slice on this
+# page, run the other way: matching is per image, so appending one set's rows
+# to another's changes no verdict, and the concatenation scores exactly as one
+# eval over the union would have.
+
+
+def pool_tables(tables: list[MatchTable]) -> tuple[MatchTable | None, str]:
+    """Concatenate several evals' match tables into one, or say why not.
+
+    Only for the frame metrics: the pooled table carries no prediction
+    geometry, so it has no people, and no tag index, so it has no slices. Its
+    image names are prefixed with the set's position, because two test sets can
+    both hold a ``000001.jpg``.
+
+    Refuses rather than approximates when the tables do not describe the same
+    scoring -- a different class space would add one set's class 3 to another
+    set's class 3, and a different operating confidence would make the pooled
+    precision a blend of two questions.
+    """
+    if not tables:
+        return None, "no test set has a match table yet"
+    first = tables[0]
+    for other in tables[1:]:
+        if other.classes != first.classes:
+            return None, ("the sets were scored in different class spaces, so their "
+                          "classes cannot be added together")
+        if list(other.iou_thresholds) != list(first.iou_thresholds):
+            return None, "the sets were scored at different IoU thresholds"
+        if other.score_threshold != first.score_threshold:
+            return None, ("the sets were scored at different operating confidences "
+                          f"({first.score_threshold:g} vs {other.score_threshold:g})")
+
+    images, gt_parts, pred_parts, op_parts = [], [], [], []
+    image_offset = gt_offset = 0
+    for position, table in enumerate(tables):
+        images.extend(f"{position}/{name}" for name in table.images)
+        gt_parts.append((table.gt_image + image_offset, table.gt_class, table.gt_row,
+                         table.gt_w, table.gt_h))
+        for parts, columns in (
+            (pred_parts, (table.pred_image, table.pred_class, table.pred_score,
+                          table.pred_iou, table.pred_gt)),
+            (op_parts, (table.op_image, table.op_class, table.op_score,
+                        table.op_iou, table.op_gt)),
+        ):
+            image, klass, score, iou, gt = columns
+            # -1 is "matched nothing" and has to stay that, not become a real row.
+            parts.append((image + image_offset, klass, score, iou,
+                          np.where(gt >= 0, gt + gt_offset, gt)))
+        image_offset += table.num_images
+        gt_offset += table.num_gt
+
+    def _joined(parts):
+        columns = [np.concatenate(column) for column in zip(*parts)]
+        # Each part is already in descending-score order; a stable sort over
+        # the concatenation keeps ties in set order, which is the order a
+        # single eval over the sets laid end to end would have met them in.
+        order = _stable_score_order(columns[2])
+        return [column[order] for column in columns]
+
+    pred_image, pred_class, pred_score, pred_iou, pred_gt = _joined(pred_parts)
+    operating_is_ap = all(table.operating_is_ap for table in tables)
+    if operating_is_ap:
+        op_image, op_class, op_score, op_iou, op_gt = (
+            pred_image, pred_class, pred_score, pred_iou, pred_gt)
+    else:
+        op_image, op_class, op_score, op_iou, op_gt = _joined(op_parts)
+    gt_image, gt_class, gt_row, gt_w, gt_h = (np.concatenate(column)
+                                              for column in zip(*gt_parts))
+
+    return MatchTable(
+        path=first.path,
+        version=min(table.version for table in tables),
+        iou_thresholds=list(first.iou_thresholds),
+        score_threshold=first.score_threshold,
+        # The pooled table only holds every set's rows above the highest floor.
+        score_floor=max(table.score_floor for table in tables),
+        backfilled=any(table.backfilled for table in tables),
+        classes=dict(first.classes),
+        images=images,
+        gt_image=gt_image, gt_class=gt_class, gt_row=gt_row, gt_w=gt_w, gt_h=gt_h,
+        pred_image=pred_image, pred_class=pred_class, pred_score=pred_score,
+        pred_iou=pred_iou, pred_gt=pred_gt,
+        op_image=op_image, op_class=op_class, op_score=op_score,
+        op_iou=op_iou, op_gt=op_gt,
+        operating_is_ap=operating_is_ap,
+        op_geom_row=np.zeros(0, dtype=np.int64),
+        op_geom_box=np.zeros((0, 4), dtype=np.float64),
+        geom_cut=0.0,
+    ), ""
+
+
+#: The per-set table's columns, in the order the page prints them.
+TEST_SET_METRICS = [
+    ("map50", "mAP50"),
+    ("map50_95", "mAP50-95"),
+    ("precision", "precision"),
+    ("recall", "recall"),
+    ("f1", "F1"),
+]
+
+
+def _whole(table: MatchTable) -> dict:
+    return image_slice_metrics(table, np.ones(table.num_images, dtype=bool))
+
+
+def test_set_breakdown(entries: list[dict]) -> dict:
+    """Every test set's headline metrics side by side, plus all of them pooled.
+
+    ``entries`` is one dict per set: ``label`` (the dataset), ``table`` (its
+    :class:`MatchTable`, or None while it is still running or never wrote one)
+    and ``problem`` (why there is no table). Everything else on an entry --
+    links, status, which one is the current page -- rides through untouched.
+
+    Every set's row is scored from its table by the same function the pooled row
+    is, not read off the eval's stored metrics, so the rows and the pool add up
+    by construction; each eval's own page already checks that function against
+    the trainer's numbers.
+
+    Two summaries, because they answer different questions: **pooled** is the
+    model over every image of every set (a set twice the size counts twice),
+    **mean of sets** weighs each set once (a small, hard set is not drowned out).
+    A gap between them is itself worth reading.
+    """
+    rows, scored = [], []
+    for entry in entries:
+        table = entry.get("table")
+        row = {key: value for key, value in entry.items() if key != "table"}
+        if table is None:
+            row["metrics"] = None
+        else:
+            row["metrics"] = _whole(table)
+            scored.append((row, table))
+        rows.append(row)
+
+    # Best/worst per metric across the sets, marked rather than colour-ramped:
+    # with two to five rows a ramp says nothing a marker doesn't.
+    for key, _label in TEST_SET_METRICS:
+        values = [row["metrics"][key] for row, _table in scored
+                  if not (key.startswith("map") and not row["metrics"]["gt"])]
+        if len(values) < 2 or len(set(values)) < 2:
+            continue
+        for row, _table in scored:
+            value = row["metrics"][key]
+            row.setdefault("best", {})[key] = value == max(values)
+            row.setdefault("worst", {})[key] = value == min(values)
+
+    pooled, pooled_problem = None, ""
+    if len(scored) >= 2:
+        table, pooled_problem = pool_tables([table for _row, table in scored])
+        if table is not None:
+            pooled = _whole(table)
+    elif len(entries) >= 2:
+        pooled_problem = "fewer than two sets have results yet"
+    if pooled is not None and len(scored) < len(entries):
+        pooled_problem = (f"only {len(scored)} of {len(entries)} sets have results, so "
+                          "this pools those alone")
+
+    mean = None
+    if len(scored) >= 2:
+        # Sets with no ground truth have an undefined mAP rather than a zero one
+        # (see image_slice_metrics), so they sit the mAP means out.
+        mean = {}
+        for key, _label in TEST_SET_METRICS:
+            values = [row["metrics"][key] for row, _table in scored
+                      if not (key.startswith("map") and not row["metrics"]["gt"])]
+            mean[key] = _mean(values) if values else None
+        for key in ("images", "gt", "predictions"):
+            mean[key] = sum(row["metrics"][key] for row, _table in scored)
+
+    # Per class: AP50 and recall per set, keyed by class *name* so a set whose
+    # table numbers classes differently still lines up (pool_tables refuses those;
+    # this grid does not have to).
+    names: list[str] = []
+    for row, _table in scored:
+        for entry in row["metrics"]["per_class"]:
+            if entry["class_name"] not in names:
+                names.append(entry["class_name"])
+    per_class = []
+    for name in names:
+        cells = []
+        for row, _table in scored:
+            match = next((c for c in row["metrics"]["per_class"]
+                          if c["class_name"] == name), None)
+            cells.append(None if match is None else {
+                "ap50": match["ap50"] if match["gt"] else None,
+                "recall": match["recall"] if match["gt"] else None,
+                "gt": match["gt"],
+            })
+        pooled_cell = None
+        if pooled is not None:
+            match = next((c for c in pooled["per_class"] if c["class_name"] == name), None)
+            if match is not None:
+                pooled_cell = {"ap50": match["ap50"] if match["gt"] else None,
+                               "recall": match["recall"] if match["gt"] else None,
+                               "gt": match["gt"]}
+        per_class.append({"class_name": name, "cells": cells, "pooled": pooled_cell})
+
+    # Flattened to one list of cells per row so the template walks columns
+    # instead of looking keys up in a dict, which Django templates cannot do.
+    def _cells(metrics, marked=None):
+        cells = []
+        for key, _label in TEST_SET_METRICS:
+            undefined = key.startswith("map") and metrics.get("gt") == 0
+            cells.append({
+                "value": None if undefined else metrics.get(key),
+                "undefined": undefined,
+                "best": bool(marked and marked.get("best", {}).get(key)),
+                "worst": bool(marked and marked.get("worst", {}).get(key)),
+            })
+        return cells
+
+    for row in rows:
+        if row["metrics"] is not None:
+            row["cells"] = _cells(row["metrics"], row)
+
+    return {
+        "rows": rows,
+        "scored": len(scored),
+        "pooled_cells": _cells(pooled) if pooled is not None else None,
+        "mean_cells": _cells(mean) if mean is not None else None,
+        "pooled": pooled,
+        "pooled_problem": pooled_problem,
+        "mean": mean,
+        "per_class": per_class,
+        "per_class_columns": [row["label"] for row, _table in scored],
+        "metrics": TEST_SET_METRICS,
+    }
+
+
 #: How each population is named where a heading has to name it.
 KIND_LABELS = {
     "frame": "Frame tags",

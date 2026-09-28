@@ -31,12 +31,14 @@ only that pipeline's fields are shown.</p>
   <input type="hidden" name="apply" value="1">
 
   <div class="form-row">
-    <label for="dataset">Dataset:</label>
-    <select name="dataset" id="dataset" required>
-      <option value="">— select a dataset —</option>
+    <label for="dataset">Test dataset(s):</label>
+    <select name="dataset" id="dataset" required multiple size="8">
       {% for d in datasets %}<option value="{{ d.pk }}">{{ d.name }}</option>{% endfor %}
     </select>
-    <p class="help">The dataset whose labels the model's predictions are scored against.</p>
+    <p class="help">The dataset(s) whose labels the model's predictions are scored against.
+    Ctrl/Cmd-click to pick several: each becomes its own eval, and their Tag analytics
+    pages gain a <em>Test sets</em> section comparing them (plus all sets pooled). The
+    <em>Sliceable by</em> panel below describes the first one picked.</p>
   </div>
 
   <div class="form-row">

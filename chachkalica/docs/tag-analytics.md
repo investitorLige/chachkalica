@@ -251,6 +251,33 @@ it.
 A free-text tag keeps only its most common answers as groups — a tag with one
 distinct value per image is not a grouping.
 
+## Test sets
+
+Every way of queuing an eval takes several test datasets: Models → *Evaluate…*
+(multi-select), Datasets → *Evaluate a model on these datasets…* (select
+several rows), and an experiment with more than one `test` dataset (each
+trained model is evaluated on all of them after training; the trainer's own
+in-run test pass still takes only the first). Each dataset becomes an ordinary
+eval of its own — its own page, hard images, compare, promote — and the evals
+of one request share a `test_group`.
+
+The page of any eval in a group gets a **Test sets** section: every set's
+mAP50, mAP50-95, precision, recall and F1 side by side (best and worst per
+column marked), then two summaries:
+
+- **All sets pooled** — the sets' match tables concatenated and scored as one
+  eval over the union would be. Same property as every slice here, run the
+  other way: matching is per image, so appending one set's rows to another's
+  changes no verdict. Checked on real evals (5,040 images, 700k predictions)
+  split into two sets and pooled back: identical to the last bit. Refused when
+  the sets were scored in different class spaces or at different operating
+  confidences, rather than blended.
+- **Mean of sets** — each set weighed once, so a small hard set is not drowned
+  out by a big easy one. A gap between the two rows is itself worth reading.
+
+Below, a per-class grid (AP50 · recall · gt boxes per set). A set still
+running, errored or without a match table stays a row saying so.
+
 ## Getting the data
 
 One file is required; the page names anything else that is missing and says

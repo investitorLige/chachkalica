@@ -309,8 +309,10 @@ class Experiment(models.Model):
 class ExperimentDataset(models.Model):
     """One dataset assigned a role in an experiment (a YAML dataset entry).
 
-    ``train`` may repeat (it is friendy_chachkalica's comparison axis); ``val`` and
-    ``test`` are at most one each. ``label_source`` picks which on-disk labels
+    ``train`` may repeat (it is friendy_chachkalica's comparison axis); ``val``
+    is at most one. ``test`` may repeat too: every test dataset gets its own
+    post-training eval, grouped so Tag analytics compares them (see
+    ``training.services.test_sets``). ``label_source`` picks which on-disk labels
     folder feeds this dataset for this run.
     """
 
@@ -866,6 +868,11 @@ class EvaluatedModelSource(models.Model):
     # after the catalogue entry, artifact or bundle behind it is gone — and so a
     # changelist of artifact evals is readable without resolving paths.
     model_label_snapshot = models.CharField(max_length=512, blank=True)
+    # Shared by the evals one request queued against several test datasets at
+    # once -- one row per dataset, so each stays an ordinary eval, and this is
+    # what lets Tag analytics put them side by side. Null for a lone eval. See
+    # training.services.test_sets.
+    test_group = models.UUIDField(null=True, blank=True, editable=False, db_index=True)
 
     class Meta:
         abstract = True

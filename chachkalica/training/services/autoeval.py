@@ -4,7 +4,9 @@ Mirrors the manual "promote to registry → evaluate on a dataset" admin flow, b
 runs it automatically once a training run finishes: every trained
 :class:`~training.models.RunResult` that produced a checkpoint is promoted to a
 :class:`~training.models.TrainedModel` and then evaluated against the
-experiment's test dataset via a standalone :class:`~training.models.EvalRun`.
+experiment's test dataset(s) via a standalone :class:`~training.models.EvalRun`
+per (model, test dataset). With several test datasets, one model's evals share
+a ``test_group`` so its Tag analytics pages compare the sets.
 
 No-op when the experiment has no test dataset. Called from
 ``training.jobs.run_training`` after results are ingested; it enqueues the eval
@@ -20,7 +22,7 @@ used to have its evals race each other for that single slot.
 import django_rq
 
 from training.models import EvalRun, ExperimentDataset
-from training.services import config_gen, pipeline_meta, promote
+from training.services import config_gen, pipeline_meta, promote, test_sets
 
 
 def _queue():
@@ -41,12 +43,12 @@ def schedule_test_evals(run) -> list[int]:
     experiment = run.experiment
     if experiment is None:
         return []
-    test_ds = experiment.datasets.filter(role=ExperimentDataset.TEST).first()
-    if test_ds is None:
+    tests = list(experiment.datasets.filter(role=ExperimentDataset.TEST))
+    if not tests:
         return []
 
     if experiment.pipeline:
-        return _schedule_pipeline_evals(run, experiment, test_ds)
+        return _schedule_pipeline_evals(run, experiment, tests)
 
     # Local import: training.jobs imports this module at load time, so importing
     # it back at module level here would be circular.
@@ -59,27 +61,30 @@ def schedule_test_evals(run) -> list[int]:
         if not (rr.best_checkpoint or rr.last_checkpoint):
             continue  # a model that failed to train has no checkpoint to eval
         trained_model = promote.promote_run_result(rr)
-        eval_run = EvalRun.objects.create(
-            trained_model=trained_model,
-            dataset=test_ds.dataset,
-            label_source=test_ds.label_source,
-            annotator=test_ds.annotator,
-            explicit_labels_path=test_ds.explicit_labels_path,
-        )
-        try:
-            config_gen.write_eval_request(eval_run)
-        except (ValueError, FileNotFoundError, RuntimeError) as exc:
-            eval_run.status = EvalRun.ERROR
-            eval_run.last_error = f"could not build eval request: {exc}"
-            eval_run.save(update_fields=["status", "last_error"])
-            continue
-        prev_job = queue.enqueue(
-            "training.jobs.run_eval", eval_run.pk,
-            depends_on=depends_on(prev_job), job_timeout=JOB_TIMEOUT,
-        )
-        eval_run.status = EvalRun.QUEUED
-        eval_run.save(update_fields=["status"])
-        queued.append(eval_run.pk)
+        group = test_sets.new_group(len(tests))
+        for test_ds in tests:
+            eval_run = EvalRun.objects.create(
+                trained_model=trained_model,
+                dataset=test_ds.dataset,
+                label_source=test_ds.label_source,
+                annotator=test_ds.annotator,
+                explicit_labels_path=test_ds.explicit_labels_path,
+                test_group=group,
+            )
+            try:
+                config_gen.write_eval_request(eval_run)
+            except (ValueError, FileNotFoundError, RuntimeError) as exc:
+                eval_run.status = EvalRun.ERROR
+                eval_run.last_error = f"could not build eval request: {exc}"
+                eval_run.save(update_fields=["status", "last_error"])
+                continue
+            prev_job = queue.enqueue(
+                "training.jobs.run_eval", eval_run.pk,
+                depends_on=depends_on(prev_job), job_timeout=JOB_TIMEOUT,
+            )
+            eval_run.status = EvalRun.QUEUED
+            eval_run.save(update_fields=["status"])
+            queued.append(eval_run.pk)
     return queued
 
 
@@ -119,7 +124,7 @@ def _pipeline_geometry(trained_model, pipeline: str) -> dict:
     return fields
 
 
-def _schedule_pipeline_evals(run, experiment, test_ds) -> list[int]:
+def _schedule_pipeline_evals(run, experiment, tests) -> list[int]:
     """Enqueue a :class:`PipelineEvalRun` per trained model, using the
     experiment's saved pipeline config, so test results appear in the "Eval
     Pipelines" tab under the pipeline chosen on the experiment."""
@@ -137,26 +142,30 @@ def _schedule_pipeline_evals(run, experiment, test_ds) -> list[int]:
         if not (rr.best_checkpoint or rr.last_checkpoint):
             continue  # a model that failed to train has no checkpoint to eval
         trained_model = promote.promote_run_result(rr)
-        pe = PipelineEvalRun.objects.create(
-            trained_model=trained_model,
-            dataset=test_ds.dataset,
-            label_source=test_ds.label_source,
-            annotator=test_ds.annotator,
-            explicit_labels_path=test_ds.explicit_labels_path,
-            **_pipeline_geometry(trained_model, experiment.pipeline),
-        )
-        try:
-            config_gen.write_pipeline_request(pe)
-        except (ValueError, FileNotFoundError, RuntimeError) as exc:
-            pe.status = PipelineEvalRun.ERROR
-            pe.last_error = f"could not build pipeline request: {exc}"
-            pe.save(update_fields=["status", "last_error"])
-            continue
-        prev_job = queue.enqueue(
-            "training.jobs.run_pipeline_eval", pe.pk,
-            depends_on=depends_on(prev_job), job_timeout=JOB_TIMEOUT,
-        )
-        pe.status = PipelineEvalRun.QUEUED
-        pe.save(update_fields=["status"])
-        queued.append(pe.pk)
+        geometry = _pipeline_geometry(trained_model, experiment.pipeline)
+        group = test_sets.new_group(len(tests))
+        for test_ds in tests:
+            pe = PipelineEvalRun.objects.create(
+                trained_model=trained_model,
+                dataset=test_ds.dataset,
+                label_source=test_ds.label_source,
+                annotator=test_ds.annotator,
+                explicit_labels_path=test_ds.explicit_labels_path,
+                test_group=group,
+                **geometry,
+            )
+            try:
+                config_gen.write_pipeline_request(pe)
+            except (ValueError, FileNotFoundError, RuntimeError) as exc:
+                pe.status = PipelineEvalRun.ERROR
+                pe.last_error = f"could not build pipeline request: {exc}"
+                pe.save(update_fields=["status", "last_error"])
+                continue
+            prev_job = queue.enqueue(
+                "training.jobs.run_pipeline_eval", pe.pk,
+                depends_on=depends_on(prev_job), job_timeout=JOB_TIMEOUT,
+            )
+            pe.status = PipelineEvalRun.QUEUED
+            pe.save(update_fields=["status"])
+            queued.append(pe.pk)
     return queued

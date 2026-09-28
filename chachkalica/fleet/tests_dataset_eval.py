@@ -148,6 +148,58 @@ class DatasetEvalActionTests(TestCase):
         self.assertEqual(response.redirect_chain[-1][0].split("?")[0],
                          reverse("admin:eval_pipelines_combinedeval_changelist"))
 
+    def _second_dataset(self, classes="helmet\nvest\n"):
+        other = self.src / "ds-night"
+        other.mkdir()
+        (other / "classes.txt").write_text(classes, encoding="utf-8")
+        (other / "labels").mkdir()
+        cv2.imwrite(str(other / "img0.jpg"), np.full((32, 48, 3), 30, dtype=np.uint8))
+        return Dataset.objects.create(name="ds-night")
+
+    def test_several_datasets_are_several_grouped_evals(self):
+        night = self._second_dataset()
+        with mock.patch("fleet.admin._queue") as queue:
+            self._post(**{
+                ACTION_CHECKBOX_NAME: [str(self.dataset.pk), str(night.pk)],
+                "model_source": EvalRun.TRAINED, "apply": "1",
+                "trained_model": str(self.model.pk), "pipeline": "raw",
+            })
+
+        rows = list(EvalRun.objects.order_by("dataset__name"))
+        self.assertEqual([r.dataset.name for r in rows], ["ds", "ds-night"])
+        self.assertIsNotNone(rows[0].test_group)
+        self.assertEqual(rows[0].test_group, rows[1].test_group)
+        self.assertTrue(all(r.status == EvalRun.QUEUED for r in rows))
+        self.assertEqual(queue.return_value.enqueue.call_count, 2)
+
+    def test_a_class_map_applies_to_each_set_by_class_name(self):
+        night = self._second_dataset(classes="helmet\nperson\n")
+        with mock.patch("fleet.admin._queue"):
+            self._post(**{
+                ACTION_CHECKBOX_NAME: [str(self.dataset.pk), str(night.pk)],
+                "model_source": EvalRun.TRAINED, "apply": "1",
+                "trained_model": str(self.model.pk), "pipeline": "raw",
+                "class_map__helmet": "hardhat", "class_map__vest": "",
+            })
+
+        maps = {r.dataset.name: r.class_map for r in EvalRun.objects.all()}
+        self.assertEqual(maps["ds"], {"helmet": "hardhat", "vest": None})
+        self.assertEqual(maps["ds-night"], {"helmet": "hardhat"})
+
+    def test_one_set_with_no_labels_refuses_the_whole_request(self):
+        night = self._second_dataset()
+        (self.src / "ds-night" / "labels").rmdir()
+        with mock.patch("fleet.admin._queue") as queue:
+            response = self._post(**{
+                ACTION_CHECKBOX_NAME: [str(self.dataset.pk), str(night.pk)],
+                "model_source": EvalRun.TRAINED, "apply": "1",
+                "trained_model": str(self.model.pk), "pipeline": "raw",
+            })
+
+        self.assertFalse(EvalRun.objects.exists())
+        queue.return_value.enqueue.assert_not_called()
+        self.assertContains(response, "ds-night")
+
     def test_an_exported_artifact_is_evaluated_as_itself(self):
         relpath = self._artifact()
         with mock.patch("fleet.admin._queue"):

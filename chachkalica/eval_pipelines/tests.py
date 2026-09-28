@@ -672,3 +672,159 @@ class TagCompareTests(PipelineEvalSetup):
         payload = self._get([bare], tag="auto:crowding")
 
         self.assertIn("error", payload)
+
+
+class TestSetsTests(PipelineEvalSetup):
+    """Several test datasets in one request: grouped evals, compared on the page."""
+
+    def setUp(self):
+        super().setUp()
+        _make_dataset_on_disk(self.source, "ds2", ["helmet", "head", "vest"])
+        self.ds2 = Dataset.objects.create(name="ds2")
+
+    def _eval(self, dataset, group, table=None, status=EvalRun.OK):
+        output_dir = self.source.parent / f"eval-{dataset.name}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if table is not None:
+            (output_dir / "eval_matches.json").write_text(json.dumps(table), encoding="utf-8")
+        return EvalRun.objects.create(
+            trained_model=self.tm, dataset=dataset, label_source=EvalRun.SOURCE,
+            output_dir=str(output_dir), status=status, test_group=group,
+        )
+
+    def _page(self, er):
+        admin = CombinedEvalAdmin(CombinedEval, AdminSite())
+        request = RequestFactory().get("/", {"kind": CombinedEval.BASE, "eval": er.pk})
+        request.user = mock.Mock(is_active=True, is_staff=True)
+        response = admin.tag_analytics_view(request)
+        response.render()
+        return response
+
+    def test_a_grouped_eval_page_compares_every_set_and_pools_them(self):
+        import uuid
+        group = uuid.uuid4()
+        first = self._eval(self.ds1, group, _MATCH_TABLE)
+        self._eval(self.ds2, group, {**_MATCH_TABLE, "pred": {
+            "image": [0, 1], "class": [0, 0], "score": [0.9, 0.8],
+            "iou": [0.9, 0.9], "gt": [0, 1]}})
+
+        response = self._page(first)
+
+        sets = response.context_data["test_sets"]
+        self.assertEqual([row["label"] for row in sets["rows"]], ["ds1", "ds2"])
+        self.assertTrue(sets["rows"][0]["current"])
+        self.assertAlmostEqual(sets["rows"][0]["metrics"]["recall"], 0.5)
+        self.assertAlmostEqual(sets["rows"][1]["metrics"]["recall"], 1.0)
+        self.assertAlmostEqual(sets["pooled"]["recall"], 0.75)
+        self.assertIn(b"All sets pooled", response.content)
+
+    def test_a_set_still_running_is_a_row_saying_so_not_a_missing_one(self):
+        import uuid
+        group = uuid.uuid4()
+        first = self._eval(self.ds1, group, _MATCH_TABLE)
+        self._eval(self.ds2, group, status=EvalRun.RUNNING)
+
+        sets = self._page(first).context_data["test_sets"]
+
+        self.assertEqual(sets["rows"][1]["problem"], "eval is running")
+        self.assertIsNone(sets["pooled"])
+
+    def test_a_lone_eval_has_no_test_sets_section(self):
+        er = self._eval(self.ds1, None, _MATCH_TABLE)
+
+        response = self._page(er)
+
+        self.assertIsNone(response.context_data["test_sets"])
+        self.assertNotIn(b"<h2>Test sets</h2>", response.content)
+
+    def test_the_model_side_form_queues_one_grouped_eval_per_dataset(self):
+        from training.admin import TrainedModelAdmin
+
+        admin = TrainedModelAdmin(TrainedModel, AdminSite())
+        request = RequestFactory().post("/", {
+            "apply": "1", "dataset": [str(self.ds2.pk), str(self.ds1.pk)],
+            "label_source": EvalRun.SOURCE,
+        })
+        with mock.patch("training.admin._queue") as queue, \
+                mock.patch.object(config_gen, "write_eval_request"), \
+                mock.patch.object(admin, "message_user") as message:
+            admin.evaluate(request, TrainedModel.objects.filter(pk=self.tm.pk))
+
+        rows = list(EvalRun.objects.order_by("dataset__name"))
+        self.assertEqual([r.dataset.name for r in rows], ["ds1", "ds2"])
+        self.assertIsNotNone(rows[0].test_group)
+        self.assertEqual(rows[0].test_group, rows[1].test_group)
+        self.assertEqual(queue.return_value.enqueue.call_count, 2)
+        self.assertIn("compares the test sets", message.call_args.args[1])
+
+    def test_one_dataset_that_cannot_be_evaluated_refuses_the_whole_request(self):
+        from training.admin import TrainedModelAdmin
+
+        admin = TrainedModelAdmin(TrainedModel, AdminSite())
+        request = RequestFactory().post("/", {
+            "apply": "1", "dataset": [str(self.ds1.pk), str(self.ds2.pk)],
+            "label_source": EvalRun.SOURCE,
+        })
+
+        def _write(row):
+            if row.dataset == self.ds2:
+                raise ValueError("no labels")
+
+        with mock.patch("training.admin._queue") as queue, \
+                mock.patch.object(config_gen, "write_eval_request", side_effect=_write), \
+                mock.patch.object(admin, "message_user"):
+            admin.evaluate(request, TrainedModel.objects.filter(pk=self.tm.pk))
+
+        self.assertFalse(EvalRun.objects.exists())
+        queue.return_value.enqueue.assert_not_called()
+
+    def test_a_single_dataset_eval_stays_ungrouped(self):
+        from training.admin import TrainedModelAdmin
+
+        admin = TrainedModelAdmin(TrainedModel, AdminSite())
+        request = RequestFactory().post("/", {
+            "apply": "1", "dataset": str(self.ds1.pk), "label_source": EvalRun.SOURCE})
+        with mock.patch("training.admin._queue"), \
+                mock.patch.object(config_gen, "write_eval_request"), \
+                mock.patch.object(admin, "message_user"):
+            admin.evaluate(request, TrainedModel.objects.filter(pk=self.tm.pk))
+
+        self.assertIsNone(EvalRun.objects.get().test_group)
+
+    def test_an_experiment_with_two_test_sets_evaluates_each_model_on_both(self):
+        exp = Experiment.objects.create(name="exp2")
+        for dataset in (self.ds1, self.ds2):
+            ExperimentDataset.objects.create(
+                experiment=exp, dataset=dataset, role=ExperimentDataset.TEST)
+        run = TrainingRun.objects.create(experiment=exp)
+        for index in range(2):
+            RunResult.objects.create(
+                run=run, run_name=f"0{index}-x-retinanet", model_arch="retinanet",
+                train_dataset_name="x", best_checkpoint=f"/tmp/best{index}.pt")
+
+        with mock.patch.object(autoeval, "_queue") as queue, \
+                mock.patch.object(autoeval.config_gen, "write_eval_request"):
+            queued = autoeval.schedule_test_evals(run)
+
+        self.assertEqual(len(queued), 4)
+        rows = EvalRun.objects.filter(pk__in=queued)
+        # One group per model, each holding both sets.
+        groups = {}
+        for row in rows:
+            groups.setdefault(row.test_group, set()).add(row.dataset.name)
+        self.assertEqual(list(groups.values()), [{"ds1", "ds2"}, {"ds1", "ds2"}])
+        self.assertEqual(queue.return_value.enqueue.call_count, 4)
+
+    def test_an_experiment_may_carry_several_test_sets(self):
+        exp = Experiment.objects.create(name="exp3")
+        ExperimentDataset.objects.create(experiment=exp, dataset=self.ds1,
+                                         role=ExperimentDataset.TRAIN)
+        for dataset in (self.ds1, self.ds2):
+            ExperimentDataset.objects.create(
+                experiment=exp, dataset=dataset, role=ExperimentDataset.TEST)
+        exp.models.create(arch="retinanet")
+
+        data = config_gen.build_experiment_dict(exp, "/tmp/out")
+
+        # The trainer's in-run test pass takes one; the post-training evals take all.
+        self.assertIn("ds1", json.dumps(data["datasets"]["test"]))

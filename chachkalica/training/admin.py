@@ -45,7 +45,7 @@ from training import model_specs, pipelines
 from training.forms import ExperimentModelForm
 from training.services import (
     buildnode, combine, config_gen, exports, extend, finetune, ingest, pipeline_meta, promote,
-    runner, teardown,
+    runner, teardown, test_sets,
 )
 
 
@@ -917,14 +917,26 @@ class TrainedModelAdmin(admin.ModelAdmin):
         extra_models = models[1:]
 
         if request.POST.get("apply"):
-            dataset = Dataset.objects.filter(pk=request.POST.get("dataset") or None).first()
-            if dataset is None:
+            # Several datasets may be picked: each becomes its own eval (so every
+            # per-eval page keeps working), grouped so Tag analytics can put the
+            # sets side by side -- see training.services.test_sets.
+            picked = [pk for pk in request.POST.getlist("dataset") if pk]
+            datasets = sorted(Dataset.objects.filter(pk__in=picked), key=lambda d: d.name)
+            if not datasets:
                 self.message_user(request, "Choose a dataset.", level=messages.WARNING)
                 return None
             label_source = request.POST.get("label_source") or EvalRun.SOURCE
             annotator = Annotator.objects.filter(pk=request.POST.get("annotator") or None).first()
             explicit = request.POST.get("explicit_labels_path", "")
+            if len(datasets) > 1 and label_source == EvalRun.EXPLICIT:
+                self.message_user(
+                    request,
+                    "An explicit labels path is one dataset's labels — pick a single "
+                    "dataset for it, or use source labels / annotator output for several.",
+                    level=messages.WARNING)
+                return None
             pipeline = (request.POST.get("pipeline") or "").strip()
+            group = test_sets.new_group(len(datasets))
 
             def _threshold(name, default):
                 raw = (request.POST.get(name) or "").strip()
@@ -941,72 +953,90 @@ class TrainedModelAdmin(admin.ModelAdmin):
 
             if not pipeline:
                 # No pipeline chosen — a plain EvalRun (the old "evaluate on a dataset").
-                eval_run = EvalRun.objects.create(
-                    trained_model=model, dataset=dataset, label_source=label_source,
-                    annotator=annotator, explicit_labels_path=explicit,
-                    map_score_threshold=_map_score_threshold(),
-                    score_threshold=_score_threshold(),
-                )
-                if extra_models:
-                    eval_run.combined_models.set(extra_models)
+                def _create(dataset):
+                    eval_run = EvalRun.objects.create(
+                        trained_model=model, dataset=dataset, label_source=label_source,
+                        annotator=annotator, explicit_labels_path=explicit,
+                        map_score_threshold=_map_score_threshold(),
+                        score_threshold=_score_threshold(),
+                        test_group=group,
+                    )
+                    if extra_models:
+                        eval_run.combined_models.set(extra_models)
+                    return eval_run
+
+                write, job, label = config_gen.write_eval_request, jobs.run_eval, "Eval"
+            else:
+                # A pipeline was chosen — a PipelineEvalRun.
+                def _float(name):
+                    raw = (request.POST.get(name) or "").strip()
+                    return float(raw) if raw else None
+
+                chain = [c.strip() for c in (request.POST.get("chain") or "").split(",")
+                         if c.strip()]
+                # Non-null field: fall back to the model default when the form omits
+                # it (a legitimate 0.0 must survive, so test for None explicitly).
+                expand_ratio = _float("detector_expand_ratio")
+                if expand_ratio is None:
+                    expand_ratio = PipelineEvalRun._meta.get_field(
+                        "detector_expand_ratio").get_default()
+
+                def _create(dataset):
+                    pe = PipelineEvalRun.objects.create(
+                        trained_model=model, dataset=dataset, label_source=label_source,
+                        annotator=annotator, explicit_labels_path=explicit,
+                        pipeline=pipeline,
+                        detector_checkpoint=(request.POST.get("detector_checkpoint") or "").strip(),
+                        detector_expand_ratio=expand_ratio,
+                        detector_min_box_size=_float("detector_min_box_size"),
+                        tile_size_px=_int_or_none(request.POST.get("tile_size_px")),
+                        tile_width_pct=_float("tile_width_pct"),
+                        tile_height_pct=_float("tile_height_pct"),
+                        overlap=_float("overlap"),
+                        merge_nms_iou=_float("merge_nms_iou"),
+                        chain=chain,
+                        map_score_threshold=_map_score_threshold(),
+                        score_threshold=_score_threshold(),
+                        test_group=group,
+                    )
+                    if extra_models:
+                        pe.combined_models.set(extra_models)
+                    return pe
+
+                write, job = config_gen.write_pipeline_request, jobs.run_pipeline_eval
+                label = f"Pipeline eval ({pipeline})"
+
+            # All requests are written before anything is queued, so one dataset
+            # that cannot be evaluated refuses the whole request rather than
+            # leaving a half-queued group behind.
+            created = []
+            for dataset in datasets:
+                row = _create(dataset)
+                created.append(row)
                 try:
-                    config_gen.write_eval_request(eval_run)
+                    write(row)
                 except (ValueError, FileNotFoundError, RuntimeError) as exc:
-                    eval_run.delete()
-                    self.message_user(request, f"Cannot build eval request: {exc}",
-                                      level=messages.ERROR)
+                    for done in created:
+                        done.delete()
+                    self.message_user(
+                        request, f"Cannot build the eval request for {dataset.name}: {exc}",
+                        level=messages.ERROR)
                     return None
-                _queue().enqueue(jobs.run_eval, eval_run.pk, job_timeout=jobs.JOB_TIMEOUT)
-                eval_run.status = EvalRun.QUEUED
-                eval_run.save(update_fields=["status"])
-                self.message_user(
-                    request,
-                    f"Eval #{eval_run.pk} queued for {_models_title(models)} on {dataset.name}.")
-                return None
 
-            # A pipeline was chosen — a PipelineEvalRun.
-            def _float(name):
-                raw = (request.POST.get(name) or "").strip()
-                return float(raw) if raw else None
-
-            chain = [c.strip() for c in (request.POST.get("chain") or "").split(",") if c.strip()]
-            # Non-null field: fall back to the model default when the form omits it
-            # (a legitimate 0.0 must survive, so test for None explicitly).
-            expand_ratio = _float("detector_expand_ratio")
-            if expand_ratio is None:
-                expand_ratio = PipelineEvalRun._meta.get_field("detector_expand_ratio").get_default()
-            pe = PipelineEvalRun.objects.create(
-                trained_model=model, dataset=dataset, label_source=label_source,
-                annotator=annotator, explicit_labels_path=explicit,
-                pipeline=pipeline,
-                detector_checkpoint=(request.POST.get("detector_checkpoint") or "").strip(),
-                detector_expand_ratio=expand_ratio,
-                detector_min_box_size=_float("detector_min_box_size"),
-                tile_size_px=_int_or_none(request.POST.get("tile_size_px")),
-                tile_width_pct=_float("tile_width_pct"),
-                tile_height_pct=_float("tile_height_pct"),
-                overlap=_float("overlap"),
-                merge_nms_iou=_float("merge_nms_iou"),
-                chain=chain,
-                map_score_threshold=_map_score_threshold(),
-                score_threshold=_score_threshold(),
-            )
-            if extra_models:
-                pe.combined_models.set(extra_models)
-            try:
-                config_gen.write_pipeline_request(pe)
-            except (ValueError, FileNotFoundError, RuntimeError) as exc:
-                pe.delete()
-                self.message_user(request, f"Cannot build pipeline request: {exc}",
-                                  level=messages.ERROR)
-                return None
-            _queue().enqueue(jobs.run_pipeline_eval, pe.pk, job_timeout=jobs.JOB_TIMEOUT)
-            pe.status = PipelineEvalRun.QUEUED
-            pe.save(update_fields=["status"])
+            # Chained: the trainer runs one eval at a time (see jobs.depends_on).
+            prev_job = None
+            for row in created:
+                prev_job = _queue().enqueue(job, row.pk, depends_on=jobs.depends_on(prev_job),
+                                            job_timeout=jobs.JOB_TIMEOUT)
+                row.status = row.QUEUED
+                row.save(update_fields=["status"])
+            ids = ", ".join(f"#{row.pk}" for row in created)
+            names = ", ".join(d.name for d in datasets)
             self.message_user(
                 request,
-                f"Pipeline eval #{pe.pk} ({pipeline}) queued for "
-                f"{_models_title(models)} on {dataset.name}.")
+                f"{label} {ids} queued for {_models_title(models)} on {names}."
+                + (" Tag analytics on any of them compares the test sets."
+                   if group else ""))
             return None
 
         context = {

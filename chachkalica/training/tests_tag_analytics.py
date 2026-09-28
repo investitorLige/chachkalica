@@ -1414,3 +1414,169 @@ class ScorecardTests(TagAnalyticsSetup):
                 self.assertIsNone(row["metrics"]["precision"])
                 self.assertIsNone(row["metrics"]["map50"])
                 self.assertIsNotNone(row["metrics"]["recall"])
+
+
+def _random_table(rng, images: int, classes: int = 3, operating: bool = True) -> dict:
+    """A match table with every complication a real one has: several classes,
+    two IoU thresholds, unmatched predictions, tied scores and a suppressed
+    operating set that is a strict subset of the AP set."""
+    gt_image, gt_class = [], []
+    for image in range(images):
+        for _ in range(int(rng.integers(0, 4))):
+            gt_image.append(image)
+            gt_class.append(int(rng.integers(0, classes)))
+    pred = {"image": [], "class": [], "score": [], "iou": [], "gt": []}
+    for image in range(images):
+        own = [i for i, value in enumerate(gt_image) if value == image]
+        for _ in range(int(rng.integers(0, 5))):
+            klass = int(rng.integers(0, classes))
+            candidates = [i for i in own if gt_class[i] == klass]
+            pred["image"].append(image)
+            pred["class"].append(klass)
+            # Two decimals, so ties are common.
+            pred["score"].append(round(float(rng.uniform(0.01, 1.0)), 2))
+            if candidates and rng.uniform() < 0.8:
+                pred["gt"].append(int(rng.choice(candidates)))
+                pred["iou"].append(round(float(rng.uniform(0.3, 1.0)), 6))
+            else:
+                pred["gt"].append(-1)
+                pred["iou"].append(0.0)
+    keep = [i for i in range(len(pred["image"])) if i % 3 != 0]
+    table = {
+        "version": 1,
+        "iou_thresholds": [0.5, 0.75],
+        "score_threshold": 0.3,
+        "score_floor": 0.01,
+        "classes": {str(c): f"class{c}" for c in range(classes)},
+        "images": [f"img{i}.jpg" for i in range(images)],
+        "gt": {"image": gt_image, "class": gt_class, "row": [0] * len(gt_image)},
+        "pred": pred,
+        "pred_operating": ({key: [values[i] for i in keep] for key, values in pred.items()}
+                           if operating else None),
+    }
+    return table
+
+
+def _split(table: dict, cut: int) -> tuple[dict, dict]:
+    """Images ``[0, cut)`` and ``[cut, n)`` as two tables of their own, the way
+    two evals over two halves of the dataset would have written them."""
+    halves = []
+    for low, high in ((0, cut), (cut, len(table["images"]))):
+        gt_keep = [i for i, image in enumerate(table["gt"]["image"]) if low <= image < high]
+        gt_new = {old: new for new, old in enumerate(gt_keep)}
+
+        def _block(block):
+            if block is None:
+                return None
+            rows = [i for i, image in enumerate(block["image"]) if low <= image < high]
+            return {
+                "image": [block["image"][i] - low for i in rows],
+                "class": [block["class"][i] for i in rows],
+                "score": [block["score"][i] for i in rows],
+                "iou": [block["iou"][i] for i in rows],
+                "gt": [gt_new[block["gt"][i]] if block["gt"][i] >= 0 else -1 for i in rows],
+            }
+
+        halves.append({
+            **table,
+            "images": table["images"][low:high],
+            "gt": {key: [values[i] if key != "image" else values[i] - low for i in gt_keep]
+                   for key, values in table["gt"].items()},
+            "pred": _block(table["pred"]),
+            "pred_operating": _block(table["pred_operating"]),
+        })
+    return halves[0], halves[1]
+
+
+class PooledTestSetTests(TagAnalyticsSetup):
+    """Several test sets pooled into one: the pool must *be* the union eval."""
+
+    def _load(self, name, table):
+        path = self.root / name / "eval_matches.json"
+        path.parent.mkdir()
+        path.write_text(json.dumps(table), encoding="utf-8")
+        return tag_analytics.load_table(path)
+
+    def _whole(self, table):
+        return tag_analytics.image_slice_metrics(table, np.ones(table.num_images, dtype=bool))
+
+    def test_two_halves_pooled_score_exactly_as_the_whole(self):
+        rng = np.random.default_rng(7)
+        for case in range(12):
+            with self.subTest(case=case):
+                whole = _random_table(rng, images=int(rng.integers(4, 30)),
+                                      operating=bool(case % 2))
+                first, second = _split(whole, int(rng.integers(1, len(whole["images"]))))
+                pooled, problem = tag_analytics.pool_tables([
+                    self._load(f"a{case}", first), self._load(f"b{case}", second)])
+                self.assertEqual(problem, "")
+
+                expected = self._whole(self._load(f"w{case}", whole))
+                actual = self._whole(pooled)
+                for key in ("map50", "map50_95", "precision", "recall", "f1"):
+                    self.assertAlmostEqual(actual[key], expected[key], places=12, msg=key)
+                for key in ("images", "gt", "predictions"):
+                    self.assertEqual(actual[key], expected[key], key)
+                for got, want in zip(actual["per_class"], expected["per_class"]):
+                    self.assertAlmostEqual(got["ap50"], want["ap50"], places=12)
+                    self.assertAlmostEqual(got["recall"], want["recall"], places=12)
+
+    def test_the_hand_worked_table_split_in_two_still_scores_its_own_numbers(self):
+        first, second = _split(_table(), 2)
+        pooled, _problem = tag_analytics.pool_tables([
+            self._load("a", first), self._load("b", second)])
+
+        metrics = self._whole(pooled)
+
+        self.assertAlmostEqual(metrics["map50"], 0.55)
+        self.assertAlmostEqual(metrics["precision"], 0.75)
+        self.assertAlmostEqual(metrics["recall"], 0.6)
+
+    def test_different_class_spaces_are_refused_rather_than_added_up(self):
+        pooled, problem = tag_analytics.pool_tables([
+            self._load("a", _table()),
+            self._load("b", _table(classes={"0": "helmet"}))])
+
+        self.assertIsNone(pooled)
+        self.assertIn("class spaces", problem)
+
+    def test_different_operating_confidences_are_refused(self):
+        pooled, problem = tag_analytics.pool_tables([
+            self._load("a", _table()), self._load("b", _table(score_threshold=0.5))])
+
+        self.assertIsNone(pooled)
+        self.assertIn("operating confidences", problem)
+
+    def test_the_breakdown_marks_each_sets_best_and_worst_and_both_summaries(self):
+        first, second = _split(_table(), 2)
+        breakdown = tag_analytics.test_set_breakdown([
+            {"label": "day", "table": self._load("a", first)},
+            {"label": "night", "table": self._load("b", second)},
+            {"label": "still running", "table": None, "problem": "eval is running"},
+        ])
+
+        day, night, running = breakdown["rows"]
+        # img0+img1: 3 gt, 2 of 3 predictions correct. img2+img3: 2 gt, 1 of 1.
+        self.assertAlmostEqual(day["metrics"]["recall"], 2 / 3)
+        self.assertAlmostEqual(night["metrics"]["recall"], 0.5)
+        self.assertTrue(day["cells"][3]["best"])
+        self.assertTrue(night["cells"][3]["worst"])
+        self.assertIsNone(running["metrics"])
+        self.assertEqual(breakdown["pooled"]["gt"], 5)
+        self.assertAlmostEqual(breakdown["pooled"]["recall"], 0.6)
+        self.assertAlmostEqual(breakdown["mean"]["recall"], (2 / 3 + 0.5) / 2)
+        self.assertIn("only 2 of 3", breakdown["pooled_problem"])
+        self.assertEqual(breakdown["per_class_columns"], ["day", "night"])
+
+    def test_a_set_with_no_ground_truth_has_an_undefined_map_not_a_zero_one(self):
+        empty = _table(images=["x.jpg"], gt={"image": [], "class": [], "row": []},
+                       pred={"image": [0], "class": [0], "score": [0.9], "iou": [0.0],
+                             "gt": [-1]})
+        breakdown = tag_analytics.test_set_breakdown([
+            {"label": "full", "table": self._load("a", _table())},
+            {"label": "empty", "table": self._load("b", empty)},
+        ])
+
+        self.assertTrue(breakdown["rows"][1]["cells"][0]["undefined"])
+        # So the mean of sets is the one set that has an mAP, not half of it.
+        self.assertAlmostEqual(breakdown["mean"]["map50"], 0.55)

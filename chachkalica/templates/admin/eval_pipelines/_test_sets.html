@@ -1,0 +1,91 @@
+{# "Test sets": this eval and the ones queued with it on other test datasets -- see training.services.test_sets. #}
+<h2>Test sets</h2>
+<p class="note">
+  {{ test_sets.model }} was evaluated on {{ test_sets.rows|length }} test sets in one request.
+  Each row is an eval of its own — click through for its tag breakdowns.
+</p>
+<table class="sets">
+  <thead>
+    <tr>
+      <th class="rowlabel">Test set</th>
+      <th class="rowlabel">Labels</th>
+      {% for key, label in test_sets.metrics %}<th>{{ label }}</th>{% endfor %}
+      <th>images</th><th>gt boxes</th><th>predictions</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in test_sets.rows %}
+    <tr{% if row.current %} class="current"{% endif %}>
+      <td class="rowlabel">
+        {% if row.current %}{{ row.label }} <span class="scope">this page</span>
+        {% else %}<a href="{{ row.url }}">{{ row.label }}</a>{% endif %}
+        <span class="evalref">{{ row.eval_label }}</span>
+      </td>
+      <td class="rowlabel sub">{{ row.label_source }}</td>
+      {% if row.metrics %}
+        {% for cell in row.cells %}
+          <td class="{% if cell.best %}best{% elif cell.worst %}worst{% endif %}">
+            {% if cell.undefined %}undefined{% else %}{{ cell.value|floatformat:4 }}{% endif %}</td>
+        {% endfor %}
+        <td>{{ row.metrics.images }}</td><td>{{ row.metrics.gt }}</td><td>{{ row.metrics.predictions }}</td>
+      {% else %}
+        <td class="na" colspan="{{ test_sets.metrics|length|add:3 }}">{{ row.problem }}</td>
+      {% endif %}
+    </tr>
+  {% endfor %}
+  {% if test_sets.pooled_cells %}
+    <tr class="summary">
+      <td class="rowlabel" colspan="2">All sets pooled</td>
+      {% for cell in test_sets.pooled_cells %}
+        <td>{% if cell.undefined %}undefined{% else %}{{ cell.value|floatformat:4 }}{% endif %}</td>
+      {% endfor %}
+      <td>{{ test_sets.pooled.images }}</td><td>{{ test_sets.pooled.gt }}</td><td>{{ test_sets.pooled.predictions }}</td>
+    </tr>
+  {% endif %}
+  {% if test_sets.mean_cells %}
+    <tr class="summary">
+      <td class="rowlabel" colspan="2">Mean of sets</td>
+      {% for cell in test_sets.mean_cells %}
+        <td>{% if cell.value is None %}—{% else %}{{ cell.value|floatformat:4 }}{% endif %}</td>
+      {% endfor %}
+      <td class="na" colspan="3"></td>
+    </tr>
+  {% endif %}
+  </tbody>
+</table>
+<p class="note">
+  <strong>Pooled</strong> scores every image of every set as a single eval over all of them
+  would (a bigger set weighs more); <strong>mean of sets</strong> weighs each set once.
+  Green marks the best set per column, red the worst.
+  {% if test_sets.pooled_problem %}<br>Pooled: {{ test_sets.pooled_problem }}.{% endif %}
+</p>
+
+{% if test_sets.scored > 1 %}
+<details>
+  <summary>Per class, per set (AP50 · recall · gt boxes)</summary>
+  <table class="sets">
+    <thead>
+      <tr>
+        <th class="rowlabel">Class</th>
+        {% for label in test_sets.per_class_columns %}<th>{{ label }}</th>{% endfor %}
+        {% if test_sets.pooled %}<th>pooled</th>{% endif %}
+      </tr>
+    </thead>
+    <tbody>
+    {% for row in test_sets.per_class %}
+      <tr>
+        <td class="rowlabel">{{ row.class_name }}</td>
+        {% for cell in row.cells %}
+          {% if cell is None or cell.ap50 is None %}<td class="na">no gt</td>
+          {% else %}<td>{{ cell.ap50|floatformat:3 }} · {{ cell.recall|floatformat:3 }} <span class="evalref">{{ cell.gt }}</span></td>{% endif %}
+        {% endfor %}
+        {% if test_sets.pooled %}
+          {% if row.pooled is None or row.pooled.ap50 is None %}<td class="na">no gt</td>
+          {% else %}<td>{{ row.pooled.ap50|floatformat:3 }} · {{ row.pooled.recall|floatformat:3 }} <span class="evalref">{{ row.pooled.gt }}</span></td>{% endif %}
+        {% endif %}
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</details>
+{% endif %}
