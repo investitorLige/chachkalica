@@ -64,6 +64,7 @@ INSTALLED_APPS = [
     "cameras",
     "benchmarks",
     "vlm",
+    "genaug",
     "admin_sections",
 ]
 

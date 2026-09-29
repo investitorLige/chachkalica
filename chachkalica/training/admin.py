@@ -1141,6 +1141,23 @@ class TrainedModelAdmin(admin.ModelAdmin):
                 )
                 return None
 
+            # Same rule as ExperimentDataset.clean(): an enabled augmentation
+            # needs a fraction in (0, 1]. Unticked boxes ignore their fraction.
+            aug = {}
+            for key, label in [("aug_hflip", "hflip"), ("aug_scale_crop", "scale+crop")]:
+                enabled = bool(request.POST.get(key))
+                try:
+                    fraction = _float_or_none(request.POST.get(f"{key}_fraction"))
+                except ValueError:
+                    fraction = None
+                if enabled and not (fraction is not None and 0 < fraction <= 1):
+                    self.message_user(
+                        request, f"Enter a {label} fraction between 0 (exclusive) and 1.",
+                        level=messages.WARNING)
+                    return None
+                aug[key] = enabled
+                aug[f"{key}_fraction"] = fraction if enabled else 0.5
+
             req = finetune.FineTuneRequest(
                 train_dataset=train_dataset,
                 label_source=label_source,
@@ -1157,6 +1174,7 @@ class TrainedModelAdmin(admin.ModelAdmin):
                 lr=_float_or_none(request.POST.get("lr")) or 2e-5,
                 freeze_backbone=bool(request.POST.get("freeze_backbone")),
                 early_stopping_patience=early_stopping_patience,
+                **aug,
             )
             try:
                 run = finetune.create_run(source, req)

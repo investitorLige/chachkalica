@@ -1,0 +1,17 @@
+# QwenImageEditPlusPipeline (what FireRed-Image-Edit-1.1 loads as) landed in
+# diffusers 0.36; GGUF single-file loading of QwenImageTransformer2DModel and
+# LoRA on GGUF-quantized layers are both present by 0.40, which is what this
+# was written against.
+diffusers>=0.40,<0.41
+# Qwen2.5-VL text encoder. Independent of the trainer's and vlm-backend's pins.
+transformers>=4.57
+accelerate>=1.0
+# GGUF-quantized transformer (the q4_k_m file) and the NF4 text encoder.
+gguf>=0.10
+bitsandbytes>=0.45
+# The Lightning LoRA.
+peft>=0.17
+huggingface_hub>=0.34
+pillow>=10.0
+fastapi>=0.110
+uvicorn>=0.29

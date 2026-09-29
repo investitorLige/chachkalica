@@ -1,0 +1,120 @@
+{% extends "admin/base_site.html" %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  .gb { max-width: 1300px; }
+  .gb h2 { margin-top: 1.6em; border-bottom: 1px solid #ccc; padding-bottom: .3em; }
+  .gb .note { color: #777; font-size: 12px; }
+  .gb .meta { color: #666; margin: 4px 0; }
+  .gb .tiles { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+  .gb .tile { border: 1px solid #ddd; border-radius: 6px; padding: 8px 14px; background: #fafafa; min-width: 110px; }
+  .gb .tile .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; color: #222; }
+  .gb .tile .l { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: .04em; }
+  .gb .bar { height: 10px; background: #eee; border-radius: 5px; overflow: hidden; max-width: 600px; }
+  .gb .bar > div { height: 100%; background: #3b82f6; width: 0; }
+  .gb .banner { margin: 8px 0; padding: 8px 10px; border-radius: 4px; background: #fff7e6;
+                border: 1px solid #f5c26b; color: #6b4a00; }
+  .gb .banner.bad { background: #fdecea; border-color: #f5a3a3; color: #7a1c1c; }
+  .gb pre { background: #f8f8f8; color: #222; padding: 8px; border-radius: 4px; display: inline-block; }
+  .gb .grid { display: flex; flex-wrap: wrap; gap: 12px; }
+  .gb figure { margin: 0; width: 260px; font-size: 12px; background: #fff; color: #222;
+               border: 1px solid #ddd; border-radius: 6px; padding: 6px; }
+  .gb figure img { width: 100%; height: 170px; object-fit: contain; background: #eee; border-radius: 4px; }
+  .gb .pass { color: #14692b; font-weight: 700; }
+  .gb .fail { color: #ba2121; font-weight: 700; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="gb" id="build" data-progress-url="{{ progress_url }}" data-terminal="{{ counters.terminal|yesno:'1,0' }}">
+  <p class="meta">
+    <b>{{ build.source_dataset.name }}</b> → <b>{{ build.output_name }}</b> ·
+    {{ build.prompts_snapshot|length }} prompt(s) · fraction {{ build.fraction }} ·
+    {{ build.variants_per_image }} variant(s)/image · editor {{ build.editor }}{% if build.editor == "firered" %} {{ build.transformer }}{% if build.lightning %} + lightning{% endif %}{% endif %}
+    {% if studio_url %}· <a href="{{ studio_url }}">studio</a>{% endif %}
+    {% if dataset_url %}· <a href="{{ dataset_url }}">output dataset</a>{% endif %}
+  </p>
+  <p>Status: <b id="status">{{ counters.status }}</b></p>
+  <div class="bar"><div id="bar"></div></div>
+  <div id="waiting" class="banner" {% if not counters.waiting_reason %}style="display:none"{% endif %}>Waiting for the GPU: <span id="waiting-text">{{ counters.waiting_reason }}</span></div>
+  <div id="error" class="banner bad" {% if not counters.last_error %}style="display:none"{% endif %}>{{ counters.last_error }}</div>
+
+  <div class="tiles">
+    <div class="tile"><div class="v" data-k="images_total">{{ counters.images_total }}</div><div class="l">source images</div></div>
+    <div class="tile"><div class="v" data-k="images_selected">{{ counters.images_selected }}</div><div class="l">images augmented</div></div>
+    <div class="tile"><div class="v" data-k="variants_attempted">{{ counters.variants_attempted }}</div><div class="l">variants attempted</div></div>
+    <div class="tile"><div class="v" data-k="variants_planned">{{ counters.variants_planned }}</div><div class="l">planned</div></div>
+    <div class="tile"><div class="v" data-k="variants_accepted">{{ counters.variants_accepted }}</div><div class="l">accepted</div></div>
+    <div class="tile"><div class="v" data-k="variants_rejected">{{ counters.variants_rejected }}</div><div class="l">rejected</div></div>
+    <div class="tile"><div class="v" data-k="variants_errored">{{ counters.variants_errored }}</div><div class="l">errors</div></div>
+    <div class="tile"><div class="v" data-k="variants_cached">{{ counters.variants_cached }}</div><div class="l">from cache</div></div>
+    <div class="tile"><div class="v" data-k="acceptance_rate">{% if counters.acceptance_rate is not None %}{{ counters.acceptance_rate }}%{% else %}—{% endif %}</div><div class="l">acceptance</div></div>
+  </div>
+
+  {% if not counters.terminal %}
+  <form method="post" action="{{ cancel_url }}">{% csrf_token %}
+    <input type="hidden" name="build" value="{{ build.pk }}">
+    <input type="submit" value="Stop after the current image">
+  </form>
+  {% endif %}
+
+  {% if counters.terminal %}<pre>{{ summary }}</pre>{% endif %}
+
+  <h2>Train on it</h2>
+  <p class="note">Add <b>{{ build.output_name }}</b> to an experiment as a <b>train</b> dataset
+  with label source <b>source labels</b>. Keep your val/test sets as they are — just not
+  {{ build.source_dataset.name }} itself, which this dataset contains. The flip/crop
+  checkboxes still apply on top at training time. Every generated file is traceable
+  through <code>genaug_manifest.jsonl</code> in the dataset folder.</p>
+
+  <h2>Latest variants <span class="note">(newest first; labels drawn are the source's)</span></h2>
+  <div class="grid">
+    {% for r in records %}
+      <figure>
+        {% if r.cache %}
+          <a href="{{ image_url }}&source={{ r.source|urlencode }}&generated={{ r.generated|urlencode }}&boxes=1" target="_blank">
+            <img loading="lazy" src="{{ image_url }}&source={{ r.source|urlencode }}&generated={{ r.generated|urlencode }}&boxes=1"></a>
+        {% endif %}
+        <div><b>{{ r.augmentation }}</b> · seed {{ r.seed }}{% if r.cached %} · cached{% endif %}</div>
+        <div class="note" title="{{ r.source }}">{{ r.source|truncatechars:40 }}</div>
+        {% if r.error %}<div class="fail">error: {{ r.error|truncatechars:120 }}</div>
+        {% elif r.accepted %}<div class="pass">✓ accepted</div>
+        {% else %}<div class="fail">✗ {{ r.validation.reason|default:"rejected" }}</div>{% endif %}
+        <a class="note" href="{{ image_url }}&source={{ r.source|urlencode }}&generated={{ r.generated|urlencode }}&kind=source&boxes=1" target="_blank">original</a>
+      </figure>
+    {% empty %}
+      <p class="note">Nothing generated yet.</p>
+    {% endfor %}
+  </div>
+</div>
+<script>
+(function () {
+  var root = document.getElementById("build");
+  if (root.dataset.terminal === "1") { document.getElementById("bar").style.width = "100%"; return; }
+  function setBar(c) {
+    if (!c) return;
+    var done = c.variants_planned ? c.variants_attempted / c.variants_planned : 0;
+    document.getElementById("bar").style.width = Math.round(100 * done) + "%";
+  }
+  function poll() {
+    fetch(root.dataset.progressUrl, { credentials: "same-origin" }).then(function (r) { return r.json(); })
+      .then(function (c) {
+        document.getElementById("status").textContent = c.status;
+        root.querySelectorAll("[data-k]").forEach(function (el) {
+          var v = c[el.dataset.k];
+          el.textContent = el.dataset.k === "acceptance_rate" ? (v === null ? "—" : v + "%") : v;
+        });
+        var waiting = document.getElementById("waiting");
+        waiting.style.display = c.waiting_reason ? "" : "none";
+        document.getElementById("waiting-text").textContent = c.waiting_reason;
+        var error = document.getElementById("error");
+        error.style.display = c.last_error ? "" : "none";
+        error.textContent = c.last_error;
+        setBar(c);
+        if (c.terminal) { location.reload(); } else { setTimeout(poll, 5000); }
+      }).catch(function () { setTimeout(poll, 15000); });
+  }
+  poll();
+})();
+</script>
+{% endblock %}

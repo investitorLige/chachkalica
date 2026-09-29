@@ -1,0 +1,258 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  /* Explicit light palette on the cards, as on the VLM report, so the images'
+     verdicts stay legible under the admin's dark theme too. */
+  .ga { max-width: 1400px; }
+  .ga h2 { margin-top: 1.6em; border-bottom: 1px solid #ccc; padding-bottom: .3em; }
+  .ga .note { color: #777; font-size: 12px; }
+  .ga .meta { color: #666; margin: 4px 0; }
+  .ga .banner { margin: 8px 0; padding: 8px 10px; border-radius: 4px; background: #fff7e6;
+                border: 1px solid #f5c26b; color: #6b4a00; }
+  .ga .banner.bad { background: #fdecea; border-color: #f5a3a3; color: #7a1c1c; }
+  .ga .banner.ok { background: #ecfdf5; border-color: #9ae6b4; color: #14532d; }
+  .ga .strip { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+  .ga .strip figure { margin: 0; }
+  .ga .strip img { height: 130px; border-radius: 4px; background: #eee; display: block; }
+  .ga .strip figcaption { font-size: 11px; color: #777; max-width: 200px; overflow: hidden;
+                          text-overflow: ellipsis; white-space: nowrap; }
+  .ga form.composer { background: #fafafa; border: 1px solid #ddd; border-radius: 6px;
+                      padding: 12px 14px; color: #222; }
+  .ga form.composer textarea { width: 100%; max-width: 900px; font-family: inherit; }
+  .ga .row { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin: 6px 0; }
+  .ga .row label { font-weight: 600; font-size: 12px; color: #333; }
+  .ga .row input[type=number] { width: 6em; }
+  .ga .card { border: 1px solid #ddd; border-radius: 6px; margin: 14px 0; background: #fff; color: #222; }
+  .ga .card.dropped { opacity: .55; }
+  .ga .card header { display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+                     padding: 8px 12px; border-bottom: 1px solid #eee; background: #f7f7f7; }
+  .ga .card header .name { font-weight: 700; font-size: 14px; }
+  .ga .card header .params { color: #666; font-size: 12px; }
+  .ga .card header .spacer { flex: 1; }
+  .ga .card header form { display: inline; margin: 0; }
+  .ga .card details { padding: 6px 12px; font-size: 12px; }
+  .ga .card pre { white-space: pre-wrap; margin: 4px 0; background: #f8f8f8; padding: 6px;
+                  border-radius: 4px; color: #222; }
+  .ga .grid { display: flex; flex-wrap: wrap; gap: 12px; padding: 10px 12px; }
+  .ga .grid figure { margin: 0; width: 320px; }
+  .ga .grid .frame { width: 320px; height: 220px; background: #eee; border-radius: 4px;
+                     display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  .ga .grid .frame img { max-width: 100%; max-height: 100%; cursor: zoom-in; }
+  .ga .grid .frame .wait { color: #888; font-size: 12px; }
+  .ga .verdict { font-size: 12px; margin-top: 4px; }
+  .ga .pass { color: #14692b; font-weight: 700; }
+  .ga .fail { color: #ba2121; font-weight: 700; }
+  .ga .err { color: #ba2121; font-size: 12px; }
+  .ga .badge { color: #fff; padding: 2px 8px; border-radius: 9px; font-size: 11px; }
+  .ga .b-ok { background: #22c55e; } .ga .b-running { background: #3b82f6; }
+  .ga .b-queued { background: #9ca3af; } .ga .b-error { background: #ef4444; }
+  .ga table.classes td, .ga table.classes th { padding: 3px 10px; text-align: left; }
+  .ga table.classes input { width: 5em; }
+  .ga .view-toggle { position: sticky; top: 0; z-index: 5; background: #fff; color: #222;
+                     padding: 6px 10px; border: 1px solid #ddd; border-radius: 6px; margin: 10px 0; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="ga" id="studio"
+     data-state-url="{{ urls.state }}" data-backend-url="{{ urls.backend }}"
+     data-prompt-url="{{ urls.prompt }}" data-image-url="{{ urls.image }}"
+     data-avg-edit-s="{{ avg_edit_s|default_if_none:'' }}" data-n-images="{{ n_images }}"
+     data-kept="{{ kept|length }}">
+
+  <p class="meta">
+    Dataset <b>{{ session.dataset.name }}</b> ({{ n_images }} images) ·
+    labels: <b>{{ session.get_label_source_display }}</b>
+    {% if session.annotator %}({{ session.annotator.username }}){% endif %} ·
+    <a href="{{ urls.edit }}">edit session</a> · <a href="{{ urls.builds }}">all builds</a>
+  </p>
+  <div id="backend-status" class="banner">Checking genaug-backend…</div>
+  <p class="note">Only augment a <b>training</b> split. A build's output contains this
+  dataset's images, so validating or testing on this dataset while training on the build
+  would leak — experiments refuse that combination.</p>
+
+  <h2>Preview images</h2>
+  <p class="note">Every prompt is previewed on these {{ session.preview_images|length }}
+  image(s), with their labels drawn on. New prompts use the current set.</p>
+  <div class="strip">
+    {% for name in session.preview_images %}
+      <figure>
+        <a href="{{ urls.image }}?session={{ session.pk }}&source={{ name|urlencode }}&boxes=1" target="_blank">
+          <img src="{{ urls.image }}?session={{ session.pk }}&source={{ name|urlencode }}&boxes=1" alt="{{ name }}"></a>
+        <figcaption title="{{ name }}">{{ name }}</figcaption>
+      </figure>
+    {% empty %}
+      <p class="err">This dataset has no images.</p>
+    {% endfor %}
+  </div>
+  <form method="post" action="{{ urls.shuffle }}">{% csrf_token %}
+    <input type="hidden" name="session" value="{{ session.pk }}">
+    <input type="submit" value="Pick other preview images">
+  </form>
+
+  <h2>New prompt</h2>
+  <form class="composer" method="post" action="{{ urls.generate }}">{% csrf_token %}
+    <input type="hidden" name="session" value="{{ session.pk }}">
+    <div class="row">
+      <label for="preset">Start from</label>
+      <select name="preset" id="preset">
+        <option value="">— blank —</option>
+        {% for p in presets %}
+          <option value="{{ p.pk }}" data-name="{{ p.name }}">{{ p.name }}{% if p.description %} — {{ p.description }}{% endif %}</option>
+        {% endfor %}
+      </select>
+      <label for="name">Name</label>
+      <input type="text" name="name" id="name" size="24" placeholder="night_cctv">
+    </div>
+    {{ presets_data|json_script:"presets-data" }}
+    <div class="row" style="display:block">
+      <label for="text">Prompt</label><br>
+      <textarea name="text" id="text" rows="7" required
+        placeholder="Preserve the exact geometry… Only change the lighting to…"></textarea>
+    </div>
+    <div class="row" style="display:block">
+      <label for="negative_prompt">Negative prompt</label> <span class="note">(optional)</span><br>
+      <textarea name="negative_prompt" id="negative_prompt" rows="2"></textarea>
+    </div>
+    <div class="row">
+      <label for="seed">Seed</label><input type="number" name="seed" id="seed" value="42">
+      <label for="num_inference_steps">Steps</label>
+      <input type="number" name="num_inference_steps" id="num_inference_steps" value="40" min="1" max="100">
+      <label for="true_cfg_scale">CFG</label>
+      <input type="number" name="true_cfg_scale" id="true_cfg_scale" value="4.0" step="0.1" min="0" max="20">
+    </div>
+    <div class="row">
+      <label for="editor">Editor</label>
+      <select name="editor" id="editor">
+        {% for value, label in editor_choices %}<option value="{{ value }}" {% if value == session.editor %}selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+      <label for="transformer">Weights</label>
+      <select name="transformer" id="transformer">
+        {% for value, label in transformer_choices %}<option value="{{ value }}" {% if value == session.transformer %}selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+      <label><input type="checkbox" name="lightning" {% if session.lightning %}checked{% endif %}> Lightning (8 steps)</label>
+    </div>
+    <input type="submit" class="default" value="Generate previews">
+    <span class="note">Runs on the GPU in genaug-backend; the first prompt after it has been
+    idle also pays for loading FireRed.{% if avg_edit_s %} So far ≈ {{ avg_edit_s }} s per image.{% endif %}</span>
+  </form>
+
+  <h2>Prompts <span class="note">({{ prompts|length }} tried, {{ kept|length }} kept)</span></h2>
+  <div class="view-toggle">
+    Show:
+    <label><input type="radio" name="view" value="generated" checked> generated</label>
+    <label><input type="radio" name="view" value="original"> original</label>
+    · <label><input type="checkbox" id="show-boxes" checked> source labels drawn on</label>
+    <span class="note">— the labels drawn on a generated image are the source's, unchanged:
+    that is what the build copies, so they should still fit.</span>
+  </div>
+
+  {% for p in prompts %}
+    <div class="card{% if not p.keep %} dropped{% endif %}" id="p{{ p.pk }}" data-prompt-id="{{ p.pk }}">
+      <header>
+        <span class="name">{{ p.name }}</span>
+        <span class="params">seed {{ p.seed }} · {{ p.num_inference_steps }} steps · CFG {{ p.true_cfg_scale }}
+          · {{ p.editor_config.editor }}{% if p.editor_config.editor == "firered" %} {{ p.editor_config.transformer }}{% if p.editor_config.lightning %} + lightning{% endif %}{% endif %}</span>
+        <span class="badge b-{{ p.status }}" data-role="status">{{ p.status }}</span>
+        <span class="params" data-role="summary"></span>
+        <span class="spacer"></span>
+        <label><input type="checkbox" data-role="keep" {% if p.keep %}checked{% endif %}> keep for build</label>
+        <form method="post" action="{{ urls.prompt }}">{% csrf_token %}
+          <input type="hidden" name="prompt" value="{{ p.pk }}">
+          <input type="hidden" name="action" value="reroll">
+          <input type="submit" value="Re-roll seed" title="Same prompt, seed + 1">
+        </form>
+        <form method="post" action="{{ urls.prompt }}">{% csrf_token %}
+          <input type="hidden" name="prompt" value="{{ p.pk }}">
+          <input type="hidden" name="action" value="save_preset">
+          <input type="text" name="preset_name" value="{{ p.name }}" size="14">
+          <input type="submit" value="Save to library">
+        </form>
+        <form method="post" action="{{ urls.prompt }}" onsubmit="return confirm('Delete this prompt and its previews?')">{% csrf_token %}
+          <input type="hidden" name="prompt" value="{{ p.pk }}">
+          <input type="hidden" name="action" value="delete">
+          <input type="submit" value="Delete">
+        </form>
+      </header>
+      <details><summary>prompt</summary><pre>{{ p.text }}</pre>
+        {% if p.negative_prompt %}<p><b>negative:</b></p><pre>{{ p.negative_prompt }}</pre>{% endif %}
+      </details>
+      <div class="err" data-role="error" style="padding:0 12px">{{ p.last_error }}</div>
+      <div class="grid">
+        {% for pv in p.previews.all %}
+          <figure data-preview-id="{{ pv.pk }}" data-source="{{ pv.source_filename }}">
+            <div class="frame"><span class="wait">{{ pv.status }}…</span></div>
+            <div class="verdict" data-role="verdict"></div>
+          </figure>
+        {% endfor %}
+      </div>
+    </div>
+  {% empty %}
+    <p class="note">No prompts yet — write one above, or start from a preset.</p>
+  {% endfor %}
+
+  <h2>Validation</h2>
+  <form method="post" action="{{ urls.settings }}">{% csrf_token %}
+    <input type="hidden" name="session" value="{{ session.pk }}">
+    <p class="note">Each variant is compared with its source on photometric-invariant
+    structure (lighting, colour, noise and compression do not count), per labelled box. It is
+    rejected if a box <b>moved</b>, <b>changed shape or disappeared</b>, or the <b>whole
+    scene shifted</b>. Changing these re-checks every preview above without the GPU.</p>
+    <div class="row">
+      <label><input type="checkbox" name="validation_enabled" {% if session.validation_enabled %}checked{% endif %}> validate</label>
+      <label for="max_bbox_drift">max box drift</label>
+      <input type="number" step="0.01" name="max_bbox_drift" id="max_bbox_drift" value="{{ session.max_bbox_drift }}">
+      <label for="min_box_similarity">min box similarity</label>
+      <input type="number" step="0.01" name="min_box_similarity" id="min_box_similarity" value="{{ session.min_box_similarity }}">
+      <label for="max_global_shift">max scene shift</label>
+      <input type="number" step="0.005" name="max_global_shift" id="max_global_shift" value="{{ session.max_global_shift }}">
+      <input type="submit" value="Save &amp; re-check previews">
+    </div>
+  </form>
+
+  <h2>Build augmented dataset</h2>
+  {% if kept %}
+  <form method="post" action="{{ urls.build }}" id="build-form">{% csrf_token %}
+    <input type="hidden" name="session" value="{{ session.pk }}">
+    <p class="meta">Kept prompts ({{ kept|length }}):
+      {% for p in kept %}<b>{{ p.name }}</b> (seed {{ p.seed }}){% if not forloop.last %}, {% endif %}{% endfor %}</p>
+    <div class="row">
+      <label for="output_name">New dataset name</label>
+      <input type="text" name="output_name" id="output_name" size="40" value="{{ default_output_name }}">
+    </div>
+    <div class="row">
+      <label for="fraction">Fraction of images to augment</label>
+      <input type="number" name="fraction" id="fraction" value="0.3" step="0.05" min="0" max="1">
+      <label for="variants_per_image">Variants per image</label>
+      <input type="number" name="variants_per_image" id="variants_per_image" value="2" min="1" max="20">
+      <label for="build_seed">Seed</label>
+      <input type="number" name="seed" id="build_seed" value="42">
+    </div>
+    <p class="note">Each selected image gets that many variants, using different kept prompts
+    (repeating with seed + 1 when there are fewer prompts than variants).</p>
+    {% if classes %}
+    <details><summary>Class-aware sampling</summary>
+      <p class="note">An image's chance of being picked is the highest weight among the classes
+      it contains (0 excludes it). Raise under-represented classes.</p>
+      <table class="classes">
+        <tr><th>class</th><th>weight</th></tr>
+        {% for c in classes %}<tr><td>{{ c }}</td><td><input type="number" name="class__{{ c }}" value="1.0" step="0.1" min="0"></td></tr>{% endfor %}
+        <tr><td><i>background (no boxes)</i></td><td><input type="number" name="class__{{ background_key }}" value="1.0" step="0.1" min="0"></td></tr>
+      </table>
+    </details>
+    {% endif %}
+    <div class="row">
+      <label><input type="checkbox" name="include_originals" checked> include the original images</label>
+      <label><input type="checkbox" name="force"> regenerate even if cached</label>
+    </div>
+    <p class="meta" id="estimate"></p>
+    <input type="submit" class="default" value="Build dataset">
+  </form>
+  {% else %}
+    <p class="note">Keep at least one prompt to build a dataset.</p>
+  {% endif %}
+</div>
+<script src="{% static 'genaug/studio.js' %}"></script>
+{% endblock %}

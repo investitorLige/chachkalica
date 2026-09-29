@@ -315,6 +315,9 @@ def _random_scale_crop(image, target, scale_range, min_visibility, min_side_px):
         scale_x = width / crop_w
         scale_y = height / crop_h
         clipped = clipped * clipped.new_tensor([scale_x, scale_y, scale_x, scale_y])
+        # crop_w * (width / crop_w) can land a float ulp past the edge.
+        clipped[:, 0::2] = clipped[:, 0::2].clamp(0, width)
+        clipped[:, 1::2] = clipped[:, 1::2].clamp(0, height)
 
         widths = clipped[:, 2] - clipped[:, 0]
         heights = clipped[:, 3] - clipped[:, 1]

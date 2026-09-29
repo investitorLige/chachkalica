@@ -55,4 +55,5 @@ The cleanup command removes only the container. It does not delete the Docker vo
 - [Marketing Studio](marketing-studio.md) — the same renderer as its own section: own video library, own bundle root, own presets, bundles only
 - [VLM Live Inference](vlm-live-inference.md) — running a vision-language model over a video and watching its commentary arrive
 - [VLM Dataset Runs](vlm-dataset-runs.md) — running a VLM over a whole dataset and scoring its answers against the labels
+- [Generative Augmentation](generative-augmentation.md) — prompt FireRed-Image-Edit in a studio with previews, then build a validated, labelled augmented dataset
 - [.pt Bundles](pt-bundles.md) — export a checkpoint plus its full catalog/pipeline/training provenance as one `.tar.gz`, to catalog on another machine

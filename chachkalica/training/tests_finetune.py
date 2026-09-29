@@ -127,6 +127,24 @@ class CreateRunTests(TestCase):
             run = finetune.create_run(self.source_model, self._request(freeze_backbone=True))
         self.assertEqual(run.experiment.models.get().params["trainable_backbone_layers"], 0)
 
+    def test_augmentation_lands_on_the_train_row_and_in_the_yaml(self):
+        import yaml
+
+        with mock.patch.object(finetune, "django_rq"):
+            run = finetune.create_run(
+                self.source_model,
+                self._request(val_dataset=self.dataset, aug_hflip=True, aug_hflip_fraction=0.4),
+            )
+        train_row = run.experiment.datasets.get(role=ExperimentDataset.TRAIN)
+        self.assertTrue(train_row.aug_hflip)
+        self.assertEqual(train_row.aug_hflip_fraction, 0.4)
+        self.assertFalse(train_row.aug_scale_crop)
+        val_row = run.experiment.datasets.get(role=ExperimentDataset.VAL)
+        self.assertFalse(val_row.aug_hflip or val_row.aug_scale_crop)
+
+        config = yaml.safe_load(Path(run.config_yaml_path).read_text())
+        self.assertIn({"hflip": 0.4}, [d.get("augmentation") for d in config["datasets"]["train"]])
+
     def test_val_dataset_is_an_optional_second_row(self):
         with mock.patch.object(finetune, "django_rq"):
             run = finetune.create_run(
@@ -254,6 +272,28 @@ class FineTuneAdminActionTests(TestCase):
             resp = self._post(apply="1")
         self.assertEqual(resp.status_code, 302)
         self.assertEqual(TrainingRun.objects.count(), 0)
+
+    def test_apply_passes_augmentation_checkboxes_through(self):
+        with mock.patch.object(finetune, "django_rq"):
+            resp = self._post(
+                apply="1", train_dataset=str(self.dataset.pk),
+                aug_scale_crop="on", aug_scale_crop_fraction="0.3",
+                aug_hflip_fraction="0.9",  # unticked: its fraction is ignored
+            )
+        self.assertEqual(resp.status_code, 302)
+        row = TrainingRun.objects.get().experiment.datasets.get()
+        self.assertEqual((row.aug_scale_crop, row.aug_scale_crop_fraction), (True, 0.3))
+        self.assertFalse(row.aug_hflip)
+
+    def test_apply_with_an_out_of_range_augmentation_fraction_is_rejected(self):
+        for fraction in ["0", "1.5", "", "lots"]:
+            with self.subTest(fraction=fraction), mock.patch.object(finetune, "django_rq"):
+                resp = self._post(
+                    apply="1", train_dataset=str(self.dataset.pk),
+                    aug_hflip="on", aug_hflip_fraction=fraction,
+                )
+                self.assertEqual(resp.status_code, 302)
+                self.assertEqual(TrainingRun.objects.count(), 0)
 
     def test_early_stopping_without_a_val_dataset_is_rejected(self):
         with mock.patch.object(finetune, "django_rq"):

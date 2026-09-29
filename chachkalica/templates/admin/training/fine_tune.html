@@ -58,6 +58,26 @@ model is registered on the Trained models page automatically (see it under
     <p class="help">Only used when <em>Label source</em> is "explicit path".</p>
   </div>
 
+  <div class="form-row">
+    <label for="aug_hflip">Augment: hflip</label>
+    <input type="checkbox" name="aug_hflip" id="aug_hflip">
+    <input type="number" name="aug_hflip_fraction" id="aug_hflip_fraction"
+           min="0" max="1" step="any" value="0.5" title="Fraction (0-1)">
+    <p class="help">Randomly mirror images (and their boxes) horizontally. The number is the
+    chance each image is flipped in a given epoch — applied on the fly, the dataset does not
+    get bigger.</p>
+  </div>
+
+  <div class="form-row">
+    <label for="aug_scale_crop">Augment: scale+crop</label>
+    <input type="checkbox" name="aug_scale_crop" id="aug_scale_crop">
+    <input type="number" name="aug_scale_crop_fraction" id="aug_scale_crop_fraction"
+           min="0" max="1" step="any" value="0.5" title="Fraction (0-1)">
+    <p class="help">Randomly crop a 60-100% window and scale it back up; boxes are clipped or
+    dropped at the crop edges. The number is the chance each image is scale-cropped in a
+    given epoch.</p>
+  </div>
+
   <h3>Validation dataset <span class="help">(optional)</span></h3>
   <p class="help">Needed for early stopping and for tracking a best-epoch checkpoint by
   metric rather than just training every epoch requested. Leave blank to skip both.</p>

@@ -261,6 +261,35 @@ def pipeline_block(experiment: Experiment) -> dict | None:
     return data
 
 
+def _refuse_generative_leakage(rows) -> None:
+    """Refuse training on a genaug build while evaluating on its source.
+
+    A generative-augmentation build contains its source dataset's images plus
+    edited copies of them, so scoring on the source (or on any other build of
+    it) measures the model on pictures it trained on.
+    """
+    from genaug.models import AugBuild
+
+    train_ids = {r.dataset_id for r in rows if r.role == ExperimentDataset.TRAIN}
+    eval_rows = [r for r in rows if r.role != ExperimentDataset.TRAIN]
+    if not train_ids or not eval_rows:
+        return
+    builds = AugBuild.objects.filter(output_dataset_id__in=train_ids).select_related(
+        "source_dataset", "output_dataset")
+    sources = {b.source_dataset_id: b for b in builds}
+    derived = {b.output_dataset_id: b for b in AugBuild.objects.filter(
+        source_dataset_id__in=list(sources)).exclude(output_dataset_id=None)}
+    for row in eval_rows:
+        build = sources.get(row.dataset_id) or derived.get(row.dataset_id)
+        if build is not None:
+            raise ValueError(
+                f"{row.dataset.name} is used as {row.role}, but a train dataset was "
+                f"generated from {build.source_dataset.name} (genaug build #{build.pk}), "
+                f"so the model would be evaluated on images it trained on. Evaluate on "
+                f"a split the build was not made from."
+            )
+
+
 def build_experiment_dict(experiment: Experiment, output_dir: Path | str) -> dict:
     """Assemble the full friendy_chachkalica experiment dict.
 
@@ -281,6 +310,7 @@ def build_experiment_dict(experiment: Experiment, output_dir: Path | str) -> dic
         raise ValueError("Add at least one train dataset.")
     if len(vals) > 1:
         raise ValueError("At most one val dataset is allowed.")
+    _refuse_generative_leakage(rows)
 
     models = list(experiment.models.all())
     if not models:

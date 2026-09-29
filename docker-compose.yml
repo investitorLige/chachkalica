@@ -47,6 +47,8 @@ x-app: &app
     SAM_BACKEND_URL: http://sam-backend:9090
     # And the vision-language model backend the VLM tab's runs call per frame.
     VLM_BACKEND_URL: http://vlm-backend:9091
+    # And the generative-augmentation (FireRed) backend.
+    GENAUG_BACKEND_URL: http://genaug-backend:9092
     # bgutil-ytdlp-pot-provider (installed via requirements.txt) reads this to
     # find its companion BotGuard-solving server — see videos/services/downloader.py.
     YT_POT_SERVER_URL: http://yt-pot-server:4416
@@ -352,6 +354,35 @@ services:
     # ───────────────────────────────── GPU ─────────────────────────────────
     # Now a THREE-way share with `trainer` and `sam-backend`. A resident 7B VLM
     # alongside an active training run will OOM — run them one at a time.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  genaug-backend:
+    # Generative augmentation (FireRed-Image-Edit) for the "Generative
+    # augmentation" section. Same arrangement as vlm-backend: one model warm, a
+    # lock, image PATHS on the shared data mount. See ml_backends/genaug/.
+    build:
+      context: ./chachkalica
+      dockerfile: ml_backends/genaug/Dockerfile
+    environment:
+      HF_HOME: /app/data/hf_cache
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
+      # FireRed at 4-bit still needs ~14 GB of VRAM, so it hands the GPU back
+      # to training this long after its last edit. 0 keeps it loaded.
+      GENAUG_IDLE_UNLOAD_S: ${GENAUG_IDLE_UNLOAD_S:-300}
+    ports:
+      - "${GENAUG_HOST_PORT:-9092}:9092"
+    volumes:
+      - ./chachkalica/data:/app/data
+    restart: unless-stopped
+    # ───────────────────────────────── GPU ─────────────────────────────────
+    # A four-way share now (trainer, sam-backend, vlm-backend, this). FireRed
+    # refuses to load (HTTP 503) rather than OOM when the others hold the GPU.
     deploy:
       resources:
         reservations:

@@ -4,8 +4,8 @@
 of ``ExperimentAdmin.generate_run``: instead of an operator building an
 Experiment by hand with inline dataset/model rows, it collects only the handful
 of knobs that matter for fine-tuning (a dataset, epochs, batch size, DataLoader
-worker count, learning rate, an optional freeze-backbone toggle and
-early-stopping patience) and this module assembles the same Experiment /
+worker count, learning rate, an optional freeze-backbone toggle,
+early-stopping patience and the train-time augmentation checkboxes) and this module assembles the same Experiment /
 ExperimentDataset / ExperimentModel /
 TrainingRun rows ``generate_run`` would, pre-seeded from the source
 :class:`~training.models.TrainedModel`:
@@ -61,6 +61,12 @@ class FineTuneRequest:
     lr: float = 2e-5
     freeze_backbone: bool = False
     early_stopping_patience: int | None = None
+    # Train-time augmentations on the fine-tune dataset, same semantics as the
+    # ExperimentDataset checkboxes (see ExperimentDataset.aug_hflip).
+    aug_hflip: bool = False
+    aug_hflip_fraction: float = 0.5
+    aug_scale_crop: bool = False
+    aug_scale_crop_fraction: float = 0.5
 
 
 def _unique_name(base: str) -> str:
@@ -130,6 +136,8 @@ def create_run(source: TrainedModel, req: FineTuneRequest) -> TrainingRun:
         experiment=experiment, dataset=req.train_dataset, role=ExperimentDataset.TRAIN,
         label_source=req.label_source, annotator=req.annotator,
         explicit_labels_path=req.explicit_labels_path,
+        aug_hflip=req.aug_hflip, aug_hflip_fraction=req.aug_hflip_fraction,
+        aug_scale_crop=req.aug_scale_crop, aug_scale_crop_fraction=req.aug_scale_crop_fraction,
     )
     if req.val_dataset is not None:
         ExperimentDataset.objects.create(
